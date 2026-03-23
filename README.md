@@ -29,8 +29,23 @@ keep Codex moving, keep context close, and keep your momentum.
 - a trusted local network
 - the Home Screen web app with Web Push enabled
 
+It gets even more fun with a Mac mini.
+Leave Codex running on a small always-on machine, and `viveworker` starts to feel like a local coding appliance: your Mac mini keeps building in the background while your iPhone handles approvals, plan checks, questions, and follow-up replies from anywhere in your home or office.
+
 `viveworker` is designed for local use only.
 It is not intended for Internet exposure.
+
+## Mac mini Ideas
+
+`viveworker` pairs especially well with a Mac mini.
+
+You can use it as:
+
+- an always-on Codex station that stays running in the background
+- a way to keep approvals and plan checks moving even when you are away from your desk
+- a lightweight monitor for long-running coding or research tasks, where your iPhone only surfaces what needs your attention
+- a small local AI appliance for your home or office
+- a quick way to review a completion and send “do this next” back into the latest thread from your phone
 
 ## Quick Start
 
