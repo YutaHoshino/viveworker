@@ -1,0 +1,8892 @@
+#!/usr/bin/env node
+
+import { spawn } from "node:child_process";
+import crypto from "node:crypto";
+import { createServer as createHttpServer } from "node:http";
+import { createServer as createHttpsServer } from "node:https";
+import { promises as fs, readFileSync, createReadStream } from "node:fs";
+import net from "node:net";
+import os from "node:os";
+import path from "node:path";
+import process from "node:process";
+import { createInterface } from "node:readline";
+import { fileURLToPath } from "node:url";
+import webPush from "web-push";
+import { DEFAULT_LOCALE, SUPPORTED_LOCALES, localeDisplayName, normalizeLocale, resolveLocalePreference, t } from "../web/i18n.js";
+import { generatePairingCredentials, shouldRotatePairing, upsertEnvText } from "./lib/pairing.mjs";
+import { renderMarkdownHtml } from "./lib/markdown-render.mjs";
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+const workspaceRoot = path.resolve(__dirname, "..");
+const webRoot = path.join(workspaceRoot, "web");
+const appPackageVersion = readPackageVersion();
+const sessionCookieName = "viveworker_session";
+const deviceCookieName = "viveworker_device";
+const historyKinds = new Set(["completion", "plan_ready", "approval", "plan", "choice", "info"]);
+const timelineMessageKinds = new Set(["user_message", "assistant_commentary", "assistant_final"]);
+const timelineKinds = new Set([...timelineMessageKinds, "approval", "plan", "choice", "completion", "plan_ready"]);
+const SQLITE_COMPLETION_BATCH_SIZE = 200;
+const DEFAULT_DEVICE_TRUST_TTL_MS = 30 * 24 * 60 * 60 * 1000;
+const MAX_PAIRED_DEVICES = 200;
+const PAIRING_RATE_LIMIT_WINDOW_MS = 15 * 60 * 1000;
+const PAIRING_RATE_LIMIT_MAX_ATTEMPTS = 8;
+
+const cli = parseCliArgs(process.argv.slice(2));
+const envFile = resolveEnvFile(cli.envFile);
+loadEnvFile(envFile);
+await maybeRotateStartupPairingEnv(envFile);
+
+const config = buildConfig(cli);
+validateConfig(config);
+
+const runtime = {
+  fileStates: new Map(),
+  sessionIndex: new Map(),
+  knownFiles: [],
+  lastSessionIndexLoadAt: 0,
+  lastDirectoryScanAt: 0,
+  logsDbFile: "",
+  historyFileState: {
+    offset: 0,
+    remainder: "",
+    skipPartialLine: false,
+    startupCutoffTs: 0,
+    sourceFile: "",
+  },
+  rolloutThreadLabels: new Map(),
+  threadStates: new Map(),
+  threadOwnerClientIds: new Map(),
+  nativeApprovalsByToken: new Map(),
+  nativeApprovalsByRequestKey: new Map(),
+  planRequestsByToken: new Map(),
+  planRequestsByRequestKey: new Map(),
+  planRequestsByTurnKey: new Map(),
+  planQuestionRequestsByRequestKey: new Map(),
+  planQuestionRequestsByTurnKey: new Map(),
+  userInputRequestsByToken: new Map(),
+  userInputRequestsByRequestKey: new Map(),
+  completionDetailsByToken: new Map(),
+  planDetailsByToken: new Map(),
+  recentHistoryItems: [],
+  recentTimelineEntries: [],
+  pairingAttemptsByRemoteAddress: new Map(),
+  ipcClient: null,
+  stopping: false,
+};
+const state = await loadState(config.stateFile);
+const migratedPairedDevicesStateChanged = migratePairedDevicesState({ config, state });
+const restoredPendingPlanStateChanged = restorePendingPlanRequests({ config, runtime, state });
+const restoredPendingUserInputStateChanged = restorePendingUserInputRequests({ config, runtime, state });
+runtime.recentHistoryItems = normalizeHistoryItems(state.recentHistoryItems ?? [], config.maxHistoryItems);
+runtime.recentTimelineEntries = normalizeTimelineEntries(state.recentTimelineEntries ?? [], config.maxTimelineEntries);
+runtime.historyFileState.offset = Number(state.historyFileOffset) || 0;
+runtime.historyFileState.sourceFile = cleanText(state.historyFileSourceFile ?? "");
+
+function defaultLocale(config) {
+  return normalizeLocale(config?.defaultLocale || "") || DEFAULT_LOCALE;
+}
+
+function readPackageVersion() {
+  try {
+    const packageJsonPath = path.join(workspaceRoot, "package.json");
+    const parsed = JSON.parse(readFileSync(packageJsonPath, "utf8"));
+    return cleanText(parsed?.version ?? "") || "0.0.0";
+  } catch {
+    return "0.0.0";
+  }
+}
+
+function normalizeSupportedLocale(value, fallback = "") {
+  return normalizeLocale(value) || normalizeLocale(fallback) || "";
+}
+
+function getDeviceLocaleState(state, deviceId) {
+  const normalizedDeviceId = cleanText(deviceId || "");
+  if (!normalizedDeviceId || !isPlainObject(state?.deviceLocales)) {
+    return null;
+  }
+  const record = state.deviceLocales[normalizedDeviceId];
+  return isPlainObject(record) ? record : null;
+}
+
+function resolveDeviceLocaleInfo(config, state, deviceId) {
+  const record = getDeviceLocaleState(state, deviceId);
+  const resolved = resolveLocalePreference({
+    overrideLocale: record?.overrideLocale,
+    detectedLocale: record?.detectedLocale,
+    defaultLocale: config.defaultLocale,
+    fallbackLocale: DEFAULT_LOCALE,
+  });
+  return {
+    locale: resolved.locale,
+    source: resolved.source,
+    overrideLocale: normalizeSupportedLocale(record?.overrideLocale),
+    detectedLocale: normalizeSupportedLocale(record?.detectedLocale),
+  };
+}
+
+function upsertDetectedDeviceLocale(state, deviceId, detectedLocale) {
+  const normalizedDeviceId = cleanText(deviceId || "");
+  const normalizedLocale = normalizeSupportedLocale(detectedLocale);
+  if (!normalizedDeviceId || !normalizedLocale) {
+    return false;
+  }
+  if (!isPlainObject(state.deviceLocales)) {
+    state.deviceLocales = {};
+  }
+  const previous = isPlainObject(state.deviceLocales[normalizedDeviceId]) ? state.deviceLocales[normalizedDeviceId] : {};
+  const next = {
+    ...previous,
+    detectedLocale: normalizedLocale,
+    updatedAtMs: Date.now(),
+  };
+  state.deviceLocales[normalizedDeviceId] = next;
+  return JSON.stringify(previous) !== JSON.stringify(next);
+}
+
+function setDeviceLocaleOverride(state, deviceId, overrideLocale) {
+  const normalizedDeviceId = cleanText(deviceId || "");
+  if (!normalizedDeviceId) {
+    return false;
+  }
+  if (!isPlainObject(state.deviceLocales)) {
+    state.deviceLocales = {};
+  }
+  const previous = isPlainObject(state.deviceLocales[normalizedDeviceId]) ? state.deviceLocales[normalizedDeviceId] : {};
+  const next = {
+    ...previous,
+    overrideLocale: normalizeSupportedLocale(overrideLocale) || "",
+    updatedAtMs: Date.now(),
+  };
+  state.deviceLocales[normalizedDeviceId] = next;
+  return JSON.stringify(previous) !== JSON.stringify(next);
+}
+
+function clearDeviceLocaleOverride(state, deviceId) {
+  const normalizedDeviceId = cleanText(deviceId || "");
+  const record = getDeviceLocaleState(state, normalizedDeviceId);
+  if (!normalizedDeviceId || !record || !record.overrideLocale) {
+    return false;
+  }
+  const next = {
+    ...record,
+    overrideLocale: "",
+    updatedAtMs: Date.now(),
+  };
+  state.deviceLocales[normalizedDeviceId] = next;
+  return true;
+}
+
+function buildSessionLocalePayload(config, state, deviceId) {
+  const resolved = resolveDeviceLocaleInfo(config, state, deviceId);
+  return {
+    locale: resolved.locale,
+    localeSource: resolved.source,
+    supportedLocales: [...SUPPORTED_LOCALES],
+    defaultLocale: defaultLocale(config),
+    deviceDetectedLocale: resolved.detectedLocale || null,
+    deviceOverrideLocale: resolved.overrideLocale || null,
+  };
+}
+
+function kindTitle(locale, kind) {
+  switch (kind) {
+    case "user_message":
+      return t(locale, "server.title.userMessage");
+    case "assistant_commentary":
+      return t(locale, "server.title.assistantCommentary");
+    case "assistant_final":
+      return t(locale, "server.title.assistantFinal");
+    case "approval":
+      return t(locale, "server.title.approval");
+    case "plan":
+      return t(locale, "server.title.plan");
+    case "plan_ready":
+      return t(locale, "server.title.planReady");
+    case "choice":
+      return t(locale, "server.title.choice");
+    case "completion":
+      return t(locale, "server.title.complete");
+    default:
+      return t(locale, "common.item");
+  }
+}
+
+function formatLocalizedTitle(locale, baseKeyOrTitle, threadLabel) {
+  const baseTitle = baseKeyOrTitle.includes(".") ? t(locale, baseKeyOrTitle) : baseKeyOrTitle;
+  return formatTitle(baseTitle, threadLabel);
+}
+
+function notificationIconPrefix(kind) {
+  switch (kind) {
+    case "approval":
+      return "✋";
+    case "plan":
+      return "🧭";
+    case "choice":
+      return "☑️";
+    case "completion":
+      return "✅";
+    default:
+      return "";
+  }
+}
+
+function withNotificationIcon(kind, title) {
+  const prefix = notificationIconPrefix(kind);
+  return prefix ? `${prefix} ${title}` : title;
+}
+
+function handleSignal() {
+  runtime.stopping = true;
+}
+
+function normalizeHistoryItems(rawItems, maxItems) {
+  if (!Array.isArray(rawItems)) {
+    return [];
+  }
+
+  const normalized = rawItems
+    .map(normalizeHistoryItem)
+    .filter(Boolean)
+    .sort((left, right) => Number(right.createdAtMs ?? 0) - Number(left.createdAtMs ?? 0));
+  const deduped = [];
+  const seen = new Set();
+  for (const item of normalized) {
+    if (seen.has(item.stableId)) {
+      continue;
+    }
+    seen.add(item.stableId);
+    deduped.push(item);
+    if (deduped.length >= maxItems) {
+      break;
+    }
+  }
+  return deduped;
+}
+
+function normalizeHistoryItem(raw) {
+  if (!isPlainObject(raw)) {
+    return null;
+  }
+
+  const stableId = cleanText(raw.stableId ?? raw.id ?? "");
+  const kind = cleanText(raw.kind ?? "");
+  const title = cleanText(raw.title ?? "");
+  const messageText = normalizeLongText(raw.messageText ?? "");
+  const createdAtMs = Number(raw.createdAtMs) || Date.now();
+  if (!stableId || !historyKinds.has(kind) || !title) {
+    return null;
+  }
+
+  return {
+    stableId,
+    token: cleanText(raw.token ?? "") || historyToken(stableId),
+    kind,
+    threadId: cleanText(raw.threadId ?? extractConversationIdFromStableId(stableId) ?? ""),
+    title,
+    threadLabel: cleanText(raw.threadLabel ?? ""),
+    summary: normalizeNotificationText(raw.summary ?? "") || formatNotificationBody(messageText, 100) || "",
+    messageText,
+    createdAtMs,
+    readOnly: raw.readOnly !== false,
+    primaryLabel: cleanText(raw.primaryLabel ?? "") || "詳細",
+    tone: cleanText(raw.tone ?? "") || "secondary",
+  };
+}
+
+function historyToken(stableId) {
+  return crypto.createHash("sha1").update(String(stableId), "utf8").digest("hex").slice(0, 24);
+}
+
+function normalizeTimelineEntries(rawItems, maxItems) {
+  if (!Array.isArray(rawItems)) {
+    return [];
+  }
+
+  const normalized = rawItems
+    .map(normalizeTimelineEntry)
+    .filter(Boolean)
+    .sort((left, right) => {
+      const createdAtDiff = Number(right.createdAtMs ?? 0) - Number(left.createdAtMs ?? 0);
+      if (createdAtDiff !== 0) {
+        return createdAtDiff;
+      }
+      return timelineKindSortPriority(right.kind) - timelineKindSortPriority(left.kind);
+    });
+  const deduped = [];
+  const seen = new Set();
+  for (const item of normalized) {
+    if (seen.has(item.stableId)) {
+      continue;
+    }
+    seen.add(item.stableId);
+    deduped.push(item);
+    if (deduped.length >= maxItems) {
+      break;
+    }
+  }
+  return deduped;
+}
+
+function timelineKindSortPriority(kind) {
+  switch (cleanText(kind || "")) {
+    case "completion":
+      return 70;
+    case "approval":
+    case "plan":
+    case "plan_ready":
+    case "choice":
+      return 60;
+    case "assistant_final":
+      return 50;
+    case "assistant_commentary":
+      return 40;
+    case "user_message":
+      return 30;
+    default:
+      return 0;
+  }
+}
+
+function normalizeTimelineEntry(raw) {
+  if (!isPlainObject(raw)) {
+    return null;
+  }
+
+  const stableId = cleanText(raw.stableId ?? raw.id ?? "");
+  const kind = cleanText(raw.kind ?? "");
+  const createdAtMs = Number(raw.createdAtMs) || Date.now();
+  if (!stableId || !timelineKinds.has(kind)) {
+    return null;
+  }
+
+  const messageText = normalizeLongText(raw.messageText ?? "");
+  const summary =
+    normalizeNotificationText(raw.summary ?? "") ||
+    formatNotificationBody(messageText, 180) ||
+    cleanText(raw.title ?? "") ||
+    "";
+  const threadLabel = cleanText(raw.threadLabel ?? "");
+  const title = cleanText(raw.title ?? "") || threadLabel || kindTitle(DEFAULT_LOCALE, kind);
+
+  return {
+    stableId,
+    token: cleanText(raw.token ?? "") || historyToken(stableId),
+    kind,
+    threadId: cleanText(raw.threadId ?? extractConversationIdFromStableId(stableId) ?? ""),
+    threadLabel,
+    title,
+    summary,
+    messageText,
+    createdAtMs,
+    readOnly: raw.readOnly !== false,
+    primaryLabel: cleanText(raw.primaryLabel ?? "") || "詳細",
+    tone: cleanText(raw.tone ?? "") || "secondary",
+  };
+}
+
+function recordTimelineEntry({ config, runtime, state, entry }) {
+  const normalized = normalizeTimelineEntry(entry);
+  if (!normalized) {
+    return false;
+  }
+
+  const nextItems = normalizeTimelineEntries(
+    [normalized, ...runtime.recentTimelineEntries.filter((item) => item.stableId !== normalized.stableId)],
+    config.maxTimelineEntries
+  );
+  const changed =
+    JSON.stringify(nextItems.map((item) => [item.stableId, item.title, item.createdAtMs])) !==
+    JSON.stringify(runtime.recentTimelineEntries.map((item) => [item.stableId, item.title, item.createdAtMs]));
+  runtime.recentTimelineEntries = nextItems;
+  state.recentTimelineEntries = nextItems;
+  return changed;
+}
+
+function timelineEntryByToken(runtime, token, kind = "") {
+  const normalizedToken = cleanText(token ?? "");
+  const normalizedKind = cleanText(kind ?? "");
+  return runtime.recentTimelineEntries.find(
+    (entry) => entry.token === normalizedToken && (!normalizedKind || entry.kind === normalizedKind)
+  );
+}
+
+function messageTimelineStableId(kind, threadId, itemId, messageText = "", createdAtMs = 0) {
+  const normalizedKind = cleanText(kind || "");
+  const normalizedThreadId = cleanText(threadId || "unknown");
+  const normalizedItemId = cleanText(itemId || "");
+  if (normalizedItemId) {
+    return `${normalizedKind}:${normalizedThreadId}:${normalizedItemId}`;
+  }
+  return `${normalizedKind}:${normalizedThreadId}:${Math.max(0, Number(createdAtMs) || 0)}:${historyToken(messageText)}`;
+}
+
+function historyItemFromEvent(event) {
+  if (!event?.id || !event?.title) {
+    return null;
+  }
+
+  if (event.kind !== "task_complete" && event.kind !== "plan_ready") {
+    return null;
+  }
+
+  const kind = event.kind === "task_complete" ? "completion" : "plan_ready";
+  const messageText = normalizeLongText(event.detailText || event.message || "");
+  return normalizeHistoryItem({
+    stableId: event.id,
+    kind,
+    threadId: cleanText(event.threadId ?? event.conversationId ?? ""),
+    title: event.title,
+    threadLabel: cleanText(event.threadLabel ?? ""),
+    summary: formatNotificationBody(messageText, 100) || event.message || "",
+    messageText,
+    createdAtMs: event.timestampMs || Date.now(),
+    readOnly: true,
+    primaryLabel: "詳細",
+    tone: "secondary",
+  });
+}
+
+function recordHistoryItem({ config, runtime, state, item }) {
+  const normalized = normalizeHistoryItem(item);
+  if (!normalized) {
+    return false;
+  }
+
+  const nextItems = normalizeHistoryItems(
+    [normalized, ...runtime.recentHistoryItems.filter((entry) => entry.stableId !== normalized.stableId)],
+    config.maxHistoryItems
+  );
+  const changed =
+    JSON.stringify(nextItems.map((entry) => [entry.stableId, entry.title, entry.createdAtMs])) !==
+    JSON.stringify(runtime.recentHistoryItems.map((entry) => [entry.stableId, entry.title, entry.createdAtMs]));
+  runtime.recentHistoryItems = nextItems;
+  state.recentHistoryItems = nextItems;
+  return changed;
+}
+
+function recordActionHistoryItem({ config, runtime, state, kind, stableId, token, title, threadLabel = "", messageText, summary }) {
+  return recordHistoryItem({
+    config,
+    runtime,
+    state,
+    item: {
+      stableId,
+      token,
+      kind,
+      title,
+      threadId: cleanText(extractConversationIdFromStableId(stableId) ?? ""),
+      threadLabel,
+      summary,
+      messageText,
+      createdAtMs: Date.now(),
+      readOnly: true,
+      primaryLabel: "詳細",
+      tone: "secondary",
+    },
+  });
+}
+
+function pendingApprovalStableId(approval) {
+  return `approval:${approval.requestKey}`;
+}
+
+function pendingPlanStableId(planRequest) {
+  return `plan:${planRequest.turnKey || planRequest.requestKey}`;
+}
+
+function pendingChoiceStableId(userInputRequest) {
+  return `choice:${userInputRequest.requestKey}`;
+}
+
+function buildAppItemUrl(config, kind, token) {
+  const url = new URL(`${config.nativeApprovalPublicBaseUrl}/app`);
+  url.searchParams.set("item", `${kind}:${token}`);
+  return url.toString();
+}
+
+function buildPushPayload({ config, kind, token, stableId, title, body }) {
+  return {
+    title: withNotificationIcon(kind, title),
+    body: formatNotificationBody(body, config.completionDetailThresholdChars) || body || title,
+    tag: stableId,
+    data: {
+      kind,
+      token,
+      stableId,
+      url: buildAppItemUrl(config, kind, token),
+    },
+  };
+}
+
+function pushSubscriptionId(endpoint) {
+  return crypto.createHash("sha1").update(String(endpoint || ""), "utf8").digest("hex").slice(0, 24);
+}
+
+function normalizePushSubscriptionRecord(raw) {
+  if (!isPlainObject(raw)) {
+    return null;
+  }
+  const endpoint = cleanText(raw.endpoint ?? "");
+  const deviceId = cleanText(raw.deviceId ?? "");
+  const p256dh = cleanText(raw.keys?.p256dh ?? raw.p256dh ?? "");
+  const auth = cleanText(raw.keys?.auth ?? raw.auth ?? "");
+  if (!endpoint || !deviceId || !p256dh || !auth) {
+    return null;
+  }
+  return {
+    id: cleanText(raw.id ?? "") || pushSubscriptionId(endpoint),
+    endpoint,
+    keys: { p256dh, auth },
+    deviceId,
+    userAgent: cleanText(raw.userAgent ?? ""),
+    standalone: raw.standalone === true,
+    createdAtMs: Number(raw.createdAtMs) || Date.now(),
+    updatedAtMs: Number(raw.updatedAtMs) || Date.now(),
+    lastSuccessfulDeliveryAtMs: Number(raw.lastSuccessfulDeliveryAtMs) || 0,
+  };
+}
+
+function serializePushSubscriptionRecord(record) {
+  return {
+    id: record.id,
+    endpoint: record.endpoint,
+    keys: record.keys,
+    deviceId: record.deviceId,
+    userAgent: record.userAgent ?? "",
+    standalone: record.standalone === true,
+    createdAtMs: Number(record.createdAtMs) || Date.now(),
+    updatedAtMs: Number(record.updatedAtMs) || Date.now(),
+    lastSuccessfulDeliveryAtMs: Number(record.lastSuccessfulDeliveryAtMs) || 0,
+  };
+}
+
+function listPushSubscriptions(state) {
+  if (!isPlainObject(state.pushSubscriptions)) {
+    return [];
+  }
+  return Object.values(state.pushSubscriptions)
+    .map((entry) => normalizePushSubscriptionRecord(entry))
+    .filter(Boolean);
+}
+
+function getPushSubscriptionForDevice(state, deviceId) {
+  const normalizedDeviceId = cleanText(deviceId || "");
+  if (!normalizedDeviceId) {
+    return null;
+  }
+  return listPushSubscriptions(state).find((entry) => entry.deviceId === normalizedDeviceId) ?? null;
+}
+
+function upsertPushSubscription(state, record) {
+  const normalized = normalizePushSubscriptionRecord(record);
+  if (!normalized) {
+    return false;
+  }
+  if (!isPlainObject(state.pushSubscriptions)) {
+    state.pushSubscriptions = {};
+  }
+
+  let changed = false;
+  for (const [id, existing] of Object.entries(state.pushSubscriptions)) {
+    const normalizedExisting = normalizePushSubscriptionRecord(existing);
+    if (!normalizedExisting) {
+      delete state.pushSubscriptions[id];
+      changed = true;
+      continue;
+    }
+    if (
+      normalizedExisting.id !== normalized.id &&
+      normalizedExisting.deviceId === normalized.deviceId
+    ) {
+      delete state.pushSubscriptions[id];
+      changed = true;
+    }
+  }
+
+  const previous = state.pushSubscriptions[normalized.id];
+  const serialized = serializePushSubscriptionRecord(normalized);
+  state.pushSubscriptions[normalized.id] = serialized;
+  return JSON.stringify(previous) !== JSON.stringify(serialized) || changed;
+}
+
+function deletePushSubscriptionById(state, subscriptionId) {
+  if (!subscriptionId || !isPlainObject(state.pushSubscriptions) || !state.pushSubscriptions[subscriptionId]) {
+    return false;
+  }
+  delete state.pushSubscriptions[subscriptionId];
+  return true;
+}
+
+function deletePushSubscriptionsForDevice(state, deviceId) {
+  let changed = false;
+  for (const subscription of listPushSubscriptions(state)) {
+    if (subscription.deviceId !== deviceId) {
+      continue;
+    }
+    delete state.pushSubscriptions[subscription.id];
+    changed = true;
+  }
+  return changed;
+}
+
+function pushDeliveryKey(deviceId, stableId) {
+  return `${cleanText(deviceId || "")}:${cleanText(stableId || "")}`;
+}
+
+async function deliverWebPushItem({ config, state, kind, token, stableId, title, body, buildLocalizedContent = null }) {
+  if (!config.webPushEnabled || config.dryRun) {
+    return false;
+  }
+
+  const subscriptions = listPushSubscriptions(state);
+  if (subscriptions.length === 0) {
+    return false;
+  }
+
+  if (!isPlainObject(state.pushDeliveries)) {
+    state.pushDeliveries = {};
+  }
+
+  let changed = false;
+
+  for (const subscription of subscriptions) {
+    const deliveryKey = pushDeliveryKey(subscription.deviceId, stableId);
+    if (state.pushDeliveries[deliveryKey]) {
+      continue;
+    }
+
+    try {
+      const locale = resolveDeviceLocaleInfo(config, state, subscription.deviceId).locale;
+      const localizedContent = typeof buildLocalizedContent === "function"
+        ? buildLocalizedContent({ locale, deviceId: subscription.deviceId })
+        : { title, body };
+      const payload = JSON.stringify(
+        buildPushPayload({
+          config,
+          kind,
+          token,
+          stableId,
+          title: localizedContent?.title || title,
+          body: localizedContent?.body || body,
+        })
+      );
+      await webPush.sendNotification(
+        {
+          endpoint: subscription.endpoint,
+          keys: subscription.keys,
+        },
+        payload
+      );
+      const now = Date.now();
+      state.pushDeliveries[deliveryKey] = now;
+      trimSeenEvents(state.pushDeliveries, config.maxSeenEvents * 4);
+      const stored = normalizePushSubscriptionRecord(state.pushSubscriptions?.[subscription.id]);
+      if (stored) {
+        stored.lastSuccessfulDeliveryAtMs = now;
+        stored.updatedAtMs = now;
+        state.pushSubscriptions[subscription.id] = serializePushSubscriptionRecord(stored);
+      }
+      changed = true;
+      console.log(`[web-push] ${stableId} | ${subscription.deviceId}`);
+    } catch (error) {
+      const statusCode = Number(error?.statusCode) || 0;
+      if (statusCode === 404 || statusCode === 410) {
+        changed = deletePushSubscriptionById(state, subscription.id) || changed;
+        console.warn(`[web-push-pruned] ${subscription.id} | ${statusCode}`);
+        continue;
+      }
+      console.error(`[web-push-error] ${stableId} | ${subscription.deviceId} | ${error.message}`);
+    }
+  }
+
+  return changed;
+}
+
+async function scanOnce({ config, runtime, state }) {
+  let dirty = false;
+  const now = Date.now();
+  let sessionIndexChanged = false;
+  let knownFilesChanged = false;
+
+  if (now - runtime.lastSessionIndexLoadAt >= config.sessionIndexRefreshMs) {
+    runtime.sessionIndex = await loadSessionIndex(config.sessionIndexFile);
+    runtime.lastSessionIndexLoadAt = now;
+    sessionIndexChanged = true;
+  }
+
+  if (now - runtime.lastDirectoryScanAt >= config.directoryScanIntervalMs) {
+    runtime.knownFiles = await listRolloutFiles(config.sessionsDir);
+    runtime.logsDbFile = config.codexLogsDbFile || (await findLatestCodexLogsDbFile(config.codexHome)) || "";
+    runtime.lastDirectoryScanAt = now;
+    knownFilesChanged = true;
+  }
+
+  if (sessionIndexChanged || knownFilesChanged) {
+    runtime.rolloutThreadLabels = await buildRolloutThreadLabelIndex(runtime.knownFiles, runtime.sessionIndex);
+    dirty = refreshResolvedThreadLabels({ config, runtime, state }) || dirty;
+  }
+
+  for (const filePath of runtime.knownFiles) {
+    const changed = await processRolloutFile({
+      filePath,
+      config,
+      runtime,
+      state,
+      now,
+    });
+    dirty = dirty || changed;
+  }
+
+  if (config.notifyCompletions || config.webUiEnabled) {
+    const changed = await processSqliteCompletionLog({
+      config,
+      runtime,
+      state,
+      now,
+    });
+    dirty = dirty || changed;
+  }
+
+  if (config.webUiEnabled) {
+    const sqliteTimelineChanged = await processSqliteTimelineLog({
+      config,
+      runtime,
+      state,
+      now,
+    });
+    dirty = dirty || sqliteTimelineChanged;
+
+    const historyTimelineChanged = await processHistoryTimelineFile({
+      config,
+      runtime,
+      state,
+      now,
+    });
+    dirty = dirty || historyTimelineChanged;
+  }
+
+  dirty = cleanupExpiredPlanRequests({ runtime, state, now }) || dirty;
+  dirty = cleanupExpiredUserInputRequests({ runtime, state, now }) || dirty;
+
+  return dirty;
+}
+
+async function processRolloutFile({ filePath, config, runtime, state, now }) {
+  let stat;
+  try {
+    stat = await fs.stat(filePath);
+  } catch {
+    return false;
+  }
+
+  let fileState = runtime.fileStates.get(filePath);
+  if (!fileState) {
+    const restoredOffset = state.fileOffsets[filePath];
+    const shouldReplayRecent = stat.mtimeMs >= now - config.replaySeconds * 1000;
+    fileState = {
+      offset:
+        typeof restoredOffset === "number"
+          ? restoredOffset
+          : shouldReplayRecent
+            ? Math.max(0, stat.size - config.maxReadBytes)
+            : stat.size,
+      remainder: "",
+      threadId: extractThreadIdFromRolloutPath(filePath),
+      cwd: null,
+      startupCutoffMs:
+        typeof restoredOffset === "number" ? 0 : now - config.replaySeconds * 1000,
+      skipPartialLine:
+        typeof restoredOffset !== "number" && shouldReplayRecent && stat.size > config.maxReadBytes,
+    };
+    runtime.fileStates.set(filePath, fileState);
+  }
+
+  if (stat.size < fileState.offset) {
+    fileState.offset = 0;
+    fileState.remainder = "";
+    fileState.skipPartialLine = false;
+  }
+
+  if (stat.size === fileState.offset) {
+    return false;
+  }
+
+  if (stat.size - fileState.offset > config.maxReadBytes) {
+    fileState.offset = Math.max(0, stat.size - config.maxReadBytes);
+    state.fileOffsets[filePath] = fileState.offset;
+    fileState.remainder = "";
+    fileState.skipPartialLine = true;
+  }
+
+  const length = stat.size - fileState.offset;
+  const handle = await fs.open(filePath, "r");
+  const buffer = Buffer.alloc(length);
+  try {
+    await handle.read(buffer, 0, length, fileState.offset);
+  } finally {
+    await handle.close();
+  }
+
+  const chunk = buffer.toString("utf8");
+  const merged = fileState.remainder + chunk;
+  const lines = merged.split("\n");
+  fileState.remainder = lines.pop() ?? "";
+  if (fileState.skipPartialLine && lines.length > 0) {
+    lines.shift();
+    fileState.skipPartialLine = false;
+  }
+  fileState.offset = stat.size;
+  state.fileOffsets[filePath] = fileState.offset;
+
+  let dirty = true;
+  for (const rawLine of lines) {
+    if (!rawLine.trim()) {
+      continue;
+    }
+
+    let record;
+    try {
+      record = JSON.parse(rawLine);
+    } catch {
+      continue;
+    }
+
+    if (record.type === "session_meta") {
+      fileState.threadId = record.payload?.id ?? fileState.threadId;
+      fileState.cwd = record.payload?.cwd ?? fileState.cwd;
+      continue;
+    }
+
+    if (config.webUiEnabled) {
+      const timelineEntry = buildRolloutUserTimelineEntry({
+        record,
+        fileState,
+        runtime,
+      });
+      if (timelineEntry) {
+        dirty =
+          recordTimelineEntry({
+            config,
+            runtime,
+            state,
+            entry: timelineEntry,
+          }) || dirty;
+      }
+    }
+
+    const event = buildRolloutEvent({
+      record,
+      filePath,
+      fileState,
+      sessionIndex: runtime.sessionIndex,
+      config,
+      runtime,
+      state,
+    });
+    if (!event) {
+      continue;
+    }
+
+    if (fileState.startupCutoffMs && event.timestampMs < fileState.startupCutoffMs) {
+      continue;
+    }
+
+    dirty =
+      (await processScannedEvent({
+        config,
+        runtime,
+        state,
+        event,
+      })) || dirty;
+  }
+
+  fileState.startupCutoffMs = 0;
+  return dirty;
+}
+
+async function processSqliteCompletionLog({ config, runtime, state, now }) {
+  const logsDbFile = cleanText(runtime.logsDbFile || config.codexLogsDbFile || "");
+  if (!logsDbFile) {
+    return false;
+  }
+
+  try {
+    await fs.access(logsDbFile);
+  } catch {
+    return false;
+  }
+
+  let dirty = false;
+  const sourceChanged = cleanText(state.sqliteCompletionSourceFile ?? "") !== logsDbFile;
+  if (sourceChanged) {
+    state.sqliteCompletionSourceFile = logsDbFile;
+    state.sqliteCompletionCursorId = 0;
+    dirty = true;
+  }
+
+  let cursorId = Number(state.sqliteCompletionCursorId) || 0;
+  const startupMinTsSec = Math.max(0, Math.floor((now - config.replaySeconds * 1000) / 1000));
+
+  while (true) {
+    let rows;
+    try {
+      rows = await querySqliteCompletionRows({
+        logsDbFile,
+        cursorId,
+        minTsSec: cursorId > 0 ? 0 : startupMinTsSec,
+      });
+    } catch (error) {
+      console.error(`[sqlite-completion-scan-error] ${error.message}`);
+      break;
+    }
+
+    if (rows.length === 0) {
+      break;
+    }
+
+    for (const row of rows) {
+      const rowId = Number(row.id) || 0;
+      if (rowId > cursorId) {
+        cursorId = rowId;
+      }
+
+      const event = buildSqliteCompletionEvent({
+        row,
+        config,
+        runtime,
+      });
+      if (!event) {
+        continue;
+      }
+
+      dirty =
+        (await processScannedEvent({
+          config,
+          runtime,
+          state,
+          event,
+        })) || dirty;
+    }
+
+    state.sqliteCompletionCursorId = cursorId;
+    dirty = true;
+
+    if (rows.length < SQLITE_COMPLETION_BATCH_SIZE) {
+      break;
+    }
+  }
+
+  return dirty;
+}
+
+async function processSqliteTimelineLog({ config, runtime, state, now }) {
+  const logsDbFile = cleanText(runtime.logsDbFile || config.codexLogsDbFile || "");
+  if (!logsDbFile) {
+    return false;
+  }
+
+  try {
+    await fs.access(logsDbFile);
+  } catch {
+    return false;
+  }
+
+  let dirty = false;
+  const sourceChanged = cleanText(state.sqliteMessageSourceFile ?? "") !== logsDbFile;
+  if (sourceChanged) {
+    state.sqliteMessageSourceFile = logsDbFile;
+    state.sqliteMessageCursorId = 0;
+    dirty = true;
+  }
+
+  let cursorId = Number(state.sqliteMessageCursorId) || 0;
+  const startupMinTsSec = Math.max(0, Math.floor((now - config.replaySeconds * 1000) / 1000));
+
+  while (true) {
+    let rows;
+    try {
+      rows = await querySqliteTimelineRows({
+        logsDbFile,
+        cursorId,
+        minTsSec: cursorId > 0 ? 0 : startupMinTsSec,
+      });
+    } catch (error) {
+      console.error(`[sqlite-timeline-scan-error] ${error.message}`);
+      break;
+    }
+
+    if (rows.length === 0) {
+      break;
+    }
+
+    for (const row of rows) {
+      const rowId = Number(row.id) || 0;
+      if (rowId > cursorId) {
+        cursorId = rowId;
+      }
+
+      const entry = buildSqliteTimelineEntry({
+        row,
+        config,
+        runtime,
+      });
+      if (!entry) {
+        continue;
+      }
+
+      dirty =
+        recordTimelineEntry({
+          config,
+          runtime,
+          state,
+          entry,
+        }) || dirty;
+    }
+
+    state.sqliteMessageCursorId = cursorId;
+    dirty = true;
+
+    if (rows.length < SQLITE_COMPLETION_BATCH_SIZE) {
+      break;
+    }
+  }
+
+  return dirty;
+}
+
+async function processHistoryTimelineFile({ config, runtime, state, now }) {
+  const historyFile = cleanText(config.historyFile || "");
+  if (!historyFile) {
+    return false;
+  }
+
+  try {
+    await fs.access(historyFile);
+  } catch {
+    return false;
+  }
+
+  let fileState = runtime.historyFileState;
+  let dirty = false;
+  if (cleanText(fileState.sourceFile) !== historyFile) {
+    fileState = {
+      offset: 0,
+      remainder: "",
+      skipPartialLine: false,
+      startupCutoffTs: 0,
+      sourceFile: historyFile,
+    };
+    runtime.historyFileState = fileState;
+    state.historyFileSourceFile = historyFile;
+    state.historyFileOffset = 0;
+    dirty = true;
+  }
+
+  let stat;
+  try {
+    stat = await fs.stat(historyFile);
+  } catch {
+    return dirty;
+  }
+
+  if (fileState.offset <= 0) {
+    const shouldReplayRecent = stat.mtimeMs >= now - config.replaySeconds * 1000;
+    fileState.offset = shouldReplayRecent ? Math.max(0, stat.size - config.maxReadBytes) : stat.size;
+    fileState.startupCutoffTs = shouldReplayRecent ? Math.floor((now - config.replaySeconds * 1000) / 1000) : 0;
+    fileState.skipPartialLine = shouldReplayRecent && stat.size > config.maxReadBytes;
+    state.historyFileOffset = fileState.offset;
+    dirty = true;
+  }
+
+  if (stat.size < fileState.offset) {
+    fileState.offset = 0;
+    fileState.remainder = "";
+    fileState.skipPartialLine = false;
+  }
+
+  if (stat.size === fileState.offset) {
+    return dirty;
+  }
+
+  if (stat.size - fileState.offset > config.maxReadBytes) {
+    fileState.offset = Math.max(0, stat.size - config.maxReadBytes);
+    fileState.remainder = "";
+    fileState.skipPartialLine = true;
+    state.historyFileOffset = fileState.offset;
+    dirty = true;
+  }
+
+  const length = stat.size - fileState.offset;
+  const handle = await fs.open(historyFile, "r");
+  const buffer = Buffer.alloc(length);
+  try {
+    await handle.read(buffer, 0, length, fileState.offset);
+  } finally {
+    await handle.close();
+  }
+
+  const chunk = buffer.toString("utf8");
+  const merged = fileState.remainder + chunk;
+  const lines = merged.split("\n");
+  fileState.remainder = lines.pop() ?? "";
+  if (fileState.skipPartialLine && lines.length > 0) {
+    lines.shift();
+    fileState.skipPartialLine = false;
+  }
+  fileState.offset = stat.size;
+  state.historyFileOffset = fileState.offset;
+  state.historyFileSourceFile = historyFile;
+  dirty = true;
+
+  for (const rawLine of lines) {
+    if (!rawLine.trim()) {
+      continue;
+    }
+
+    let record;
+    try {
+      record = JSON.parse(rawLine);
+    } catch {
+      continue;
+    }
+
+    const entry = buildHistoryUserTimelineEntry({
+      record,
+      runtime,
+      config,
+    });
+    if (!entry) {
+      continue;
+    }
+    if (fileState.startupCutoffTs && Math.floor(Number(entry.createdAtMs || 0) / 1000) < fileState.startupCutoffTs) {
+      continue;
+    }
+
+    dirty =
+      recordTimelineEntry({
+        config,
+        runtime,
+        state,
+        entry,
+      }) || dirty;
+  }
+
+  fileState.startupCutoffTs = 0;
+  return dirty;
+}
+
+async function querySqliteTimelineRows({ logsDbFile, cursorId, minTsSec = 0 }) {
+  const conditions = [
+    `id > ${Math.max(0, Number(cursorId) || 0)}`,
+    `target = 'codex_api::endpoint::responses_websocket'`,
+    `feedback_log_body LIKE '%websocket event: {"type":"response.output_item.done"%'`,
+    `feedback_log_body LIKE '%"type":"message"%'`,
+    `feedback_log_body LIKE '%"role":"assistant"%'`,
+  ];
+
+  if (Number(minTsSec) > 0) {
+    conditions.push(`ts >= ${Math.max(0, Number(minTsSec) || 0)}`);
+  }
+
+  const sql = `
+    SELECT id, ts, thread_id, feedback_log_body
+    FROM logs
+    WHERE ${conditions.join("\n      AND ")}
+    ORDER BY id ASC
+    LIMIT ${SQLITE_COMPLETION_BATCH_SIZE}
+  `;
+
+  return runSqliteJsonQuery(logsDbFile, sql);
+}
+
+function buildSqliteTimelineEntry({ row, config, runtime }) {
+  const body = String(row?.feedback_log_body ?? "");
+  const marker = "websocket event: ";
+  const markerIndex = body.indexOf(marker);
+  if (markerIndex === -1) {
+    return null;
+  }
+
+  let payload;
+  try {
+    payload = JSON.parse(body.slice(markerIndex + marker.length));
+  } catch {
+    return null;
+  }
+
+  if (payload?.type !== "response.output_item.done") {
+    return null;
+  }
+
+  const item = isPlainObject(payload.item) ? payload.item : null;
+  if (!item || item.type !== "message" || item.role !== "assistant") {
+    return null;
+  }
+
+  const phase = cleanText(item.phase || "");
+  const kind =
+    phase === "commentary"
+      ? "assistant_commentary"
+      : phase === "final_answer"
+        ? "assistant_final"
+        : "";
+  if (!kind) {
+    return null;
+  }
+
+  const threadId = cleanText(row.thread_id || extractThreadIdFromLogBody(body));
+  if (!threadId) {
+    return null;
+  }
+
+  const messageText = extractRolloutMessageText(item.content);
+  if (!messageText) {
+    return null;
+  }
+
+  const createdAtMs = Math.max(0, Number(row.ts) || 0) * 1000 || Date.now();
+  const threadLabel = getNativeThreadLabel({
+    runtime,
+    conversationId: threadId,
+    cwd: "",
+  });
+  const stableId = messageTimelineStableId(kind, threadId, item.id || row.id, messageText, createdAtMs);
+
+  return normalizeTimelineEntry({
+    stableId,
+    token: historyToken(stableId),
+    kind,
+    threadId,
+    threadLabel,
+    title: threadLabel || kindTitle(config.defaultLocale, kind),
+    summary: formatNotificationBody(messageText, 180) || messageText,
+    messageText,
+    createdAtMs,
+    readOnly: true,
+  });
+}
+
+function buildRolloutUserTimelineEntry({ record, fileState, runtime }) {
+  const payload = isPlainObject(record?.payload) ? record.payload : null;
+  if (!payload || payload.type !== "message" || payload.role !== "user") {
+    return null;
+  }
+
+  const messageText = extractRolloutMessageText(payload.content);
+  if (!messageText) {
+    return null;
+  }
+
+  const threadId = cleanText(fileState.threadId || "");
+  if (!threadId) {
+    return null;
+  }
+
+  const createdAtMs = Date.parse(record.timestamp ?? "") || Date.now();
+  const stableId = messageTimelineStableId("user_message", threadId, payload.id || record.timestamp, messageText, createdAtMs);
+  const threadLabel = getNativeThreadLabel({
+    runtime,
+    conversationId: threadId,
+    cwd: fileState.cwd || "",
+  });
+
+  return normalizeTimelineEntry({
+    stableId,
+    token: historyToken(stableId),
+    kind: "user_message",
+    threadId,
+    threadLabel,
+    title: threadLabel || kindTitle(DEFAULT_LOCALE, "user_message"),
+    summary: formatNotificationBody(messageText, 180) || messageText,
+    messageText,
+    createdAtMs,
+    readOnly: true,
+  });
+}
+
+function buildHistoryUserTimelineEntry({ record, runtime, config }) {
+  if (!isPlainObject(record)) {
+    return null;
+  }
+
+  const threadId = cleanText(record.session_id || record.sessionId || "");
+  const messageText = normalizeLongText(record.text ?? "");
+  if (!threadId || !messageText) {
+    return null;
+  }
+  if (!runtime.threadStates.has(threadId) && !runtime.sessionIndex.has(threadId) && !runtime.rolloutThreadLabels.has(threadId)) {
+    return null;
+  }
+
+  const createdAtMs = Math.max(0, Number(record.ts) || 0) * 1000 || Date.now();
+  const stableId = messageTimelineStableId("user_message", threadId, record.id || record.ts, messageText, createdAtMs);
+  const threadLabel = getNativeThreadLabel({
+    runtime,
+    conversationId: threadId,
+    cwd: "",
+  });
+
+  return normalizeTimelineEntry({
+    stableId,
+    token: historyToken(stableId),
+    kind: "user_message",
+    threadId,
+    threadLabel,
+    title: threadLabel || kindTitle(config.defaultLocale, "user_message"),
+    summary: formatNotificationBody(messageText, 180) || messageText,
+    messageText,
+    createdAtMs,
+    readOnly: true,
+  });
+}
+
+async function processScannedEvent({ config, runtime, state, event }) {
+  if (!event || state.seenEvents[event.id]) {
+    return false;
+  }
+
+  let dirty = false;
+
+  if (event.kind === "task_complete") {
+    attachCompletionDetails({ config, runtime, event });
+  } else if (event.kind === "plan_ready") {
+    attachPlanDetails({ config, runtime, event });
+  }
+
+  dirty =
+    recordHistoryItem({
+      config,
+      runtime,
+      state,
+      item: historyItemFromEvent(event),
+    }) || dirty;
+
+  if (event.kind === "task_complete") {
+    dirty =
+      (await deliverWebPushItem({
+        config,
+        state,
+        kind: "completion",
+        token: historyToken(event.id),
+        stableId: event.id,
+        title: event.title,
+        body: event.detailText || event.message,
+        buildLocalizedContent: ({ locale }) => ({
+          title: formatLocalizedTitle(locale, "server.title.complete", event.threadLabel),
+          body: event.detailText || event.message,
+        }),
+      })) || dirty;
+  }
+
+  if (config.enableNtfy) {
+    try {
+      await publishNtfy(config, event);
+    } catch (error) {
+      console.error(`[notify-error] ${event.kind} | ${event.title} | ${error.message}`);
+    }
+  }
+
+  state.seenEvents[event.id] = event.timestampMs || Date.now();
+  trimSeenEvents(state.seenEvents, config.maxSeenEvents);
+  return true;
+}
+
+async function querySqliteCompletionRows({ logsDbFile, cursorId, minTsSec = 0 }) {
+  const conditions = [
+    `id > ${Math.max(0, Number(cursorId) || 0)}`,
+    `target = 'codex_api::endpoint::responses_websocket'`,
+    `feedback_log_body LIKE '%websocket event: {"type":"response.output_item.done"%'`,
+    `feedback_log_body LIKE '%"type":"message"%'`,
+    `feedback_log_body LIKE '%"role":"assistant"%'`,
+    `feedback_log_body LIKE '%"phase":"final_answer"%'`,
+  ];
+
+  if (Number(minTsSec) > 0) {
+    conditions.push(`ts >= ${Math.max(0, Number(minTsSec) || 0)}`);
+  }
+
+  const sql = `
+    SELECT id, ts, thread_id, feedback_log_body
+    FROM logs
+    WHERE ${conditions.join("\n      AND ")}
+    ORDER BY id ASC
+    LIMIT ${SQLITE_COMPLETION_BATCH_SIZE}
+  `;
+
+  return runSqliteJsonQuery(logsDbFile, sql);
+}
+
+async function runSqliteJsonQuery(dbFile, sql) {
+  return new Promise((resolve, reject) => {
+    const child = spawn("sqlite3", ["-json", dbFile, sql], {
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+
+    let stdout = "";
+    let stderr = "";
+
+    child.stdout.on("data", (chunk) => {
+      stdout += chunk.toString("utf8");
+    });
+    child.stderr.on("data", (chunk) => {
+      stderr += chunk.toString("utf8");
+    });
+    child.on("error", (error) => {
+      reject(error);
+    });
+    child.on("close", (code) => {
+      if (code !== 0) {
+        reject(new Error(cleanText(stderr) || `sqlite3-exit-${code}`));
+        return;
+      }
+      if (!cleanText(stdout)) {
+        resolve([]);
+        return;
+      }
+      try {
+        const parsed = JSON.parse(stdout);
+        resolve(Array.isArray(parsed) ? parsed : []);
+      } catch (error) {
+        reject(new Error(`sqlite-json-parse-failed: ${error.message}`));
+      }
+    });
+  });
+}
+
+function buildSqliteCompletionEvent({ row, config, runtime }) {
+  const body = String(row?.feedback_log_body ?? "");
+  const marker = "websocket event: ";
+  const markerIndex = body.indexOf(marker);
+  if (markerIndex === -1) {
+    return null;
+  }
+
+  let payload;
+  try {
+    payload = JSON.parse(body.slice(markerIndex + marker.length));
+  } catch {
+    return null;
+  }
+
+  if (payload?.type !== "response.output_item.done") {
+    return null;
+  }
+
+  const item = isPlainObject(payload.item) ? payload.item : null;
+  if (!item || item.type !== "message" || item.role !== "assistant" || item.phase !== "final_answer") {
+    return null;
+  }
+
+  const threadId = cleanText(row.thread_id || extractThreadIdFromLogBody(body));
+  const turnId = cleanText(extractTurnIdFromLogBody(body) || item.id || row.id);
+  if (!threadId || !turnId) {
+    return null;
+  }
+
+  const outputTexts = Array.isArray(item.content)
+    ? item.content
+        .map((entry) => (isPlainObject(entry) && entry.type === "output_text" ? normalizeLongText(entry.text ?? "") : ""))
+        .filter(Boolean)
+    : [];
+  const detailText = formatCompletionDetailText(outputTexts.join("\n\n"), config.defaultLocale);
+  const message = formatNotificationBody(detailText, config.completionDetailThresholdChars) || t(config.defaultLocale, "server.message.taskFinished");
+  const threadLabel = getNativeThreadLabel({
+    runtime,
+    conversationId: threadId,
+    cwd: "",
+  });
+
+  return {
+    id: `task_complete:${threadId}:${turnId}`,
+    kind: "task_complete",
+    timestampMs: Math.max(0, Number(row.ts) || 0) * 1000 || Date.now(),
+    title: formatTitle(config.completeTitle, threadLabel),
+    threadLabel,
+    message,
+    detailText,
+    threadId,
+    turnId,
+    priority: config.completePriority,
+    tags: config.completeTags,
+    clickUrl: config.clickUrl,
+  };
+}
+
+function extractThreadIdFromLogBody(body) {
+  return (
+    String(body || "").match(/thread(?:\.id|_id)=([0-9a-f-]{36})/iu)?.[1] ??
+    String(body || "").match(/conversation\.id=([0-9a-f-]{36})/iu)?.[1] ??
+    ""
+  );
+}
+
+function extractTurnIdFromLogBody(body) {
+  return String(body || "").match(/turn(?:\.id|_id)=([0-9a-f-]{36})/iu)?.[1] ?? "";
+}
+
+function buildRolloutEvent({ record, filePath, fileState, sessionIndex, config, runtime, state }) {
+  const timestampMs = Date.parse(record.timestamp ?? "") || Date.now();
+  const threadId =
+    record.payload?.thread_id ??
+    record.payload?.threadId ??
+    fileState.threadId ??
+    extractThreadIdFromRolloutPath(filePath);
+  const threadName = getThreadName(sessionIndex, runtime.rolloutThreadLabels, threadId, fileState.cwd, filePath);
+  const context = describeContext({ threadName, cwd: fileState.cwd, filePath });
+
+  if (record.type === "event_msg" && record.payload?.type === "item_completed" && (config.notifyPlans || config.webUiEnabled)) {
+    const item = record.payload.item;
+    if (item?.type === "Plan") {
+      const turnId = cleanText(record.payload.turn_id ?? record.payload.turnId ?? "");
+      if (shouldSuppressPlanReadyEvent({ runtime, state, threadId, turnId })) {
+        console.log(`[plan-ready-suppressed] ${planTurnKey(threadId, turnId) || threadId || "unknown"}`);
+        return null;
+      }
+
+      const planId = turnId || item.id || record.timestamp;
+      const detailText = formatPlanDetailText(item.text ?? "", config.defaultLocale);
+      const message = formatNotificationBody(detailText, config.completionDetailThresholdChars) || t(config.defaultLocale, "server.message.planReady");
+
+      return {
+        id: `plan_ready:${threadId ?? "unknown"}:${planId}`,
+        kind: "plan_ready",
+        timestampMs,
+        title: formatTitle(config.planReadyTitle, context.threadLabel),
+        threadLabel: context.threadLabel,
+        message,
+        detailText,
+        threadId,
+        turnId,
+        priority: config.planPriority,
+        tags: config.planTags,
+      };
+    }
+  }
+
+  if (record.type === "event_msg" && record.payload?.type === "task_complete" && (config.notifyCompletions || config.webUiEnabled)) {
+    const turnId = record.payload.turn_id ?? record.payload.turnId ?? record.timestamp;
+    const detailText = formatCompletionDetailText(record.payload.last_agent_message ?? "", config.defaultLocale);
+    const message = formatNotificationBody(detailText, config.completionDetailThresholdChars) || t(config.defaultLocale, "server.message.taskFinished");
+
+    return {
+      id: `task_complete:${threadId ?? "unknown"}:${turnId}`,
+      kind: "task_complete",
+      timestampMs,
+      title: formatTitle(config.completeTitle, context.threadLabel),
+      threadLabel: context.threadLabel,
+      message,
+      detailText,
+      priority: config.completePriority,
+      tags: config.completeTags,
+      clickUrl: config.clickUrl,
+    };
+  }
+
+  if (
+    !config.nativeApprovals &&
+    record.type === "response_item" &&
+    record.payload?.type === "function_call" &&
+    config.notifyApprovals
+  ) {
+    const approval = extractLegacyApprovalRequest(record.payload);
+    if (!approval) {
+      return null;
+    }
+
+    const cmd = truncate(singleLine(approval.cmd ?? ""), config.maxCommandChars);
+    const justification = truncate(cleanText(approval.justification ?? ""), config.maxJustificationChars);
+    const message = formatMessage(
+      [
+        t(config.defaultLocale, "server.message.approveOnMac"),
+        justification || t(config.defaultLocale, "server.message.approvalNeededInCodex"),
+        cmd ? t(config.defaultLocale, "server.message.commandPrefix", { command: cmd }) : null,
+        approval.extraCount > 0 ? t(config.defaultLocale, "server.message.extraApprovals", { count: approval.extraCount }) : null,
+      ],
+      1024
+    );
+
+    return {
+      id: `approval_needed:${threadId ?? "unknown"}:${approval.eventId}`,
+      kind: "approval_needed",
+      timestampMs,
+      title: formatTitle(config.approvalTitle, context.threadLabel),
+      threadLabel: context.threadLabel,
+      message,
+      priority: config.approvalPriority,
+      tags: config.approvalTags,
+      clickUrl: config.clickUrl,
+    };
+  }
+
+  return null;
+}
+
+function extractLegacyApprovalRequest(payload) {
+  const name = payload.name ?? "";
+  const args = safeJsonParse(payload.arguments);
+  if (!args) {
+    return null;
+  }
+
+  if (name === "exec_command" && args.sandbox_permissions === "require_escalated") {
+    return {
+      eventId: payload.call_id ?? payload.callId ?? payload.id ?? Date.now().toString(),
+      cmd: args.cmd ?? "",
+      justification: args.justification ?? "",
+    };
+  }
+
+  if (name === "parallel" && Array.isArray(args.tool_uses)) {
+    const matching = args.tool_uses.filter(
+      (toolUse) => toolUse?.parameters?.sandbox_permissions === "require_escalated"
+    );
+    if (matching.length === 0) {
+      return null;
+    }
+
+    const first = matching[0];
+    return {
+      eventId: payload.call_id ?? payload.callId ?? payload.id ?? Date.now().toString(),
+      cmd: first?.parameters?.cmd ?? first?.recipient_name ?? "parallel tool call",
+      justification: first?.parameters?.justification ?? "",
+      extraCount: Math.max(0, matching.length - 1),
+    };
+  }
+
+  return null;
+}
+
+async function syncNativeApprovals({ config, runtime, state, conversationId, previousRequests, nextRequests, sourceClientId }) {
+  let stateChanged = false;
+  if (sourceClientId) {
+    runtime.threadOwnerClientIds.set(conversationId, sourceClientId);
+  }
+
+  const previousKeys = new Map(previousRequests.map((request) => [nativeRequestKey(conversationId, request.id), request]));
+  const nextKeys = new Map(nextRequests.map((request) => [nativeRequestKey(conversationId, request.id), request]));
+
+  for (const [requestKey, request] of nextKeys) {
+    const existing = runtime.nativeApprovalsByRequestKey.get(requestKey);
+    if (existing) {
+      existing.ownerClientId =
+        runtime.threadOwnerClientIds.get(conversationId) ??
+        existing.ownerClientId ??
+        null;
+      continue;
+    }
+
+    if (previousKeys.has(requestKey)) {
+      continue;
+    }
+
+    const approval = createNativeApproval({
+      config,
+      runtime,
+      conversationId,
+      request,
+    });
+    if (!approval) {
+      continue;
+    }
+
+    runtime.nativeApprovalsByRequestKey.set(requestKey, approval);
+    runtime.nativeApprovalsByToken.set(approval.token, approval);
+
+    try {
+      await publishNtfy(config, {
+        kind: "native_approval",
+        title: approval.title,
+        message: formatNotificationBody(approval.messageText, config.completionDetailThresholdChars),
+        priority: config.approvalPriority,
+        tags: config.approvalTags,
+        clickUrl: approval.reviewUrl,
+        actions: buildNativeApprovalActions(approval.reviewUrl, config.defaultLocale),
+      });
+      console.log(`[native-approval] ${requestKey} | ${approval.title}`);
+    } catch (error) {
+      console.error(`[native-approval-error] ${requestKey} | ${error.message}`);
+    }
+
+    stateChanged =
+      await deliverWebPushItem({
+        config,
+        state,
+        kind: "approval",
+        token: approval.token,
+        stableId: pendingApprovalStableId(approval),
+        title: approval.title,
+        body: approval.messageText,
+        buildLocalizedContent: ({ locale }) => ({
+          title: formatLocalizedTitle(locale, "server.title.approval", approval.threadLabel),
+          body: approval.messageText,
+        }),
+      }) || stateChanged;
+  }
+
+  for (const requestKey of previousKeys.keys()) {
+    if (nextKeys.has(requestKey)) {
+      continue;
+    }
+    expireNativeApproval(runtime, requestKey);
+  }
+
+  if (stateChanged) {
+    await saveState(config.stateFile, state);
+  }
+}
+
+async function syncPlanImplementationRequests({
+  config,
+  runtime,
+  state,
+  conversationId,
+  previousRequests,
+  nextRequests,
+  sourceClientId,
+}) {
+  let stateChanged = false;
+  const now = Date.now();
+
+  if (sourceClientId) {
+    runtime.threadOwnerClientIds.set(conversationId, sourceClientId);
+  }
+
+  const previousPlans = new Map(
+    previousRequests
+      .filter((request) => request.method === "item/plan/requestImplementation")
+      .map((request) => [nativeRequestKey(conversationId, request.id), request])
+  );
+  const nextPlans = new Map(
+    nextRequests
+      .filter((request) => request.method === "item/plan/requestImplementation")
+      .map((request) => [nativeRequestKey(conversationId, request.id), request])
+  );
+
+  for (const [requestKey, request] of nextPlans) {
+    const turnKey = planTurnKeyFromRequest(conversationId, request);
+    const existingPlanRequest =
+      runtime.planRequestsByRequestKey.get(requestKey) ?? runtime.planRequestsByTurnKey.get(turnKey) ?? null;
+    let planRequest = existingPlanRequest;
+
+    if (!planRequest && state.dismissedPlanRequests[requestKey]) {
+      stateChanged = markPlanTurnSuppressed(state, turnKey, config.maxSeenEvents) || stateChanged;
+      continue;
+    }
+
+    const hadExistingSession = Boolean(existingPlanRequest);
+    const wasLiveRequestActive = existingPlanRequest?.isLiveRequestActive === true;
+    const wasRecovered = !existingPlanRequest && previousPlans.has(requestKey);
+
+    if (!planRequest) {
+      planRequest = createPlanImplementationRequest({
+        config,
+        runtime,
+        conversationId,
+        request,
+        now,
+      });
+      if (!planRequest) {
+        continue;
+      }
+    } else {
+      const previousRequestKey = planRequest.requestKey;
+      updatePlanImplementationRequest({
+        config,
+        runtime,
+        conversationId,
+        request,
+        planRequest,
+        now,
+      });
+      if (previousRequestKey && previousRequestKey !== planRequest.requestKey) {
+        runtime.planRequestsByRequestKey.delete(previousRequestKey);
+      }
+    }
+
+    stateChanged = applyStoredPlanQuestionRequest(runtime, planRequest) || stateChanged;
+    registerPlanImplementationRequest(runtime, planRequest);
+    stateChanged = storePendingPlanRequest(state, planRequest) || stateChanged;
+    stateChanged = markPlanTurnSuppressed(state, planRequest.turnKey, config.maxSeenEvents) || stateChanged;
+    if (!planRequest.resolved) {
+      stateChanged = markPlanTurnActive(state, planRequest.turnKey, config.maxSeenEvents) || stateChanged;
+    }
+
+    const shouldNotify = !planRequest.resolved && !wasRecovered && (!hadExistingSession || !wasLiveRequestActive);
+    if (shouldNotify) {
+      try {
+        await publishNtfy(config, {
+          kind: "native_plan_request",
+          title: planRequest.title,
+          message: formatNotificationBody(planRequest.messageText, config.completionDetailThresholdChars),
+          priority: config.planPriority,
+          tags: config.planTags,
+          clickUrl: planRequest.reviewUrl,
+          actions: buildPlanRequestActions(planRequest.reviewUrl, config.defaultLocale),
+        });
+        console.log(
+          `[${hadExistingSession ? "plan-request-reused" : "plan-request"}] ${planRequest.requestKey} | ${planRequest.title}`
+        );
+      } catch (error) {
+        console.error(`[plan-request-error] ${planRequest.requestKey} | ${error.message}`);
+      }
+
+      stateChanged =
+        await deliverWebPushItem({
+          config,
+          state,
+          kind: "plan",
+          token: planRequest.token,
+          stableId: pendingPlanStableId(planRequest),
+          title: planRequest.title,
+          body: planRequest.messageText,
+          buildLocalizedContent: ({ locale }) => ({
+            title: formatLocalizedTitle(locale, "server.title.plan", planRequest.threadLabel),
+            body: planRequest.messageText,
+          }),
+        }) || stateChanged;
+    }
+  }
+
+  for (const [requestKey] of previousPlans) {
+    if (nextPlans.has(requestKey)) {
+      continue;
+    }
+    const planRequest = runtime.planRequestsByRequestKey.get(requestKey);
+    if (!planRequest) {
+      continue;
+    }
+
+    if (planRequest.isLiveRequestActive) {
+      planRequest.isLiveRequestActive = false;
+      planRequest.lastSeenAtMs = Math.max(planRequest.lastSeenAtMs ?? 0, now);
+      planRequest.expiresAtMs = Math.max(planRequest.expiresAtMs ?? 0, now + config.planRequestTtlMs);
+      stateChanged = storePendingPlanRequest(state, planRequest) || stateChanged;
+      stateChanged = clearPlanTurnActive(state, planRequest.turnKey) || stateChanged;
+      stateChanged = markPlanTurnSuppressed(state, planRequest.turnKey, config.maxSeenEvents) || stateChanged;
+      console.log(`[plan-request-retained] ${planRequest.turnKey || requestKey}`);
+    }
+  }
+
+  if (stateChanged) {
+    await saveState(config.stateFile, state);
+  }
+}
+
+async function syncPlanUserInputRequests({
+  config,
+  runtime,
+  state,
+  conversationId,
+  nextRequests,
+  sourceClientId,
+}) {
+  let stateChanged = false;
+  const now = Date.now();
+
+  if (sourceClientId) {
+    runtime.threadOwnerClientIds.set(conversationId, sourceClientId);
+  }
+
+  for (const request of nextRequests) {
+    if (!isPlanQuestionRequest(request)) {
+      continue;
+    }
+
+    const questionRequestId = cleanText(request.id);
+    const requestKey = questionRequestId ? nativeRequestKey(conversationId, questionRequestId) : "";
+    const turnId = extractPlanQuestionTurnId(request.params);
+    const turnKey = turnId ? planTurnKey(conversationId, turnId) : "";
+
+    const existingQuestionRequest =
+      (requestKey ? runtime.planQuestionRequestsByRequestKey.get(requestKey) : null) ??
+      (turnKey ? runtime.planQuestionRequestsByTurnKey.get(turnKey) : null) ??
+      null;
+
+    let questionRequest = existingQuestionRequest;
+    if (!questionRequest) {
+      questionRequest = createPlanQuestionRequest({
+        runtime,
+        conversationId,
+        request,
+        sourceClientId,
+        now,
+      });
+      if (!questionRequest) {
+        continue;
+      }
+    } else {
+      const previousRequestKey = questionRequest.requestKey;
+      updatePlanQuestionRequest({
+        runtime,
+        conversationId,
+        request,
+        sourceClientId,
+        planQuestionRequest: questionRequest,
+        now,
+      });
+      if (previousRequestKey && previousRequestKey !== questionRequest.requestKey) {
+        runtime.planQuestionRequestsByRequestKey.delete(previousRequestKey);
+      }
+    }
+
+    registerPlanQuestionRequest(runtime, questionRequest);
+
+    const planRequest =
+      (questionRequest.turnKey ? runtime.planRequestsByTurnKey.get(questionRequest.turnKey) : null) ??
+      findLatestPlanRequestForConversation(runtime, conversationId);
+    if (!planRequest || planRequest.resolved) {
+      continue;
+    }
+
+    stateChanged = attachPlanQuestionRequest(planRequest, questionRequest) || stateChanged;
+    stateChanged = storePendingPlanRequest(state, planRequest) || stateChanged;
+  }
+
+  if (stateChanged) {
+    await saveState(config.stateFile, state);
+  }
+}
+
+async function syncGenericUserInputRequests({
+  config,
+  runtime,
+  state,
+  conversationId,
+  previousRequests = [],
+  nextRequests,
+  sourceClientId,
+}) {
+  let stateChanged = false;
+  const now = Date.now();
+
+  if (sourceClientId) {
+    runtime.threadOwnerClientIds.set(conversationId, sourceClientId);
+  }
+
+  const previousGeneric = new Map(
+    previousRequests
+      .filter((request) => isGenericUserInputRequest(request))
+      .map((request) => [nativeRequestKey(conversationId, request.id), request])
+  );
+  const nextGeneric = new Map(
+    nextRequests
+      .filter((request) => isGenericUserInputRequest(request))
+      .map((request) => [nativeRequestKey(conversationId, request.id), request])
+  );
+
+  for (const [requestKey, request] of nextGeneric) {
+    let userInputRequest = runtime.userInputRequestsByRequestKey.get(requestKey) ?? null;
+    const hadExistingSession = Boolean(userInputRequest);
+    const wasLiveRequestActive = userInputRequest?.isLiveRequestActive === true;
+    const wasSupported = userInputRequest?.supported === true;
+
+    if (!userInputRequest) {
+      userInputRequest = createGenericUserInputRequest({
+        config,
+        runtime,
+        conversationId,
+        request,
+        now,
+      });
+      if (!userInputRequest) {
+        continue;
+      }
+    } else {
+      const previousRequestKey = userInputRequest.requestKey;
+      updateGenericUserInputRequest({
+        config,
+        runtime,
+        conversationId,
+        request,
+        userInputRequest,
+        now,
+      });
+      if (previousRequestKey && previousRequestKey !== userInputRequest.requestKey) {
+        runtime.userInputRequestsByRequestKey.delete(previousRequestKey);
+      }
+    }
+
+    registerGenericUserInputRequest(runtime, userInputRequest);
+    stateChanged = storePendingUserInputRequest(state, userInputRequest) || stateChanged;
+
+    const shouldNotify =
+      !userInputRequest.resolved &&
+      (!hadExistingSession || !wasLiveRequestActive || (!wasSupported && userInputRequest.supported));
+    if (shouldNotify) {
+      try {
+        await publishNtfy(config, {
+          kind: userInputRequest.supported ? "user_input" : "user_input_read_only",
+          title: userInputRequest.title,
+          message: formatNotificationBody(
+            userInputRequest.notificationText || userInputRequest.messageText,
+            config.completionDetailThresholdChars
+          ),
+          priority: config.planPriority,
+          tags: config.planTags,
+          clickUrl: userInputRequest.reviewUrl,
+          actions: userInputRequest.supported
+            ? buildUserInputActions(userInputRequest.reviewUrl, config.defaultLocale)
+            : buildUserInputFallbackActions(userInputRequest.reviewUrl, config.defaultLocale),
+        });
+        console.log(
+          `[${userInputRequest.supported ? "user-input" : "user-input-fallback"}] ${requestKey} | ${userInputRequest.title}`
+        );
+      } catch (error) {
+        console.error(`[user-input-error] ${requestKey} | ${error.message}`);
+      }
+
+      stateChanged =
+        await deliverWebPushItem({
+          config,
+          state,
+          kind: "choice",
+          token: userInputRequest.token,
+          stableId: pendingChoiceStableId(userInputRequest),
+          title: userInputRequest.title,
+          body: userInputRequest.notificationText || userInputRequest.messageText,
+          buildLocalizedContent: ({ locale }) => ({
+            title: formatLocalizedTitle(
+              locale,
+              userInputRequest.supported ? "server.title.choice" : "server.title.choiceReadOnly",
+              userInputRequest.threadLabel
+            ),
+            body: userInputRequest.notificationText || userInputRequest.messageText,
+          }),
+        }) || stateChanged;
+    }
+  }
+
+  for (const [requestKey] of previousGeneric) {
+    if (nextGeneric.has(requestKey)) {
+      continue;
+    }
+
+    const userInputRequest = runtime.userInputRequestsByRequestKey.get(requestKey);
+    if (!userInputRequest) {
+      continue;
+    }
+
+    if (userInputRequest.isLiveRequestActive) {
+      userInputRequest.isLiveRequestActive = false;
+      userInputRequest.lastSeenAtMs = Math.max(userInputRequest.lastSeenAtMs ?? 0, now);
+      userInputRequest.expiresAtMs = Math.max(userInputRequest.expiresAtMs ?? 0, now + config.planRequestTtlMs);
+      stateChanged = storePendingUserInputRequest(state, userInputRequest) || stateChanged;
+      console.log(`[user-input-retained] ${requestKey}`);
+    }
+  }
+
+  if (stateChanged) {
+    await saveState(config.stateFile, state);
+  }
+}
+
+function createNativeApproval({ config, runtime, conversationId, request, now = Date.now() }) {
+  const kind = nativeApprovalKind(request.method);
+  if (!kind) {
+    return null;
+  }
+
+  const requestId = request.id;
+  if (requestId == null) {
+    return null;
+  }
+
+  const threadLabel = getNativeThreadLabel({
+    runtime,
+    conversationId,
+    cwd: request.params?.cwd ?? request.params?.grantRoot ?? "",
+  });
+  const token = crypto.randomBytes(18).toString("hex");
+  const reviewUrl = `${config.nativeApprovalPublicBaseUrl}/native-approvals/${token}`;
+  const title = formatTitle(config.approvalTitle, threadLabel);
+  const messageText = formatNativeApprovalMessage(kind, request.params ?? {}, config.defaultLocale);
+
+  return {
+    token,
+    kind,
+    title,
+    threadLabel,
+    messageText,
+    reviewUrl,
+    conversationId,
+    requestId,
+    requestKey: nativeRequestKey(conversationId, requestId),
+    ownerClientId: runtime.threadOwnerClientIds.get(conversationId) ?? null,
+    createdAtMs: now,
+    resolved: false,
+    resolving: false,
+  };
+}
+
+function createPlanQuestionRequest({ runtime, conversationId, request, sourceClientId, now = Date.now() }) {
+  if (!isPlanQuestionRequest(request)) {
+    return null;
+  }
+
+  const questionRequestId = cleanText(request.id);
+  const turnId = extractPlanQuestionTurnId(request.params);
+  const turnKey = turnId ? planTurnKey(conversationId, turnId) : "";
+  const options = extractPlanQuestionOptions(request.params);
+  const promptText = extractPlanQuestionPrompt(request.params);
+  const requestKey = questionRequestId ? nativeRequestKey(conversationId, questionRequestId) : "";
+
+  return {
+    conversationId,
+    turnId,
+    turnKey,
+    requestId: questionRequestId,
+    requestKey,
+    ownerClientId:
+      cleanText(sourceClientId ?? "") ||
+      runtime.threadOwnerClientIds.get(conversationId) ||
+      null,
+    promptText,
+    options,
+    lastSeenAtMs: now,
+  };
+}
+
+function updatePlanQuestionRequest({ runtime, conversationId, request, sourceClientId, planQuestionRequest, now = Date.now() }) {
+  const turnId = extractPlanQuestionTurnId(request.params) || planQuestionRequest.turnId;
+  const turnKey = turnId ? planTurnKey(conversationId, turnId) : planQuestionRequest.turnKey;
+  const questionRequestId = cleanText(request.id) || planQuestionRequest.requestId;
+
+  planQuestionRequest.conversationId = conversationId;
+  planQuestionRequest.turnId = turnId;
+  planQuestionRequest.turnKey = turnKey;
+  planQuestionRequest.requestId = questionRequestId;
+  planQuestionRequest.requestKey = questionRequestId ? nativeRequestKey(conversationId, questionRequestId) : "";
+  planQuestionRequest.ownerClientId =
+    cleanText(sourceClientId ?? "") ||
+    runtime.threadOwnerClientIds.get(conversationId) ||
+    planQuestionRequest.ownerClientId ||
+    null;
+  planQuestionRequest.promptText = extractPlanQuestionPrompt(request.params) || planQuestionRequest.promptText || "";
+  planQuestionRequest.options = extractPlanQuestionOptions(request.params);
+  planQuestionRequest.lastSeenAtMs = now;
+}
+
+function registerPlanQuestionRequest(runtime, planQuestionRequest) {
+  if (!planQuestionRequest) {
+    return;
+  }
+
+  if (planQuestionRequest.requestKey) {
+    runtime.planQuestionRequestsByRequestKey.set(planQuestionRequest.requestKey, planQuestionRequest);
+  }
+  if (planQuestionRequest.turnKey) {
+    runtime.planQuestionRequestsByTurnKey.set(planQuestionRequest.turnKey, planQuestionRequest);
+  }
+}
+
+function applyStoredPlanQuestionRequest(runtime, planRequest) {
+  if (!planRequest?.turnKey) {
+    return false;
+  }
+
+  const stored = runtime.planQuestionRequestsByTurnKey.get(planRequest.turnKey);
+  if (!stored) {
+    return false;
+  }
+
+  return attachPlanQuestionRequest(planRequest, stored);
+}
+
+function attachPlanQuestionRequest(planRequest, planQuestionRequest) {
+  if (!planRequest || !planQuestionRequest) {
+    return false;
+  }
+
+  const nextOptions = Array.isArray(planQuestionRequest.options)
+    ? planQuestionRequest.options.map((option) => ({
+        id: cleanText(option.id ?? ""),
+        label: cleanText(option.label ?? ""),
+        isOther: Boolean(option.isOther),
+      }))
+    : [];
+
+  const previousSnapshot = JSON.stringify({
+    questionRequestId: planRequest.questionRequestId ?? "",
+    questionRequestKey: planRequest.questionRequestKey ?? "",
+    questionPrompt: planRequest.questionPrompt ?? "",
+    questionOwnerClientId: planRequest.questionOwnerClientId ?? "",
+    questionOptions: planRequest.questionOptions ?? [],
+  });
+
+  planRequest.questionRequestId = cleanText(planQuestionRequest.requestId ?? "") || null;
+  planRequest.questionRequestKey = cleanText(planQuestionRequest.requestKey ?? "") || null;
+  planRequest.questionPrompt = cleanText(planQuestionRequest.promptText ?? "") || null;
+  planRequest.questionOwnerClientId = cleanText(planQuestionRequest.ownerClientId ?? "") || null;
+  planRequest.questionOptions = nextOptions;
+
+  const nextSnapshot = JSON.stringify({
+    questionRequestId: planRequest.questionRequestId ?? "",
+    questionRequestKey: planRequest.questionRequestKey ?? "",
+    questionPrompt: planRequest.questionPrompt ?? "",
+    questionOwnerClientId: planRequest.questionOwnerClientId ?? "",
+    questionOptions: planRequest.questionOptions ?? [],
+  });
+
+  return previousSnapshot !== nextSnapshot;
+}
+
+function isPlanQuestionRequest(request) {
+  const method = cleanText(request?.method ?? "").toLowerCase();
+  if (!method) {
+    return false;
+  }
+
+  if (
+    !method.includes("requestuserinput") &&
+    method !== "request_user_input" &&
+    method !== "user-input-requested"
+  ) {
+    return false;
+  }
+
+  const promptText = extractPlanQuestionPrompt(request?.params ?? {}).toLowerCase();
+  if (promptText.includes("implement this plan")) {
+    return true;
+  }
+
+  const options = extractPlanQuestionOptions(request?.params ?? {});
+  return options.some((option) => {
+    const optionId = cleanText(option.id ?? "").toLowerCase();
+    const optionLabel = cleanText(option.label ?? "").toLowerCase();
+    return (
+      optionId.includes("implement") ||
+      optionId.includes("stay") ||
+      optionId.includes("plan") ||
+      optionLabel.includes("implement this plan") ||
+      optionLabel.includes("stay in plan mode") ||
+      optionLabel.includes("continue planning")
+    );
+  });
+}
+
+function extractPlanQuestionTurnId(params) {
+  return cleanText(
+    params?.turnId ??
+      params?.turn_id ??
+      params?.request?.turnId ??
+      params?.request?.turn_id ??
+      params?.item?.turnId ??
+      params?.item?.turn_id ??
+      ""
+  );
+}
+
+function extractPlanQuestionPrompt(params) {
+  const directPrompt = cleanText(params?.prompt ?? params?.question ?? params?.title ?? "");
+  if (directPrompt) {
+    return directPrompt;
+  }
+
+  const questions = extractToolRequestQuestions(params);
+  for (const question of questions) {
+    const prompt = cleanText(question.question ?? question.prompt ?? question.title ?? question.header ?? "");
+    if (prompt) {
+      return prompt;
+    }
+  }
+
+  return "";
+}
+
+function extractPlanQuestionOptions(params) {
+  const options = [];
+  const questions = extractToolRequestQuestions(params);
+  for (const question of questions) {
+    for (const option of normalizeToolRequestOptions(question.options)) {
+      options.push(option);
+    }
+  }
+
+  if (options.length > 0) {
+    return options;
+  }
+
+  return normalizeToolRequestOptions(params?.options ?? params?.choices ?? []);
+}
+
+function extractToolRequestQuestions(params) {
+  if (Array.isArray(params?.questions)) {
+    return params.questions.filter((question) => isPlainObject(question));
+  }
+  if (isPlainObject(params?.question)) {
+    return [params.question];
+  }
+  return [];
+}
+
+function normalizeToolRequestOptions(rawOptions) {
+  if (!Array.isArray(rawOptions)) {
+    return [];
+  }
+
+  return rawOptions
+    .filter((option) => isPlainObject(option) || typeof option === "string")
+    .map((option, index) => {
+      if (typeof option === "string") {
+        return {
+          id: "",
+          label: cleanText(option),
+          description: "",
+          isOther: false,
+          index,
+        };
+      }
+
+      return {
+        id: cleanText(option.id ?? option.value ?? option.key ?? ""),
+        label: cleanText(option.label ?? option.text ?? option.title ?? option.value ?? ""),
+        description: cleanText(option.description ?? option.hint ?? option.hintText ?? option.helpText ?? option.subtitle ?? option.detail ?? ""),
+        isOther: Boolean(option.isOther),
+        index,
+      };
+    })
+    .filter((option) => option.label);
+}
+
+function questionHasFreeformOption(options) {
+  if (!Array.isArray(options)) {
+    return false;
+  }
+
+  return options.some((option) => option?.isOther);
+}
+
+function isUserInputRequestedMethod(method) {
+  const normalized = cleanText(method).toLowerCase();
+  return (
+    normalized.includes("requestuserinput") ||
+    normalized === "request_user_input" ||
+    normalized === "user-input-requested"
+  );
+}
+
+function isGenericUserInputRequest(request) {
+  return isUserInputRequestedMethod(request?.method) && !isPlanQuestionRequest(request);
+}
+
+function extractUserInputTurnId(params) {
+  return cleanText(
+    params?.turnId ??
+      params?.turn_id ??
+      params?.request?.turnId ??
+      params?.request?.turn_id ??
+      params?.item?.turnId ??
+      params?.item?.turn_id ??
+      ""
+  );
+}
+
+function normalizeToolRequestQuestions(params) {
+  const sourceQuestions = extractToolRequestQuestions(params);
+  if (sourceQuestions.length === 0) {
+    const fallbackOptions = normalizeToolRequestOptions(params?.options ?? params?.choices ?? []);
+    const fallbackPrompt = cleanText(params?.prompt ?? params?.question ?? params?.title ?? "");
+    const fallbackHeader = cleanText(params?.header ?? params?.label ?? "");
+    const fallbackHint = normalizeQuestionHintText(params);
+    if (!fallbackPrompt && fallbackOptions.length === 0) {
+      return [];
+    }
+    return [
+      {
+        id: cleanText(params?.questionId ?? params?.question_id ?? ""),
+        header: fallbackHeader,
+        prompt: fallbackPrompt || fallbackHeader || t(DEFAULT_LOCALE, "choice.questionFallback"),
+        hint: fallbackHint,
+        options: fallbackOptions,
+        hasOther: questionHasFreeformOption(fallbackOptions),
+      },
+    ];
+  }
+
+  return sourceQuestions.map((question) => {
+    const options = normalizeToolRequestOptions(question.options ?? question.choices ?? []);
+    const prompt =
+      cleanText(question.question ?? question.prompt ?? question.title ?? "") ||
+      cleanText(question.header ?? "");
+    return {
+      id: cleanText(question.id ?? question.questionId ?? question.question_id ?? ""),
+      header: cleanText(question.header ?? question.title ?? ""),
+      prompt: prompt || t(DEFAULT_LOCALE, "choice.questionFallback"),
+      hint: normalizeQuestionHintText(question),
+      options,
+      // Codex sometimes sets question-level isOther even when the payload only
+      // contains fixed choices. For the iPhone selection UI, trust the actual
+      // option list so explicit choices stay actionable.
+      hasOther: questionHasFreeformOption(options),
+    };
+  });
+}
+
+function isSupportedGenericUserInputQuestion(question) {
+  return Boolean(question?.id) && Array.isArray(question?.options) && question.options.length > 0 && !question.hasOther;
+}
+
+function areSupportedGenericUserInputQuestions(questions) {
+  return Array.isArray(questions) && questions.length > 0 && questions.every(isSupportedGenericUserInputQuestion);
+}
+
+function buildUserInputDetailText(questions, locale = config?.defaultLocale || DEFAULT_LOCALE) {
+  if (!Array.isArray(questions) || questions.length === 0) {
+    return t(locale, "choice.ready");
+  }
+
+  return questions
+    .map((question, index) => {
+      const heading = question.header || t(locale, "choice.questionHeading", { index: index + 1 });
+      const prompt = question.prompt || heading;
+      const optionLines = Array.isArray(question.options)
+        ? question.options.map((option) => `- ${option.label}${option.isOther ? " (Other)" : ""}`)
+        : [];
+      return [`### ${heading}`, prompt, ...optionLines].filter(Boolean).join("\n");
+    })
+    .join("\n\n");
+}
+
+function buildUserInputNotificationText(questions, supported, locale = config?.defaultLocale || DEFAULT_LOCALE) {
+  if (!Array.isArray(questions) || questions.length === 0) {
+    return supported ? t(locale, "choice.needInput") : t(locale, "choice.macOnly");
+  }
+
+  const firstPrompt = cleanText(questions[0]?.prompt ?? questions[0]?.header ?? "") || t(locale, "choice.needInput");
+  const countLabel = questions.length > 1
+    ? t(locale, "choice.multiQuestion", { count: questions.length })
+    : t(locale, "choice.oneQuestion");
+  if (!supported) {
+    return `${firstPrompt}\n${countLabel}\n${t(locale, "choice.macOnly")}`;
+  }
+  return `${firstPrompt}\n${countLabel}`;
+}
+
+function buildUserInputReviewUrl(config, token) {
+  return `${config.nativeApprovalPublicBaseUrl}/user-inputs/${token}`;
+}
+
+function restoreUserInputTitle(rawTitle, supported) {
+  const normalizedTitle = cleanText(rawTitle ?? "");
+  if (!normalizedTitle) {
+    return supported ? t(DEFAULT_LOCALE, "server.title.choice") : t(DEFAULT_LOCALE, "server.title.choiceReadOnly");
+  }
+
+  for (const prefix of [
+    t(DEFAULT_LOCALE, "server.title.choice"),
+    t(DEFAULT_LOCALE, "server.title.choiceReadOnly"),
+    t("ja", "server.title.choice"),
+    t("ja", "server.title.choiceReadOnly"),
+  ]) {
+    const marker = `${prefix} | `;
+    if (normalizedTitle.startsWith(marker)) {
+      return formatTitle(
+        supported ? t(DEFAULT_LOCALE, "server.title.choice") : t(DEFAULT_LOCALE, "server.title.choiceReadOnly"),
+        cleanText(normalizedTitle.slice(marker.length))
+      );
+    }
+  }
+
+  return normalizedTitle;
+}
+
+function createGenericUserInputRequest({ config, runtime, conversationId, request, now = Date.now() }) {
+  if (!isGenericUserInputRequest(request) || request.id == null) {
+    return null;
+  }
+
+  const threadState = runtime.threadStates.get(conversationId) ?? null;
+  const threadLabel = getNativeThreadLabel({
+    runtime,
+    conversationId,
+    cwd: threadState?.cwd ?? "",
+  });
+  const token = crypto.randomBytes(18).toString("hex");
+  const questions = normalizeToolRequestQuestions(request.params ?? {});
+  const supported = areSupportedGenericUserInputQuestions(questions);
+  const turnId = extractUserInputTurnId(request.params ?? {});
+
+  return {
+    token,
+    title: formatTitle(
+      supported ? t(config.defaultLocale, "server.title.choice") : t(config.defaultLocale, "server.title.choiceReadOnly"),
+      threadLabel
+    ),
+    threadLabel,
+    messageText: buildUserInputDetailText(questions, config.defaultLocale),
+    notificationText: buildUserInputNotificationText(questions, supported, config.defaultLocale),
+    reviewUrl: buildUserInputReviewUrl(config, token),
+    conversationId,
+    turnId,
+    requestId: request.id,
+    requestKey: nativeRequestKey(conversationId, request.id),
+    ownerClientId: runtime.threadOwnerClientIds.get(conversationId) ?? null,
+    questions,
+    supported,
+    testRequest: false,
+    createdAtMs: now,
+    lastSeenAtMs: now,
+    expiresAtMs: now + config.planRequestTtlMs,
+    isLiveRequestActive: true,
+    resolved: false,
+    resolving: false,
+    draftAnswers: {},
+    draftPage: 1,
+  };
+}
+
+function updateGenericUserInputRequest({ config, runtime, conversationId, request, userInputRequest, now = Date.now() }) {
+  const threadState = runtime.threadStates.get(conversationId) ?? null;
+  const threadLabel = getNativeThreadLabel({
+    runtime,
+    conversationId,
+    cwd: threadState?.cwd ?? "",
+  });
+  const nextQuestions = normalizeToolRequestQuestions(request.params ?? {});
+  const nextSupported = areSupportedGenericUserInputQuestions(nextQuestions);
+  const preserveExistingSupported =
+    userInputRequest.supported &&
+    !nextSupported &&
+    Array.isArray(userInputRequest.questions) &&
+    userInputRequest.questions.length > 0;
+  const questions = preserveExistingSupported ? userInputRequest.questions : nextQuestions;
+  const supported = preserveExistingSupported ? true : nextSupported;
+
+  userInputRequest.title = formatTitle(
+    supported ? t(config.defaultLocale, "server.title.choice") : t(config.defaultLocale, "server.title.choiceReadOnly"),
+    threadLabel
+  );
+  userInputRequest.threadLabel = threadLabel;
+  userInputRequest.messageText = buildUserInputDetailText(questions, config.defaultLocale);
+  userInputRequest.notificationText = buildUserInputNotificationText(questions, supported, config.defaultLocale);
+  userInputRequest.reviewUrl = buildUserInputReviewUrl(config, userInputRequest.token);
+  userInputRequest.conversationId = conversationId;
+  userInputRequest.turnId = extractUserInputTurnId(request.params ?? {}) || userInputRequest.turnId;
+  userInputRequest.requestId = request.id;
+  userInputRequest.requestKey = nativeRequestKey(conversationId, request.id);
+  userInputRequest.ownerClientId =
+    runtime.threadOwnerClientIds.get(conversationId) ??
+    userInputRequest.ownerClientId ??
+    null;
+  userInputRequest.questions = questions;
+  userInputRequest.supported = supported;
+  userInputRequest.testRequest = false;
+  userInputRequest.lastSeenAtMs = now;
+  userInputRequest.expiresAtMs = now + config.planRequestTtlMs;
+  if (!userInputRequest.resolved) {
+    userInputRequest.isLiveRequestActive = true;
+  }
+  if (!isPlainObject(userInputRequest.draftAnswers)) {
+    userInputRequest.draftAnswers = {};
+  }
+  if (!Number.isFinite(userInputRequest.draftPage) || userInputRequest.draftPage < 1) {
+    userInputRequest.draftPage = 1;
+  }
+}
+
+function registerGenericUserInputRequest(runtime, userInputRequest) {
+  if (!userInputRequest) {
+    return;
+  }
+
+  runtime.userInputRequestsByToken.set(userInputRequest.token, userInputRequest);
+  runtime.userInputRequestsByRequestKey.set(userInputRequest.requestKey, userInputRequest);
+}
+
+function expireGenericUserInputRequest(runtime, requestKey) {
+  const request = runtime.userInputRequestsByRequestKey.get(requestKey);
+  if (!request) {
+    return;
+  }
+
+  runtime.userInputRequestsByRequestKey.delete(requestKey);
+  runtime.userInputRequestsByToken.delete(request.token);
+}
+
+function serializeGenericUserInputRequest(userInputRequest) {
+  return {
+    token: userInputRequest.token,
+    title: userInputRequest.title,
+    threadLabel: userInputRequest.threadLabel ?? "",
+    messageText: userInputRequest.messageText,
+    notificationText: userInputRequest.notificationText,
+    conversationId: userInputRequest.conversationId,
+    turnId: userInputRequest.turnId,
+    requestId: userInputRequest.requestId,
+    requestKey: userInputRequest.requestKey,
+    ownerClientId: userInputRequest.ownerClientId ?? null,
+    questions: Array.isArray(userInputRequest.questions) ? userInputRequest.questions : [],
+    supported: Boolean(userInputRequest.supported),
+    testRequest: Boolean(userInputRequest.testRequest),
+    createdAtMs: userInputRequest.createdAtMs ?? Date.now(),
+    lastSeenAtMs: userInputRequest.lastSeenAtMs ?? Date.now(),
+    expiresAtMs: userInputRequest.expiresAtMs ?? Date.now(),
+    resolved: Boolean(userInputRequest.resolved),
+    isLiveRequestActive: Boolean(userInputRequest.isLiveRequestActive),
+    draftAnswers: isPlainObject(userInputRequest.draftAnswers) ? userInputRequest.draftAnswers : {},
+    draftPage: Number(userInputRequest.draftPage) || 1,
+  };
+}
+
+function storePendingUserInputRequest(state, userInputRequest) {
+  if (!userInputRequest?.requestKey) {
+    return false;
+  }
+
+  const nextValue = serializeGenericUserInputRequest(userInputRequest);
+  const previousValue = state.pendingUserInputRequests?.[userInputRequest.requestKey];
+  state.pendingUserInputRequests[userInputRequest.requestKey] = nextValue;
+  return JSON.stringify(previousValue) !== JSON.stringify(nextValue);
+}
+
+function deletePendingUserInputRequest(state, requestKey) {
+  if (!requestKey || !state.pendingUserInputRequests?.[requestKey]) {
+    return false;
+  }
+
+  delete state.pendingUserInputRequests[requestKey];
+  return true;
+}
+
+function restorePendingUserInputRequests({ config, runtime, state, now = Date.now() }) {
+  let changed = false;
+  const pending = isPlainObject(state.pendingUserInputRequests) ? state.pendingUserInputRequests : {};
+  state.pendingUserInputRequests = pending;
+
+  for (const [requestKey, raw] of Object.entries(pending)) {
+    const userInputRequest = restoreGenericUserInputRequest({ config, raw, now });
+    if (!userInputRequest || isGenericUserInputRequestExpired(userInputRequest, now)) {
+      delete pending[requestKey];
+      changed = true;
+      continue;
+    }
+
+    registerGenericUserInputRequest(runtime, userInputRequest);
+    changed = storePendingUserInputRequest(state, userInputRequest) || changed;
+  }
+
+  return changed;
+}
+
+function restoreGenericUserInputRequest({ config, raw, now = Date.now() }) {
+  if (!isPlainObject(raw)) {
+    return null;
+  }
+
+  const token = cleanText(raw.token);
+  const conversationId = cleanText(raw.conversationId);
+  const requestId = raw.requestId;
+  const requestKey = cleanText(raw.requestKey);
+  if (!token || !conversationId || requestId == null || !requestKey) {
+    return null;
+  }
+
+  const questions = normalizeRestoredQuestions(raw.questions ?? []);
+  const supported = areSupportedGenericUserInputQuestions(questions);
+  const detailText = normalizeLongText(raw.messageText ?? "") || buildUserInputDetailText(questions, config.defaultLocale);
+  const rawNotificationText = normalizeLongText(raw.notificationText ?? "");
+  const notificationText =
+    rawNotificationText && Boolean(raw.supported) === supported
+      ? rawNotificationText
+      : buildUserInputNotificationText(questions, supported, config.defaultLocale);
+
+  return {
+    token,
+    title: restoreUserInputTitle(raw.title, supported),
+    threadLabel: cleanText(raw.threadLabel ?? ""),
+    messageText: detailText,
+    notificationText,
+    reviewUrl: buildUserInputReviewUrl(config, token),
+    conversationId,
+    turnId: cleanText(raw.turnId ?? ""),
+    requestId,
+    requestKey,
+    ownerClientId: cleanText(raw.ownerClientId ?? "") || null,
+    questions,
+    supported,
+    testRequest: Boolean(raw.testRequest),
+    createdAtMs: Number(raw.createdAtMs) || now,
+    lastSeenAtMs: Number(raw.lastSeenAtMs) || now,
+    expiresAtMs: Number(raw.expiresAtMs) || now + config.planRequestTtlMs,
+    isLiveRequestActive: false,
+    resolved: Boolean(raw.resolved),
+    resolving: false,
+    draftAnswers: isPlainObject(raw.draftAnswers) ? raw.draftAnswers : {},
+    draftPage: Number(raw.draftPage) || 1,
+  };
+}
+
+function normalizeRestoredQuestions(rawQuestions) {
+  if (!Array.isArray(rawQuestions)) {
+    return [];
+  }
+
+  return rawQuestions
+    .filter((question) => isPlainObject(question))
+    .map((question) => {
+      const options = normalizeToolRequestOptions(question.options ?? []);
+      return {
+        id: cleanText(question.id ?? ""),
+        header: cleanText(question.header ?? ""),
+        prompt: cleanText(question.prompt ?? question.header ?? "") || t(DEFAULT_LOCALE, "choice.questionFallback"),
+        hint: normalizeQuestionHintText(question),
+        options,
+        hasOther: questionHasFreeformOption(options),
+      };
+    });
+}
+
+function normalizeQuestionHintText(question) {
+  if (!isPlainObject(question)) {
+    return "";
+  }
+
+  const header = cleanText(question.header ?? question.title ?? "");
+  const prompt =
+    cleanText(question.question ?? question.prompt ?? question.title ?? "") ||
+    header;
+  const hint = cleanText(
+    question.tooltip ??
+      question.toolTip ??
+      question.hint ??
+      question.hintText ??
+      question.helpText ??
+      question.description ??
+      question.subtitle ??
+      question.detail ??
+      ""
+  );
+
+  if (!hint || hint === header || hint === prompt) {
+    return "";
+  }
+
+  return hint;
+}
+
+function isGenericUserInputRequestExpired(userInputRequest, now = Date.now()) {
+  if (!userInputRequest) {
+    return true;
+  }
+
+  if (userInputRequest.isLiveRequestActive && !userInputRequest.resolved) {
+    return false;
+  }
+
+  return Number(userInputRequest.expiresAtMs) > 0 && now >= Number(userInputRequest.expiresAtMs);
+}
+
+function createTestGenericUserInputRequest({ config, title, questions, now = Date.now() }) {
+  const requestId = `test-${crypto.randomUUID()}`;
+  const threadLabel = cleanText(title || "") || "Bridge test";
+  const token = crypto.randomBytes(18).toString("hex");
+  const normalizedQuestions = normalizeRestoredQuestions(questions);
+  const supported = areSupportedGenericUserInputQuestions(normalizedQuestions);
+
+  return {
+    token,
+    title: formatTitle(
+      supported ? t(config.defaultLocale, "server.title.choice") : t(config.defaultLocale, "server.title.choiceReadOnly"),
+      threadLabel
+    ),
+    threadLabel,
+    messageText: buildUserInputDetailText(normalizedQuestions, config.defaultLocale),
+    notificationText: buildUserInputNotificationText(normalizedQuestions, supported, config.defaultLocale),
+    reviewUrl: buildUserInputReviewUrl(config, token),
+    conversationId: "__test__",
+    turnId: "",
+    requestId,
+    requestKey: nativeRequestKey("__test__", requestId),
+    ownerClientId: null,
+    questions: normalizedQuestions,
+    supported,
+    testRequest: true,
+    createdAtMs: now,
+    lastSeenAtMs: now,
+    expiresAtMs: now + config.planRequestTtlMs,
+    isLiveRequestActive: false,
+    resolved: false,
+    resolving: false,
+    draftAnswers: {},
+    draftPage: 1,
+  };
+}
+
+function cleanupExpiredUserInputRequests({ runtime, state, now = Date.now() }) {
+  let changed = false;
+
+  for (const userInputRequest of Array.from(runtime.userInputRequestsByRequestKey.values())) {
+    if (!isGenericUserInputRequestExpired(userInputRequest, now)) {
+      continue;
+    }
+
+    expireGenericUserInputRequest(runtime, userInputRequest.requestKey);
+    changed = deletePendingUserInputRequest(state, userInputRequest.requestKey) || changed;
+    console.log(`[user-input-expired] ${userInputRequest.requestKey}`);
+  }
+
+  return changed;
+}
+
+function createPlanImplementationRequest({ config, runtime, conversationId, request, now = Date.now() }) {
+  if (request.method !== "item/plan/requestImplementation" || request.id == null) {
+    return null;
+  }
+
+  const threadState = runtime.threadStates.get(conversationId) ?? null;
+  const threadLabel = getNativeThreadLabel({
+    runtime,
+    conversationId,
+    cwd: threadState?.cwd ?? "",
+  });
+  const turnId = cleanText(request.params?.turnId ?? request.params?.turn_id ?? "");
+  const turnKey = planTurnKey(conversationId, turnId);
+  const token = crypto.randomBytes(18).toString("hex");
+  const reviewUrl = buildPlanRequestReviewUrl(config, token);
+  const title = formatTitle(config.planTitle, threadLabel);
+  const rawPlanContent = String(request.params?.planContent ?? "");
+  const planContent = formatPlanDetailText(rawPlanContent, config.defaultLocale);
+  const latestCollaborationMode = buildDefaultCollaborationMode(threadState);
+
+  return {
+    token,
+    title,
+    threadLabel,
+    messageText: planContent,
+    rawPlanContent,
+    reviewUrl,
+    conversationId,
+    turnId,
+    turnKey,
+    requestId: request.id,
+    requestKey: nativeRequestKey(conversationId, request.id),
+    ownerClientId: runtime.threadOwnerClientIds.get(conversationId) ?? null,
+    latestCollaborationMode,
+    threadState,
+    questionRequestId: null,
+    questionRequestKey: null,
+    questionPrompt: null,
+    questionOwnerClientId: null,
+    questionOptions: [],
+    createdAtMs: now,
+    lastSeenAtMs: now,
+    expiresAtMs: now + config.planRequestTtlMs,
+    isLiveRequestActive: true,
+    resolved: false,
+    resolving: false,
+    draftAnswers: {},
+  };
+}
+
+function updatePlanImplementationRequest({ config, runtime, conversationId, request, planRequest, now = Date.now() }) {
+  const threadState = runtime.threadStates.get(conversationId) ?? planRequest.threadState ?? null;
+  const threadLabel = getNativeThreadLabel({
+    runtime,
+    conversationId,
+    cwd: threadState?.cwd ?? "",
+  });
+  const turnId = cleanText(request.params?.turnId ?? request.params?.turn_id ?? planRequest.turnId);
+  const turnKey = planTurnKey(conversationId, turnId);
+  const rawPlanContent = String(request.params?.planContent ?? planRequest.rawPlanContent ?? "");
+
+  planRequest.title = formatTitle(config.planTitle, threadLabel);
+  planRequest.threadLabel = threadLabel;
+  planRequest.messageText = formatPlanDetailText(rawPlanContent, config.defaultLocale);
+  planRequest.rawPlanContent = rawPlanContent;
+  planRequest.reviewUrl = buildPlanRequestReviewUrl(config, planRequest.token);
+  planRequest.conversationId = conversationId;
+  planRequest.turnId = turnId;
+  planRequest.turnKey = turnKey;
+  planRequest.requestId = request.id;
+  planRequest.requestKey = nativeRequestKey(conversationId, request.id);
+  planRequest.ownerClientId =
+    runtime.threadOwnerClientIds.get(conversationId) ??
+    planRequest.ownerClientId ??
+    null;
+  planRequest.latestCollaborationMode = buildDefaultCollaborationMode(
+    threadState ?? planRequest.latestCollaborationMode
+  );
+  planRequest.threadState = threadState ?? planRequest.threadState ?? null;
+  planRequest.lastSeenAtMs = now;
+  planRequest.expiresAtMs = now + config.planRequestTtlMs;
+  if (!planRequest.resolved) {
+    planRequest.isLiveRequestActive = true;
+  }
+}
+
+function registerPlanImplementationRequest(runtime, planRequest) {
+  if (!planRequest) {
+    return;
+  }
+
+  runtime.planRequestsByToken.set(planRequest.token, planRequest);
+  runtime.planRequestsByRequestKey.set(planRequest.requestKey, planRequest);
+  runtime.planRequestsByTurnKey.set(planRequest.turnKey, planRequest);
+}
+
+function expireNativeApproval(runtime, requestKey) {
+  const approval = runtime.nativeApprovalsByRequestKey.get(requestKey);
+  if (!approval) {
+    return;
+  }
+
+  runtime.nativeApprovalsByRequestKey.delete(requestKey);
+  runtime.nativeApprovalsByToken.delete(approval.token);
+}
+
+function expirePlanImplementationRequest(runtime, requestKey) {
+  const request = runtime.planRequestsByRequestKey.get(requestKey);
+  if (!request) {
+    return;
+  }
+
+  if (request.questionRequestKey) {
+    runtime.planQuestionRequestsByRequestKey.delete(request.questionRequestKey);
+  }
+  if (request.turnKey) {
+    runtime.planQuestionRequestsByTurnKey.delete(request.turnKey);
+  }
+  runtime.planRequestsByRequestKey.delete(requestKey);
+  runtime.planRequestsByToken.delete(request.token);
+  runtime.planRequestsByTurnKey.delete(request.turnKey);
+}
+
+function shouldSuppressPlanReadyEvent({ runtime, state, threadId, turnId }) {
+  const turnKey = planTurnKey(threadId, turnId);
+  if (!turnKey) {
+    return false;
+  }
+
+  if (state.activePlanRequestTurns?.[turnKey] || state.suppressedPlanReadyTurns?.[turnKey]) {
+    return true;
+  }
+
+  for (const request of runtime.planRequestsByTurnKey.values()) {
+    if (request.turnKey === turnKey && !isPlanRequestExpired(request)) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+function findLatestPlanRequestForConversation(runtime, conversationId) {
+  const candidates = [];
+  for (const planRequest of runtime.planRequestsByTurnKey.values()) {
+    if (planRequest.conversationId !== conversationId) {
+      continue;
+    }
+    if (planRequest.resolved || isPlanRequestExpired(planRequest)) {
+      continue;
+    }
+    candidates.push(planRequest);
+  }
+
+  candidates.sort((left, right) => Number(right.createdAtMs ?? 0) - Number(left.createdAtMs ?? 0));
+  return candidates[0] ?? null;
+}
+
+function planTurnKey(threadId, turnId) {
+  const normalizedThreadId = cleanText(threadId);
+  const normalizedTurnId = cleanText(turnId);
+  if (!normalizedThreadId || !normalizedTurnId) {
+    return "";
+  }
+  return `${normalizedThreadId}:${normalizedTurnId}`;
+}
+
+function planTurnKeyFromRequest(conversationId, request) {
+  if (!isPlainObject(request)) {
+    return "";
+  }
+
+  const threadId = cleanText(request.params?.threadId ?? request.params?.thread_id ?? conversationId);
+  const turnId = cleanText(request.params?.turnId ?? request.params?.turn_id ?? "");
+  return planTurnKey(threadId, turnId);
+}
+
+function markPlanTurnActive(state, turnKey, maxEntries) {
+  if (!turnKey || state.activePlanRequestTurns?.[turnKey]) {
+    return false;
+  }
+
+  state.activePlanRequestTurns[turnKey] = Date.now();
+  trimSeenEvents(state.activePlanRequestTurns, maxEntries);
+  return true;
+}
+
+function clearPlanTurnActive(state, turnKey) {
+  if (!turnKey || !state.activePlanRequestTurns?.[turnKey]) {
+    return false;
+  }
+
+  delete state.activePlanRequestTurns[turnKey];
+  return true;
+}
+
+function markPlanTurnSuppressed(state, turnKey, maxEntries) {
+  if (!turnKey || state.suppressedPlanReadyTurns?.[turnKey]) {
+    return false;
+  }
+
+  state.suppressedPlanReadyTurns[turnKey] = Date.now();
+  trimSeenEvents(state.suppressedPlanReadyTurns, maxEntries);
+  return true;
+}
+
+function buildPlanRequestReviewUrl(config, token) {
+  return `${config.nativeApprovalPublicBaseUrl}/plan-requests/${token}`;
+}
+
+function serializePlanImplementationRequest(planRequest) {
+  return {
+    token: planRequest.token,
+    title: planRequest.title,
+    threadLabel: planRequest.threadLabel ?? "",
+    messageText: planRequest.messageText,
+    rawPlanContent: planRequest.rawPlanContent,
+    conversationId: planRequest.conversationId,
+    turnId: planRequest.turnId,
+    turnKey: planRequest.turnKey,
+    requestId: planRequest.requestId,
+    requestKey: planRequest.requestKey,
+    ownerClientId: planRequest.ownerClientId ?? null,
+    latestCollaborationMode: planRequest.latestCollaborationMode ?? null,
+    questionRequestId: planRequest.questionRequestId ?? null,
+    questionRequestKey: planRequest.questionRequestKey ?? null,
+    questionPrompt: planRequest.questionPrompt ?? null,
+    questionOwnerClientId: planRequest.questionOwnerClientId ?? null,
+    questionOptions: Array.isArray(planRequest.questionOptions) ? planRequest.questionOptions : [],
+    createdAtMs: planRequest.createdAtMs ?? Date.now(),
+    lastSeenAtMs: planRequest.lastSeenAtMs ?? Date.now(),
+    expiresAtMs: planRequest.expiresAtMs ?? Date.now(),
+    resolved: Boolean(planRequest.resolved),
+    isLiveRequestActive: Boolean(planRequest.isLiveRequestActive),
+  };
+}
+
+function storePendingPlanRequest(state, planRequest) {
+  if (!planRequest?.turnKey) {
+    return false;
+  }
+
+  const nextValue = serializePlanImplementationRequest(planRequest);
+  const previousValue = state.pendingPlanRequests?.[planRequest.turnKey];
+  state.pendingPlanRequests[planRequest.turnKey] = nextValue;
+  return JSON.stringify(previousValue) !== JSON.stringify(nextValue);
+}
+
+function deletePendingPlanRequest(state, turnKey) {
+  if (!turnKey || !state.pendingPlanRequests?.[turnKey]) {
+    return false;
+  }
+
+  delete state.pendingPlanRequests[turnKey];
+  return true;
+}
+
+function restorePendingPlanRequests({ config, runtime, state, now = Date.now() }) {
+  let changed = false;
+  const pending = isPlainObject(state.pendingPlanRequests) ? state.pendingPlanRequests : {};
+  state.pendingPlanRequests = pending;
+
+  for (const [turnKey, raw] of Object.entries(pending)) {
+    const planRequest = restorePlanImplementationRequest({ config, turnKey, raw, now });
+    if (!planRequest || isPlanRequestExpired(planRequest, now)) {
+      delete pending[turnKey];
+      changed = true;
+      continue;
+    }
+
+    registerPlanImplementationRequest(runtime, planRequest);
+  }
+
+  return changed;
+}
+
+function restorePlanImplementationRequest({ config, turnKey, raw, now = Date.now() }) {
+  if (!isPlainObject(raw)) {
+    return null;
+  }
+
+  const token = cleanText(raw.token);
+  const conversationId = cleanText(raw.conversationId);
+  const turnId = cleanText(raw.turnId);
+  const requestKey = cleanText(raw.requestKey);
+  if (!token || !conversationId || !turnId || !turnKey) {
+    return null;
+  }
+
+  const rawPlanContent = String(raw.rawPlanContent ?? raw.messageText ?? "");
+  const latestCollaborationMode = isPlainObject(raw.latestCollaborationMode)
+    ? buildDefaultCollaborationMode(raw.latestCollaborationMode)
+    : buildDefaultCollaborationMode(null);
+
+  return {
+    token,
+    title: cleanText(raw.title) || t(DEFAULT_LOCALE, "server.title.plan"),
+    threadLabel: cleanText(raw.threadLabel ?? ""),
+    messageText: formatPlanDetailText(raw.messageText ?? rawPlanContent, config.defaultLocale),
+    rawPlanContent,
+    reviewUrl: buildPlanRequestReviewUrl(config, token),
+    conversationId,
+    turnId,
+    turnKey,
+    requestId: raw.requestId ?? null,
+    requestKey,
+    ownerClientId: cleanText(raw.ownerClientId ?? "") || null,
+    latestCollaborationMode,
+    threadState: null,
+    questionRequestId: cleanText(raw.questionRequestId ?? "") || null,
+    questionRequestKey: cleanText(raw.questionRequestKey ?? "") || null,
+    questionPrompt: cleanText(raw.questionPrompt ?? "") || null,
+    questionOwnerClientId: cleanText(raw.questionOwnerClientId ?? "") || null,
+    questionOptions: normalizeToolRequestOptions(raw.questionOptions ?? []),
+    createdAtMs: Number(raw.createdAtMs) || now,
+    lastSeenAtMs: Number(raw.lastSeenAtMs) || now,
+    expiresAtMs: Number(raw.expiresAtMs) || now + config.planRequestTtlMs,
+    isLiveRequestActive: false,
+    resolved: Boolean(raw.resolved),
+    resolving: false,
+  };
+}
+
+function isPlanRequestExpired(planRequest, now = Date.now()) {
+  if (!planRequest) {
+    return true;
+  }
+
+  if (planRequest.isLiveRequestActive && !planRequest.resolved) {
+    return false;
+  }
+
+  return Number(planRequest.expiresAtMs) > 0 && now >= Number(planRequest.expiresAtMs);
+}
+
+function cleanupExpiredPlanRequests({ runtime, state, now = Date.now() }) {
+  let changed = false;
+
+  for (const planRequest of Array.from(runtime.planRequestsByTurnKey.values())) {
+    if (!isPlanRequestExpired(planRequest, now)) {
+      continue;
+    }
+
+    expirePlanImplementationRequest(runtime, planRequest.requestKey);
+    changed = deletePendingPlanRequest(state, planRequest.turnKey) || changed;
+    changed = clearPlanTurnActive(state, planRequest.turnKey) || changed;
+    console.log(`[plan-request-expired] ${planRequest.turnKey || planRequest.requestKey}`);
+  }
+
+  return changed;
+}
+
+function attachCompletionDetails({ config, runtime, event }) {
+  const detailText = event.detailText || "";
+  if (!detailText) {
+    return;
+  }
+
+  if (!notificationNeedsDetail(detailText, config.completionDetailThresholdChars)) {
+    return;
+  }
+
+  const token = crypto.randomBytes(18).toString("hex");
+  const detailUrl = `${config.nativeApprovalPublicBaseUrl}/completion-details/${token}`;
+  runtime.completionDetailsByToken.set(token, {
+    title: event.title,
+    messageText: detailText,
+  });
+  trimMap(runtime.completionDetailsByToken, config.maxCompletionDetails);
+
+  event.clickUrl = detailUrl;
+  event.actions = buildCompletionActions(detailUrl);
+}
+
+function attachPlanDetails({ config, runtime, event }) {
+  const detailText = event.detailText || "";
+  if (!detailText) {
+    return;
+  }
+
+  const token = crypto.randomBytes(18).toString("hex");
+  const detailUrl = `${config.nativeApprovalPublicBaseUrl}/plan-details/${token}`;
+  runtime.planDetailsByToken.set(token, {
+    title: event.title,
+    messageText: detailText,
+    threadId: event.threadId ?? "",
+    resolved: false,
+    resolving: false,
+  });
+  trimMap(runtime.planDetailsByToken, config.maxCompletionDetails);
+
+  event.clickUrl = detailUrl;
+  event.actions = buildPlanDetailActions(detailUrl);
+}
+
+async function publishNtfy(config, payload) {
+  if (!config.enableNtfy) {
+    return;
+  }
+  if (config.dryRun) {
+    console.log(`[dry-run] ${payload.kind || "event"} | ${payload.title} | ${singleLine(payload.message)}`);
+    return;
+  }
+
+  const args = [
+    "-sS",
+    "--fail-with-body",
+    "--connect-timeout",
+    String(config.ntfyConnectTimeoutSecs),
+    "--max-time",
+    String(config.ntfyMaxTimeSecs),
+    "-X",
+    "POST",
+    "-H",
+    "Content-Type: text/plain; charset=utf-8",
+    "-H",
+    `Title: ${payload.title}`,
+    "-H",
+    `Priority: ${payload.priority}`,
+    "-H",
+    `Tags: ${payload.tags.join(",")}`,
+  ];
+
+  const authHeader = buildAuthHeader();
+  if (authHeader) {
+    args.push("-H", `Authorization: ${authHeader}`);
+  }
+
+  const actionsHeader = serializeActions(payload.actions);
+  if (actionsHeader) {
+    args.push("-H", `Actions: ${actionsHeader}`);
+  }
+
+  if (payload.clickUrl) {
+    args.push("-H", `Click: ${payload.clickUrl}`);
+  }
+
+  args.push(
+    "--data-binary",
+    payload.message,
+    buildTopicUrl(config.ntfyPublishBaseUrl, config.ntfyTopic)
+  );
+
+  await runCurl(args);
+}
+
+function runCurl(args) {
+  return new Promise((resolve, reject) => {
+    const child = spawn("curl", args, {
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+
+    let stderr = "";
+    child.stderr.on("data", (chunk) => {
+      stderr += chunk.toString("utf8");
+    });
+
+    child.on("error", reject);
+    child.on("close", (code) => {
+      if (code === 0) {
+        resolve();
+        return;
+      }
+      reject(new Error(stderr.trim() || `curl exited with code ${code}`));
+    });
+  });
+}
+
+const IMPLEMENT_PLAN_PROMPT_PREFIX = "PLEASE IMPLEMENT THIS PLAN:";
+
+function buildImplementPlanPrompt(planContent) {
+  return `${IMPLEMENT_PLAN_PROMPT_PREFIX}\n${formatPlanDetailText(planContent)}`;
+}
+
+function buildTextInput(text) {
+  return [
+    {
+      type: "text",
+      text: String(text ?? ""),
+      text_elements: [],
+    },
+  ];
+}
+
+function buildRequestedCollaborationMode(threadState, requestedMode = "default") {
+  const sourceMode = isPlainObject(threadState?.latestCollaborationMode)
+    ? threadState.latestCollaborationMode
+    : isPlainObject(threadState)
+      ? threadState
+      : null;
+  const settings = isPlainObject(sourceMode?.settings)
+    ? sourceMode.settings
+    : {};
+
+  return {
+    mode: cleanText(requestedMode || "").toLowerCase() === "plan" ? "plan" : "default",
+    settings: {
+      model: cleanText(settings.model ?? ""),
+      reasoning_effort: settings.reasoning_effort ?? null,
+      developer_instructions: null,
+    },
+  };
+}
+
+function buildDefaultCollaborationMode(threadState) {
+  // Fallback turns must leave Plan mode unless the caller explicitly opts in.
+  return buildRequestedCollaborationMode(threadState, "default");
+}
+
+class NativeIpcClient {
+  constructor({ config, runtime, onThreadStateChanged, onUserInputRequested }) {
+    this.config = config;
+    this.runtime = runtime;
+    this.onThreadStateChanged = onThreadStateChanged;
+    this.onUserInputRequested = onUserInputRequested;
+    this.buffer = Buffer.alloc(0);
+    this.socket = null;
+    this.clientId = null;
+    this.pendingResponses = new Map();
+    this.reconnectTimer = null;
+    this.stopped = false;
+  }
+
+  start() {
+    this.connect();
+  }
+
+  stop() {
+    this.stopped = true;
+
+    if (this.reconnectTimer) {
+      clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = null;
+    }
+
+    for (const [requestId, pending] of this.pendingResponses) {
+      clearTimeout(pending.timeout);
+      pending.reject(new Error("ipc-client-stopped"));
+      this.pendingResponses.delete(requestId);
+    }
+
+    if (this.socket) {
+      this.socket.destroy();
+      this.socket = null;
+    }
+  }
+
+  async sendApprovalDecision(approval, decision) {
+    const method =
+      approval.kind === "command"
+        ? "thread-follower-command-approval-decision"
+        : "thread-follower-file-approval-decision";
+    return this.sendThreadFollowerRequest(method, {
+      conversationId: approval.conversationId,
+      requestId: approval.requestId,
+      decision,
+    }, approval.conversationId, approval.ownerClientId);
+  }
+
+  async setCollaborationMode(conversationId, collaborationMode, ownerClientId = null) {
+    return this.sendThreadFollowerRequest(
+      "thread-follower-set-collaboration-mode",
+      {
+        conversationId,
+        collaborationMode,
+      },
+      conversationId,
+      ownerClientId
+    );
+  }
+
+  async startTurn(conversationId, turnStartParams, ownerClientId = null) {
+    return this.sendThreadFollowerRequest(
+      "thread-follower-start-turn",
+      {
+        conversationId,
+        turnStartParams,
+      },
+      conversationId,
+      ownerClientId
+    );
+  }
+
+  async submitUserInputRequest(conversationId, requestId, answers, ownerClientId = null) {
+    return this.sendThreadFollowerRequest(
+      "thread-follower-submit-user-input-request",
+      {
+        conversationId,
+        requestId,
+        answers,
+      },
+      conversationId,
+      ownerClientId
+    );
+  }
+
+  async submitStructuredUserInput(conversationId, requestId, response, ownerClientId = null) {
+    return this.sendThreadFollowerRequest(
+      "thread-follower-submit-user-input",
+      {
+        conversationId,
+        requestId,
+        response,
+      },
+      conversationId,
+      ownerClientId
+    );
+  }
+
+  sendThreadFollowerRequest(method, params, conversationId, ownerClientId = null) {
+    return this.sendRequest(method, params, {
+      targetClientId:
+        ownerClientId ??
+        this.runtime.threadOwnerClientIds.get(conversationId) ??
+        null,
+    });
+  }
+
+  sendRequest(method, params, options = {}) {
+    if (!this.socket || !this.clientId) {
+      return Promise.reject(new Error("codex-ipc-not-connected"));
+    }
+
+    const requestId = crypto.randomUUID();
+    const timeoutMs = options.timeoutMs ?? this.config.ipcRequestTimeoutMs;
+
+    return new Promise((resolve, reject) => {
+      const timeout = setTimeout(() => {
+        this.pendingResponses.delete(requestId);
+        reject(new Error(`${method}-timeout`));
+      }, timeoutMs);
+
+      this.pendingResponses.set(requestId, { resolve, reject, timeout });
+      this.write({
+        type: "request",
+        requestId,
+        sourceClientId: this.clientId,
+        targetClientId: options.targetClientId || undefined,
+        method,
+        version: options.version ?? 1,
+        params,
+      });
+    });
+  }
+
+  connect() {
+    if (this.stopped || this.socket) {
+      return;
+    }
+
+    const socket = net.createConnection(this.config.ipcSocketPath);
+    this.socket = socket;
+
+    socket.on("connect", () => {
+      this.buffer = Buffer.alloc(0);
+      this.write({
+        type: "request",
+        requestId: crypto.randomUUID(),
+        method: "initialize",
+        params: { clientType: "viveworker-bridge" },
+      });
+    });
+
+    socket.on("data", (chunk) => {
+      this.handleData(chunk).catch((error) => {
+        console.error(`[ipc-error] ${error.message}`);
+      });
+    });
+
+    socket.on("error", (error) => {
+      console.error(`[ipc-error] ${error.message}`);
+    });
+
+    socket.on("close", () => {
+      this.socket = null;
+      this.clientId = null;
+      this.rejectPendingResponses("ipc-socket-closed");
+      this.scheduleReconnect();
+    });
+  }
+
+  scheduleReconnect() {
+    if (this.stopped || this.reconnectTimer) {
+      return;
+    }
+
+    this.reconnectTimer = setTimeout(() => {
+      this.reconnectTimer = null;
+      this.connect();
+    }, this.config.ipcReconnectMs);
+  }
+
+  rejectPendingResponses(message) {
+    for (const [requestId, pending] of this.pendingResponses) {
+      clearTimeout(pending.timeout);
+      pending.reject(new Error(message));
+      this.pendingResponses.delete(requestId);
+    }
+  }
+
+  async handleData(chunk) {
+    this.buffer = Buffer.concat([this.buffer, chunk]);
+
+    while (this.buffer.length >= 4) {
+      const frameBytes = this.buffer.readUInt32LE(0);
+      if (this.buffer.length < 4 + frameBytes) {
+        return;
+      }
+
+      const frame = this.buffer.subarray(4, 4 + frameBytes).toString("utf8");
+      this.buffer = this.buffer.subarray(4 + frameBytes);
+
+      let message;
+      try {
+        message = JSON.parse(frame);
+      } catch {
+        continue;
+      }
+
+      await this.handleMessage(message);
+    }
+  }
+
+  async handleMessage(message) {
+    if (message.type === "response") {
+      if (message.resultType === "success" && message.method === "initialize") {
+        this.clientId = message.result?.clientId ?? null;
+        console.log(`[ipc] connected | clientId=${this.clientId || "unknown"}`);
+      }
+
+      const pending = this.pendingResponses.get(message.requestId);
+      if (!pending) {
+        return;
+      }
+
+      this.pendingResponses.delete(message.requestId);
+      clearTimeout(pending.timeout);
+
+      if (message.resultType === "error") {
+        pending.reject(new Error(message.error || "ipc-request-failed"));
+        return;
+      }
+
+      pending.resolve(message.result);
+      return;
+    }
+
+    if (message.type === "client-discovery-request") {
+      this.write({
+        type: "client-discovery-response",
+        requestId: message.requestId,
+        response: { canHandle: false },
+      });
+      return;
+    }
+
+    if (message.type !== "broadcast") {
+      return;
+    }
+
+    if (message.method === "thread-stream-state-changed") {
+      await this.handleThreadStreamStateChanged(message);
+      return;
+    }
+
+    if (isUserInputRequestedBroadcastMethod(message.method)) {
+      await this.handleUserInputRequested(message);
+    }
+  }
+
+  async handleThreadStreamStateChanged(message) {
+    const normalized = normalizeThreadStreamStateChanged(message);
+    if (!normalized) {
+      return;
+    }
+
+    const previousState = this.runtime.threadStates.get(normalized.conversationId) ?? { requests: [] };
+    let nextState = cloneJson(previousState) ?? { requests: [] };
+
+    if (normalized.state) {
+      nextState = mergeConversationState(nextState, normalized.state);
+    }
+
+    if (normalized.patches.length > 0) {
+      nextState = applyJsonPatches(nextState, normalized.patches);
+    }
+
+    if (!Array.isArray(nextState.requests)) {
+      nextState.requests = [];
+    }
+
+    const previousRequests = normalizeNativeRequests(previousState.requests);
+    const nextRequests = normalizeNativeRequests(nextState.requests);
+
+    if (previousRequests.length !== nextRequests.length) {
+      console.log(
+        `[ipc-requests] ${normalized.conversationId} | ${previousRequests.length} -> ${nextRequests.length}`
+      );
+    }
+
+    this.runtime.threadStates.set(normalized.conversationId, nextState);
+
+    await this.onThreadStateChanged({
+      conversationId: normalized.conversationId,
+      previousRequests,
+      nextRequests,
+      sourceClientId: normalized.sourceClientId,
+    });
+  }
+
+  async handleUserInputRequested(message) {
+    if (!this.onUserInputRequested) {
+      return;
+    }
+
+    const normalized = normalizeUserInputRequestedBroadcast(message);
+    if (!normalized) {
+      return;
+    }
+
+    await this.onUserInputRequested(normalized);
+  }
+
+  write(message) {
+    if (!this.socket) {
+      return;
+    }
+
+    const json = JSON.stringify(message);
+    const frame = Buffer.alloc(4 + Buffer.byteLength(json));
+    frame.writeUInt32LE(Buffer.byteLength(json), 0);
+    frame.write(json, 4);
+    this.socket.write(frame);
+  }
+}
+
+function isUserInputRequestedBroadcastMethod(method) {
+  return isUserInputRequestedMethod(method);
+}
+
+function normalizeUserInputRequestedBroadcast(message) {
+  const params = isPlainObject(message.params) ? message.params : {};
+  const conversationId = cleanText(
+    params.conversationId ??
+      params.threadId ??
+      params.thread_id ??
+      params.conversation?.id ??
+      params.thread?.id ??
+      params.request?.conversationId ??
+      params.request?.threadId ??
+      ""
+  );
+  const requestId = cleanText(
+    params.requestId ??
+      params.request_id ??
+      params.id ??
+      params.request?.id ??
+      ""
+  );
+
+  if (!conversationId || !requestId) {
+    return null;
+  }
+
+  return {
+    conversationId,
+    sourceClientId: cleanText(message.sourceClientId ?? ""),
+    nextRequests: [
+      {
+        id: requestId,
+        method: cleanText(message.method) || "request_user_input",
+        params,
+      },
+    ],
+  };
+}
+
+function normalizeThreadStreamStateChanged(message) {
+  const params = message.params ?? {};
+  const change = isPlainObject(params.change) ? params.change : null;
+  const conversationId = cleanText(
+    params.conversationId ??
+      params.threadId ??
+      params.id ??
+      params.conversation?.id ??
+      params.thread?.id ??
+      change?.conversationState?.id ??
+      params.state?.id ??
+      ""
+  );
+  if (!conversationId) {
+    return null;
+  }
+
+  let patches =
+    change?.type === "patches"
+      ? change.patches ?? []
+      : params.patch ?? params.patches ?? params.operations ?? params.ops ?? [];
+  if (!Array.isArray(patches)) {
+    patches = patches ? [patches] : [];
+  }
+
+  let state = null;
+  if (change?.type === "snapshot" && isPlainObject(change.conversationState)) {
+    state = change.conversationState;
+  } else if (isPlainObject(params.state)) {
+    state = params.state;
+  } else if (isPlainObject(params.conversation)) {
+    state = params.conversation;
+  } else if (isPlainObject(params.thread)) {
+    state = params.thread;
+  } else if (Array.isArray(params.requests)) {
+    state = { requests: params.requests };
+  }
+
+  return {
+    conversationId,
+    patches: patches.filter((patch) => isPlainObject(patch) && typeof patch.op === "string"),
+    state,
+    sourceClientId: cleanText(message.sourceClientId ?? ""),
+  };
+}
+
+function mergeConversationState(previousState, nextState) {
+  const merged = {
+    ...(isPlainObject(previousState) ? previousState : {}),
+    ...(isPlainObject(nextState) ? nextState : {}),
+  };
+
+  if (Array.isArray(nextState?.requests)) {
+    merged.requests = nextState.requests;
+  }
+
+  return merged;
+}
+
+function applyJsonPatches(document, patches) {
+  let next = cloneJson(document) ?? {};
+
+  for (const patch of patches) {
+    next = applyJsonPatch(next, patch);
+  }
+
+  return next;
+}
+
+function applyJsonPatch(document, patch) {
+  const operation = patch.op;
+  const pathSegments = decodeJsonPointer(patch.path);
+
+  if (pathSegments.length === 0) {
+    if (operation === "remove") {
+      return {};
+    }
+    if (operation === "add" || operation === "replace") {
+      return cloneJson(patch.value);
+    }
+    return document;
+  }
+
+  const target = cloneJson(document) ?? {};
+  if (operation === "remove") {
+    removeAtPointer(target, pathSegments);
+    return target;
+  }
+
+  if (operation === "add" || operation === "replace") {
+    setAtPointer(target, pathSegments, cloneJson(patch.value), operation === "add");
+    return target;
+  }
+
+  return target;
+}
+
+function decodeJsonPointer(pointer) {
+  if (Array.isArray(pointer)) {
+    return pointer.map((segment) => String(segment));
+  }
+
+  if (!pointer || pointer === "/") {
+    return [];
+  }
+
+  return String(pointer)
+    .split("/")
+    .slice(1)
+    .map((segment) => segment.replace(/~1/gu, "/").replace(/~0/gu, "~"));
+}
+
+function setAtPointer(target, segments, value, isAdd) {
+  let node = target;
+
+  for (let index = 0; index < segments.length - 1; index += 1) {
+    const segment = segments[index];
+    const nextSegment = segments[index + 1];
+
+    if (Array.isArray(node)) {
+      const arrayIndex = toArrayIndex(segment, node.length, true);
+      if (node[arrayIndex] == null || typeof node[arrayIndex] !== "object") {
+        node[arrayIndex] = isArrayPointerSegment(nextSegment) ? [] : {};
+      }
+      node = node[arrayIndex];
+      continue;
+    }
+
+    if (node[segment] == null || typeof node[segment] !== "object") {
+      node[segment] = isArrayPointerSegment(nextSegment) ? [] : {};
+    }
+    node = node[segment];
+  }
+
+  const finalSegment = segments.at(-1);
+  if (Array.isArray(node)) {
+    const index = toArrayIndex(finalSegment, node.length, isAdd);
+    if (isAdd && (finalSegment === "-" || index === node.length)) {
+      node.push(value);
+      return;
+    }
+    if (isAdd) {
+      node.splice(index, 0, value);
+      return;
+    }
+    node[index] = value;
+    return;
+  }
+
+  node[finalSegment] = value;
+}
+
+function removeAtPointer(target, segments) {
+  let node = target;
+
+  for (let index = 0; index < segments.length - 1; index += 1) {
+    const segment = segments[index];
+    if (Array.isArray(node)) {
+      const arrayIndex = toArrayIndex(segment, node.length, false);
+      node = node[arrayIndex];
+    } else {
+      node = node?.[segment];
+    }
+
+    if (node == null) {
+      return;
+    }
+  }
+
+  const finalSegment = segments.at(-1);
+  if (Array.isArray(node)) {
+    const arrayIndex = toArrayIndex(finalSegment, node.length, false);
+    if (arrayIndex >= 0 && arrayIndex < node.length) {
+      node.splice(arrayIndex, 1);
+    }
+    return;
+  }
+
+  delete node?.[finalSegment];
+}
+
+function toArrayIndex(segment, length, allowEnd) {
+  if (segment === "-" && allowEnd) {
+    return length;
+  }
+  const parsed = Number.parseInt(segment, 10);
+  if (Number.isFinite(parsed) && parsed >= 0) {
+    return parsed;
+  }
+  return allowEnd ? length : 0;
+}
+
+function isArrayPointerSegment(segment) {
+  return segment === "-" || /^\d+$/u.test(String(segment || ""));
+}
+
+function normalizeNativeRequests(requests) {
+  if (!Array.isArray(requests)) {
+    return [];
+  }
+
+  return requests
+    .filter((request) => isPlainObject(request) && request.id != null && request.method)
+    .map((request) => ({
+      id: request.id,
+      method: String(request.method),
+      params: isPlainObject(request.params) ? request.params : {},
+    }));
+}
+
+function nativeApprovalKind(method) {
+  if (method === "item/commandExecution/requestApproval") {
+    return "command";
+  }
+  if (method === "item/fileChange/requestApproval") {
+    return "file";
+  }
+  return null;
+}
+
+function nativeRequestKey(conversationId, requestId) {
+  return `${conversationId}:${String(requestId)}`;
+}
+
+function getNativeThreadLabel({ runtime, conversationId, cwd }) {
+  const normalizedConversationId = cleanText(conversationId || "");
+  const threadState = normalizedConversationId ? runtime.threadStates.get(normalizedConversationId) ?? null : null;
+  const stateLabel = sanitizeResolvedThreadLabel(extractThreadLabelFromState(threadState), normalizedConversationId);
+  if (stateLabel) {
+    return stateLabel;
+  }
+  if (normalizedConversationId && runtime.sessionIndex.has(normalizedConversationId)) {
+    const sessionLabel = sanitizeResolvedThreadLabel(runtime.sessionIndex.get(normalizedConversationId) || "", normalizedConversationId);
+    if (sessionLabel) {
+      return sessionLabel;
+    }
+  }
+  if (normalizedConversationId && runtime.rolloutThreadLabels.has(normalizedConversationId)) {
+    const rolloutLabel = sanitizeResolvedThreadLabel(runtime.rolloutThreadLabels.get(normalizedConversationId) || "", normalizedConversationId);
+    if (rolloutLabel) {
+      return rolloutLabel;
+    }
+  }
+  if (cwd) {
+    return truncate(cleanText(path.basename(cwd)), 90) || shortId(normalizedConversationId);
+  }
+  return shortId(normalizedConversationId) || "Codex task";
+}
+
+function formatNativeApprovalMessage(kind, params, locale = config?.defaultLocale || DEFAULT_LOCALE) {
+  if (kind === "command") {
+    return formatCommandApprovalMessage(params, locale);
+  }
+  return formatFileApprovalMessage(params, locale);
+}
+
+function formatCommandApprovalMessage(params, locale = config?.defaultLocale || DEFAULT_LOCALE) {
+  const parts = [];
+  const reason = truncate(cleanText(params.reason ?? params.justification ?? ""), 220);
+  const command = truncate(cleanText(params.command ?? params.cmd ?? ""), 220);
+  if (reason) {
+    parts.push(reason);
+  } else {
+    parts.push(t(locale, "server.message.commandApprovalNeeded"));
+  }
+  if (command) {
+    parts.push(t(locale, "server.message.commandPrefix", { command }));
+  }
+  return truncate(parts.join("\n") || t(locale, "server.message.commandApprovalNeeded"), 1024);
+}
+
+function formatFileApprovalMessage(params, locale = config?.defaultLocale || DEFAULT_LOCALE) {
+  const parts = [];
+  const reason = truncate(cleanText(params.reason ?? ""), 220);
+  if (reason) {
+    parts.push(reason);
+  } else {
+    parts.push(t(locale, "server.message.fileApprovalNeeded"));
+  }
+  if (params.grantRoot) {
+    parts.push(t(locale, "server.message.pathPrefix", { path: compactPath(params.grantRoot) }));
+  } else if (params.cwd) {
+    parts.push(t(locale, "server.message.pathPrefix", { path: compactPath(params.cwd) }));
+  }
+  return truncate(parts.join("\n"), 1024);
+}
+
+function buildNativeApprovalActions(reviewUrl, locale = config?.defaultLocale || DEFAULT_LOCALE) {
+  return [{ action: "view", label: t(locale, "server.action.review"), url: reviewUrl, clear: true }];
+}
+
+function buildCompletionActions(detailUrl, locale = config?.defaultLocale || DEFAULT_LOCALE) {
+  return [{ action: "view", label: t(locale, "server.action.detail"), url: detailUrl, clear: false }];
+}
+
+function buildPlanDetailActions(detailUrl, locale = config?.defaultLocale || DEFAULT_LOCALE) {
+  return [{ action: "view", label: t(locale, "server.action.detail"), url: detailUrl, clear: false }];
+}
+
+function buildPlanRequestActions(detailUrl, locale = config?.defaultLocale || DEFAULT_LOCALE) {
+  return [{ action: "view", label: t(locale, "server.action.review"), url: detailUrl, clear: false }];
+}
+
+function buildUserInputActions(detailUrl, locale = config?.defaultLocale || DEFAULT_LOCALE) {
+  return [{ action: "view", label: t(locale, "server.action.select"), url: detailUrl, clear: false }];
+}
+
+function buildUserInputFallbackActions(detailUrl, locale = config?.defaultLocale || DEFAULT_LOCALE) {
+  return [{ action: "view", label: t(locale, "server.action.detail"), url: detailUrl, clear: false }];
+}
+
+function parseCookies(req) {
+  const header = String(req.headers.cookie || "");
+  const cookies = {};
+  for (const part of header.split(";")) {
+    const [rawName, ...rawValue] = part.split("=");
+    const name = cleanText(rawName);
+    if (!name) {
+      continue;
+    }
+    cookies[name] = decodeURIComponent(rawValue.join("=") || "");
+  }
+  return cookies;
+}
+
+function base64UrlEncode(value) {
+  return Buffer.from(String(value), "utf8").toString("base64url");
+}
+
+function base64UrlDecode(value) {
+  return Buffer.from(String(value), "base64url").toString("utf8");
+}
+
+function signSessionPayload(payload, secret) {
+  const encoded = base64UrlEncode(JSON.stringify(payload));
+  const signature = crypto.createHmac("sha256", secret).update(encoded).digest("base64url");
+  return `${encoded}.${signature}`;
+}
+
+function verifySessionToken(token, secret) {
+  const [encoded, signature] = String(token || "").split(".");
+  if (!encoded || !signature) {
+    return null;
+  }
+
+  const expected = crypto.createHmac("sha256", secret).update(encoded).digest("base64url");
+  const left = Buffer.from(signature, "utf8");
+  const right = Buffer.from(expected, "utf8");
+  if (left.length !== right.length || !crypto.timingSafeEqual(left, right)) {
+    return null;
+  }
+
+  try {
+    const payload = JSON.parse(base64UrlDecode(encoded));
+    if (!isPlainObject(payload)) {
+      return null;
+    }
+    const expiresAtMs = Number(payload.expiresAtMs) || 0;
+    if (expiresAtMs > 0 && Date.now() >= expiresAtMs) {
+      return null;
+    }
+    return payload;
+  } catch {
+    return null;
+  }
+}
+
+function normalizeDeviceTrustRecord(raw, { trustTtlMs, now = Date.now() }) {
+  if (typeof raw === "number" || typeof raw === "string") {
+    const legacyPairedAtMs = Number(raw) || 0;
+    if (!legacyPairedAtMs) {
+      return null;
+    }
+    return {
+      pairedAtMs: legacyPairedAtMs,
+      trustedUntilMs: legacyPairedAtMs + trustTtlMs,
+      lastAuthenticatedAtMs: legacyPairedAtMs,
+      revokedAtMs: 0,
+      userAgent: "",
+      standalone: false,
+      lastLocale: "",
+    };
+  }
+
+  if (!isPlainObject(raw)) {
+    return null;
+  }
+
+  const pairedAtMs =
+    Number(raw.pairedAtMs) ||
+    Number(raw.lastAuthenticatedAtMs) ||
+    Number(raw.trustedUntilMs) ||
+    now;
+  if (!pairedAtMs) {
+    return null;
+  }
+
+  return {
+    pairedAtMs,
+    trustedUntilMs: Number(raw.trustedUntilMs) || pairedAtMs + trustTtlMs,
+    lastAuthenticatedAtMs: Number(raw.lastAuthenticatedAtMs) || pairedAtMs,
+    revokedAtMs: Number(raw.revokedAtMs) || 0,
+    userAgent: cleanText(raw.userAgent ?? ""),
+    standalone: raw.standalone === true,
+    lastLocale: normalizeSupportedLocale(raw.lastLocale),
+  };
+}
+
+function deviceTrustSortTimestamp(record) {
+  if (!isPlainObject(record)) {
+    return 0;
+  }
+  return Math.max(
+    Number(record.lastAuthenticatedAtMs) || 0,
+    Number(record.pairedAtMs) || 0,
+    Number(record.trustedUntilMs) || 0,
+    Number(record.revokedAtMs) || 0
+  );
+}
+
+function trimDeviceTrustRecords(pairedDevices, maxEntries = MAX_PAIRED_DEVICES) {
+  const entries = Object.entries(isPlainObject(pairedDevices) ? pairedDevices : {});
+  if (entries.length <= maxEntries) {
+    return;
+  }
+
+  entries.sort((left, right) => deviceTrustSortTimestamp(right[1]) - deviceTrustSortTimestamp(left[1]));
+  for (const [deviceId] of entries.slice(maxEntries)) {
+    delete pairedDevices[deviceId];
+  }
+}
+
+function migratePairedDevicesState({ config, state, now = Date.now() }) {
+  const current = isPlainObject(state?.pairedDevices) ? state.pairedDevices : {};
+  const next = {};
+  for (const [rawDeviceId, rawRecord] of Object.entries(current)) {
+    const deviceId = cleanText(rawDeviceId || "");
+    if (!deviceId) {
+      continue;
+    }
+    const record = normalizeDeviceTrustRecord(rawRecord, {
+      trustTtlMs: config.deviceTrustTtlMs,
+      now,
+    });
+    if (!record) {
+      continue;
+    }
+    next[deviceId] = record;
+  }
+
+  trimDeviceTrustRecords(next, MAX_PAIRED_DEVICES);
+  const changed = JSON.stringify(current) !== JSON.stringify(next);
+  state.pairedDevices = next;
+  return changed;
+}
+
+function isDeviceTrustRecordActive(record, now = Date.now()) {
+  if (!isPlainObject(record)) {
+    return false;
+  }
+  if (Number(record.revokedAtMs) > 0 && Number(record.revokedAtMs) <= now) {
+    return false;
+  }
+  const trustedUntilMs = Number(record.trustedUntilMs) || 0;
+  if (trustedUntilMs > 0 && now >= trustedUntilMs) {
+    return false;
+  }
+  return true;
+}
+
+function getActiveDeviceTrustRecord(state, config, deviceId, now = Date.now()) {
+  const normalizedDeviceId = cleanText(deviceId || "");
+  if (!normalizedDeviceId || !isPlainObject(state?.pairedDevices)) {
+    return null;
+  }
+
+  const record = normalizeDeviceTrustRecord(state.pairedDevices[normalizedDeviceId], {
+    trustTtlMs: config.deviceTrustTtlMs,
+    now,
+  });
+  if (!record || !isDeviceTrustRecordActive(record, now)) {
+    return null;
+  }
+  return record;
+}
+
+function markDevicePaired(state, config, deviceId, metadata = {}, now = Date.now()) {
+  const normalizedDeviceId = cleanText(deviceId || "");
+  if (!normalizedDeviceId) {
+    return false;
+  }
+
+  if (!isPlainObject(state.pairedDevices)) {
+    state.pairedDevices = {};
+  }
+
+  const previous = normalizeDeviceTrustRecord(state.pairedDevices[normalizedDeviceId], {
+    trustTtlMs: config.deviceTrustTtlMs,
+    now,
+  });
+  const next = {
+    pairedAtMs: Number(previous?.pairedAtMs) || now,
+    trustedUntilMs: now + config.deviceTrustTtlMs,
+    lastAuthenticatedAtMs: now,
+    revokedAtMs: 0,
+    userAgent: cleanText(metadata.userAgent ?? previous?.userAgent ?? ""),
+    standalone: metadata.standalone === true || previous?.standalone === true,
+    lastLocale: normalizeSupportedLocale(metadata.lastLocale, previous?.lastLocale),
+  };
+  state.pairedDevices[normalizedDeviceId] = next;
+  trimDeviceTrustRecords(state.pairedDevices, MAX_PAIRED_DEVICES);
+  return JSON.stringify(previous ?? null) !== JSON.stringify(next);
+}
+
+function touchDeviceTrust(state, config, deviceId, now = Date.now()) {
+  const normalizedDeviceId = cleanText(deviceId || "");
+  const current = getActiveDeviceTrustRecord(state, config, normalizedDeviceId, now);
+  if (!normalizedDeviceId || !current) {
+    return false;
+  }
+
+  const next = {
+    ...current,
+    lastAuthenticatedAtMs: now,
+  };
+  state.pairedDevices[normalizedDeviceId] = next;
+  return JSON.stringify(current) !== JSON.stringify(next);
+}
+
+function updateDeviceTrustMetadata(state, config, deviceId, metadata = {}, now = Date.now()) {
+  const normalizedDeviceId = cleanText(deviceId || "");
+  if (!normalizedDeviceId || !isPlainObject(state?.pairedDevices)) {
+    return false;
+  }
+
+  const current = normalizeDeviceTrustRecord(state.pairedDevices[normalizedDeviceId], {
+    trustTtlMs: config.deviceTrustTtlMs,
+    now,
+  });
+  if (!current) {
+    return false;
+  }
+
+  const next = {
+    ...current,
+    userAgent: cleanText(metadata.userAgent ?? current.userAgent ?? ""),
+    standalone: metadata.standalone === true || (metadata.standalone == null ? current.standalone === true : false),
+    lastLocale: normalizeSupportedLocale(metadata.lastLocale, current.lastLocale),
+  };
+  state.pairedDevices[normalizedDeviceId] = next;
+  return JSON.stringify(current) !== JSON.stringify(next);
+}
+
+function revokeDeviceTrust(state, config, deviceId, now = Date.now()) {
+  const normalizedDeviceId = cleanText(deviceId || "");
+  if (!normalizedDeviceId || !isPlainObject(state?.pairedDevices)) {
+    return false;
+  }
+
+  const current = normalizeDeviceTrustRecord(state.pairedDevices[normalizedDeviceId], {
+    trustTtlMs: config.deviceTrustTtlMs,
+    now,
+  });
+  if (!current) {
+    return false;
+  }
+
+  const next = {
+    ...current,
+    trustedUntilMs: Math.min(Number(current.trustedUntilMs) || now, now),
+    revokedAtMs: now,
+  };
+  state.pairedDevices[normalizedDeviceId] = next;
+  return JSON.stringify(current) !== JSON.stringify(next);
+}
+
+function activeTrustedDevices(state, config, now = Date.now()) {
+  if (!isPlainObject(state?.pairedDevices)) {
+    return [];
+  }
+  return Object.entries(state.pairedDevices)
+    .map(([deviceId, rawRecord]) => ({
+      deviceId: cleanText(deviceId || ""),
+      record: normalizeDeviceTrustRecord(rawRecord, {
+        trustTtlMs: config.deviceTrustTtlMs,
+        now,
+      }),
+    }))
+    .filter(({ deviceId, record }) => deviceId && record && isDeviceTrustRecordActive(record, now))
+    .sort((left, right) => Number(right.record.lastAuthenticatedAtMs || 0) - Number(left.record.lastAuthenticatedAtMs || 0));
+}
+
+function summarizeUserAgentDevice(userAgent) {
+  const text = cleanText(userAgent || "");
+  if (!text) {
+    return "browser";
+  }
+  if (/iPhone/u.test(text)) {
+    return "iphone";
+  }
+  if (/iPad/u.test(text)) {
+    return "ipad";
+  }
+  if (/Android/u.test(text)) {
+    return "android";
+  }
+  if (/Macintosh|Mac OS X/u.test(text)) {
+    return "mac";
+  }
+  return "browser";
+}
+
+function buildDeviceDisplayName({ record, localeInfo, deviceId, locale }) {
+  const platformKey = `settings.device.platform.${summarizeUserAgentDevice(record?.userAgent)}`;
+  const platformLabel = t(locale, platformKey);
+  const modeLabel = t(locale, record?.standalone ? "settings.device.mode.standalone" : "settings.device.mode.browser");
+  const localeLabel = localeDisplayName(localeInfo.locale, locale) || localeInfo.locale || "";
+  const parts = [platformLabel, modeLabel].filter(Boolean);
+  if (localeLabel) {
+    parts.push(localeLabel);
+  }
+  if (parts.length === 0) {
+    return `${t(locale, "settings.device.fallbackName")} ${String(deviceId || "").slice(0, 8)}`;
+  }
+  return parts.join(" · ");
+}
+
+function buildDeviceSummary({ config, state, deviceId, record, currentDeviceId, locale }) {
+  const subscription = getPushSubscriptionForDevice(state, deviceId);
+  const localeInfo = resolveDeviceLocaleInfo(config, state, deviceId);
+  return {
+    deviceId,
+    currentDevice: deviceId === cleanText(currentDeviceId || ""),
+    pairedAtMs: Number(record?.pairedAtMs) || 0,
+    lastAuthenticatedAtMs: Number(record?.lastAuthenticatedAtMs) || 0,
+    trustedUntilMs: Number(record?.trustedUntilMs) || 0,
+    pushSubscribed: Boolean(subscription),
+    standalone: subscription?.standalone === true || record?.standalone === true,
+    locale: localeInfo.locale || "",
+    displayName: buildDeviceDisplayName({ record, localeInfo, deviceId, locale }),
+  };
+}
+
+function buildDevicesResponse({ config, state, session, locale }) {
+  return {
+    devices: activeTrustedDevices(state, config).map(({ deviceId, record }) =>
+      buildDeviceSummary({
+        config,
+        state,
+        deviceId,
+        record,
+        currentDeviceId: session.deviceId,
+        locale,
+      })
+    ),
+  };
+}
+
+function readSession(req, config, state) {
+  const deviceId = readDeviceId(req, config);
+  if (!config.authRequired) {
+    return {
+      authenticated: true,
+      sessionId: "local-noauth",
+      pairedAtMs: Date.now(),
+      expiresAtMs: 0,
+      deviceId,
+    };
+  }
+
+  const token = parseCookies(req)[sessionCookieName];
+  const payload = token ? verifySessionToken(token, config.sessionSecret) : null;
+  if (!payload) {
+    const trustedRecord = getActiveDeviceTrustRecord(state, config, deviceId);
+    if (trustedRecord) {
+      return {
+        authenticated: true,
+        sessionId: "restored-device",
+        pairedAtMs: Number(trustedRecord.pairedAtMs) || Date.now(),
+        expiresAtMs: Date.now() + config.sessionTtlMs,
+        deviceId,
+        restoredFromDevice: true,
+      };
+    }
+
+    return {
+      authenticated: false,
+      pairingAvailable: isPairingAvailable(config),
+      deviceId,
+    };
+  }
+
+  return {
+    authenticated: true,
+    sessionId: cleanText(payload.sessionId ?? "") || null,
+    pairedAtMs: Number(payload.pairedAtMs) || 0,
+    expiresAtMs: Number(payload.expiresAtMs) || 0,
+    deviceId,
+  };
+}
+
+function buildSessionCookie(config) {
+  const now = Date.now();
+  const payload = {
+    sessionId: crypto.randomUUID(),
+    pairedAtMs: now,
+    expiresAtMs: now + config.sessionTtlMs,
+  };
+  return signSessionPayload(payload, config.sessionSecret);
+}
+
+function readDeviceId(req, config) {
+  const token = parseCookies(req)[deviceCookieName];
+  const payload = token ? verifySessionToken(token, config.sessionSecret) : null;
+  return cleanText(payload?.deviceId ?? "") || null;
+}
+
+function buildDeviceCookie(config, existingDeviceId = "") {
+  const now = Date.now();
+  const payload = {
+    deviceId: cleanText(existingDeviceId || "") || crypto.randomUUID(),
+    pairedAtMs: now,
+    expiresAtMs: now + 180 * 24 * 60 * 60 * 1000,
+  };
+  return signSessionPayload(payload, config.sessionSecret);
+}
+
+function buildCookieHeader(name, { value, maxAgeSecs, secure }) {
+  const parts = [
+    `${name}=${encodeURIComponent(value)}`,
+    "Path=/",
+    "HttpOnly",
+    "SameSite=Lax",
+    `Max-Age=${maxAgeSecs}`,
+  ];
+  if (secure) {
+    parts.push("Secure");
+  }
+  return parts.join("; ");
+}
+
+function buildSetCookieHeader({ value, maxAgeSecs, secure = false }) {
+  return buildCookieHeader(sessionCookieName, { value, maxAgeSecs, secure });
+}
+
+function setSessionCookie(res, config) {
+  const secure = config.nativeApprovalPublicBaseUrl.startsWith("https://");
+  const token = buildSessionCookie(config);
+  res.setHeader("Set-Cookie", buildSetCookieHeader({
+    value: token,
+    maxAgeSecs: Math.max(1, Math.floor(config.sessionTtlMs / 1000)),
+    secure,
+  }));
+}
+
+function clearSessionCookie(res, config) {
+  const secure = config.nativeApprovalPublicBaseUrl.startsWith("https://");
+  res.setHeader("Set-Cookie", buildSetCookieHeader({ value: "", maxAgeSecs: 0, secure }));
+}
+
+function setPairingCookies(res, config, existingDeviceId = "") {
+  const secure = config.nativeApprovalPublicBaseUrl.startsWith("https://");
+  const sessionToken = buildSessionCookie(config);
+  const deviceToken = buildDeviceCookie(config, existingDeviceId);
+  res.setHeader("Set-Cookie", [
+    buildCookieHeader(sessionCookieName, {
+      value: sessionToken,
+      maxAgeSecs: Math.max(1, Math.floor(config.sessionTtlMs / 1000)),
+      secure,
+    }),
+    buildCookieHeader(deviceCookieName, {
+      value: deviceToken,
+      maxAgeSecs: 180 * 24 * 60 * 60,
+      secure,
+    }),
+  ]);
+}
+
+function clearAuthCookies(res, config) {
+  const secure = config.nativeApprovalPublicBaseUrl.startsWith("https://");
+  res.setHeader("Set-Cookie", [
+    buildCookieHeader(sessionCookieName, { value: "", maxAgeSecs: 0, secure }),
+    buildCookieHeader(deviceCookieName, { value: "", maxAgeSecs: 0, secure }),
+  ]);
+}
+
+function normalizePushSubscriptionBody(payload, deviceId) {
+  const endpoint = cleanText(payload?.subscription?.endpoint ?? payload?.endpoint ?? "");
+  const p256dh = cleanText(
+    payload?.subscription?.keys?.p256dh ??
+    payload?.keys?.p256dh ??
+    payload?.p256dh ??
+    ""
+  );
+  const auth = cleanText(
+    payload?.subscription?.keys?.auth ??
+    payload?.keys?.auth ??
+    payload?.auth ??
+    ""
+  );
+  if (!endpoint || !p256dh || !auth || !deviceId) {
+    return null;
+  }
+  return normalizePushSubscriptionRecord({
+    id: pushSubscriptionId(endpoint),
+    endpoint,
+    keys: { p256dh, auth },
+    deviceId,
+    userAgent: cleanText(payload?.userAgent ?? ""),
+    standalone: payload?.standalone === true,
+    createdAtMs: Date.now(),
+    updatedAtMs: Date.now(),
+  });
+}
+
+function buildPushStatusResponse(config, state, session) {
+  const current = getPushSubscriptionForDevice(state, session.deviceId);
+  return {
+    enabled: config.webPushEnabled,
+    secureOrigin: config.nativeApprovalPublicBaseUrl.startsWith("https://"),
+    vapidPublicKey: config.webPushEnabled ? config.webPushVapidPublicKey : "",
+    subject: config.webPushEnabled ? config.webPushSubject : "",
+    deviceId: session.deviceId || null,
+    subscribed: Boolean(current),
+    subscriptionId: current?.id || null,
+    lastSuccessfulDeliveryAtMs: Number(current?.lastSuccessfulDeliveryAtMs) || 0,
+  };
+}
+
+function requestUserAgent(req) {
+  return cleanText(req.headers?.["user-agent"] ?? "");
+}
+
+function updateCurrentDeviceSnapshot(state, config, deviceId, metadata = {}) {
+  if (!deviceId) {
+    return false;
+  }
+  return updateDeviceTrustMetadata(state, config, deviceId, metadata);
+}
+
+async function sendPushTestToDevice({ config, state, session }) {
+  if (!config.webPushEnabled) {
+    throw new Error("web-push-disabled");
+  }
+  const subscription = getPushSubscriptionForDevice(state, session.deviceId);
+  if (!subscription) {
+    throw new Error("push-subscription-not-found");
+  }
+
+  const locale = resolveDeviceLocaleInfo(config, state, session.deviceId).locale;
+  const payload = JSON.stringify({
+    title: t(locale, "server.pushTest.title"),
+    body: t(locale, "server.pushTest.body"),
+    tag: `push-test:${subscription.deviceId}`,
+    data: {
+      url: `${config.nativeApprovalPublicBaseUrl}/app`,
+      kind: "info",
+      token: "",
+      stableId: `push-test:${subscription.deviceId}`,
+    },
+  });
+
+  await webPush.sendNotification(
+    {
+      endpoint: subscription.endpoint,
+      keys: subscription.keys,
+    },
+    payload
+  );
+
+  const now = Date.now();
+  const stored = normalizePushSubscriptionRecord(state.pushSubscriptions?.[subscription.id]);
+  if (stored) {
+    stored.lastSuccessfulDeliveryAtMs = now;
+    stored.updatedAtMs = now;
+    state.pushSubscriptions[subscription.id] = serializePushSubscriptionRecord(stored);
+  }
+}
+
+function isPairingAvailable(config) {
+  if (!config.authRequired) {
+    return false;
+  }
+  if (!config.pairingCode && !config.pairingToken) {
+    return false;
+  }
+  return !(config.pairingExpiresAtMs > 0 && Date.now() >= config.pairingExpiresAtMs);
+}
+
+function currentPairingCredential(config) {
+  const token = cleanText(config?.pairingToken ?? "");
+  if (token) {
+    return `token:${token}`;
+  }
+  const code = cleanText(config?.pairingCode ?? "").toUpperCase();
+  if (code) {
+    return `code:${code}`;
+  }
+  return "";
+}
+
+function pairingCredentialConsumed(config, state) {
+  const current = currentPairingCredential(config);
+  if (!current) {
+    return false;
+  }
+  const consumedAtMs = Number(state?.pairingConsumedAt) || 0;
+  const consumedCredential = cleanText(state?.pairingConsumedCredential ?? "");
+  return consumedAtMs > 0 && consumedCredential === current;
+}
+
+function isPairingAvailableForState(config, state) {
+  return isPairingAvailable(config) && !pairingCredentialConsumed(config, state);
+}
+
+function markPairingConsumed(state, config, now = Date.now()) {
+  const current = currentPairingCredential(config);
+  if (!current) {
+    return false;
+  }
+  if (pairingCredentialConsumed(config, state)) {
+    return false;
+  }
+  state.pairingConsumedAt = now;
+  state.pairingConsumedCredential = current;
+  return true;
+}
+
+function validatePairingPayload(payload, config, state) {
+  if (!config.authRequired) {
+    return { ok: true };
+  }
+  if (!isPairingAvailableForState(config, state)) {
+    return { ok: false, error: "pairing-unavailable" };
+  }
+
+  const code = cleanText(payload?.code ?? "").toUpperCase();
+  const token = cleanText(payload?.token ?? "");
+  const matchesCode = code && cleanText(config.pairingCode).toUpperCase() === code;
+  const matchesToken = token && cleanText(config.pairingToken) === token;
+  if (!matchesCode && !matchesToken) {
+    return { ok: false, error: "invalid-pairing-credentials" };
+  }
+  return { ok: true };
+}
+
+function readRemoteAddress(req) {
+  return cleanText(req.socket?.remoteAddress ?? "");
+}
+
+function getActivePairingFailureTimestamps(runtime, remoteAddress, now = Date.now()) {
+  const normalizedRemoteAddress = cleanText(remoteAddress || "");
+  if (!normalizedRemoteAddress) {
+    return [];
+  }
+
+  const cutoff = now - PAIRING_RATE_LIMIT_WINDOW_MS;
+  const existing = Array.isArray(runtime.pairingAttemptsByRemoteAddress.get(normalizedRemoteAddress))
+    ? runtime.pairingAttemptsByRemoteAddress.get(normalizedRemoteAddress)
+    : [];
+  const next = existing
+    .map((value) => Number(value) || 0)
+    .filter((value) => value > cutoff);
+
+  if (next.length > 0) {
+    runtime.pairingAttemptsByRemoteAddress.set(normalizedRemoteAddress, next);
+  } else {
+    runtime.pairingAttemptsByRemoteAddress.delete(normalizedRemoteAddress);
+  }
+
+  return next;
+}
+
+function getPairingRetryAfterSecs(runtime, remoteAddress, now = Date.now()) {
+  const failures = getActivePairingFailureTimestamps(runtime, remoteAddress, now);
+  if (failures.length < PAIRING_RATE_LIMIT_MAX_ATTEMPTS) {
+    return 0;
+  }
+
+  const oldestFailure = failures[0];
+  return Math.max(1, Math.ceil((oldestFailure + PAIRING_RATE_LIMIT_WINDOW_MS - now) / 1000));
+}
+
+function recordPairingFailure(runtime, remoteAddress, now = Date.now()) {
+  const normalizedRemoteAddress = cleanText(remoteAddress || "");
+  if (!normalizedRemoteAddress) {
+    return 0;
+  }
+
+  const failures = getActivePairingFailureTimestamps(runtime, normalizedRemoteAddress, now);
+  failures.push(now);
+  runtime.pairingAttemptsByRemoteAddress.set(normalizedRemoteAddress, failures);
+  return getPairingRetryAfterSecs(runtime, normalizedRemoteAddress, now);
+}
+
+function clearPairingFailures(runtime, remoteAddress) {
+  const normalizedRemoteAddress = cleanText(remoteAddress || "");
+  if (!normalizedRemoteAddress) {
+    return;
+  }
+  runtime.pairingAttemptsByRemoteAddress.delete(normalizedRemoteAddress);
+}
+
+function writePairingRateLimited(res, retryAfterSecs) {
+  res.setHeader("Retry-After", String(Math.max(1, Number(retryAfterSecs) || 1)));
+  return writeJson(res, 429, { error: "pairing-rate-limited" });
+}
+
+function nonLoopbackIpv4Origins(config) {
+  const origins = new Set();
+  let baseUrl;
+  try {
+    baseUrl = new URL(config.nativeApprovalPublicBaseUrl);
+  } catch {
+    return origins;
+  }
+
+  const interfaces = os.networkInterfaces();
+  for (const entries of Object.values(interfaces || {})) {
+    for (const entry of entries || []) {
+      if (!entry || entry.internal) {
+        continue;
+      }
+      const family = typeof entry.family === "string" ? entry.family : String(entry.family || "");
+      if (family !== "IPv4") {
+        continue;
+      }
+      const ip = cleanText(entry.address || "");
+      if (!ip || ip === "127.0.0.1") {
+        continue;
+      }
+      const next = new URL(baseUrl.toString());
+      next.hostname = ip;
+      next.pathname = "";
+      next.search = "";
+      next.hash = "";
+      origins.add(next.origin);
+    }
+  }
+
+  return origins;
+}
+
+function trustedMutationOrigins(config) {
+  const origins = new Set();
+  let baseUrl;
+  try {
+    baseUrl = new URL(config.nativeApprovalPublicBaseUrl);
+  } catch {
+    return origins;
+  }
+
+  baseUrl.pathname = "";
+  baseUrl.search = "";
+  baseUrl.hash = "";
+  origins.add(baseUrl.origin);
+
+  for (const host of ["localhost", "127.0.0.1"]) {
+    const next = new URL(baseUrl.toString());
+    next.hostname = host;
+    origins.add(next.origin);
+  }
+
+  for (const origin of nonLoopbackIpv4Origins(config)) {
+    origins.add(origin);
+  }
+
+  return origins;
+}
+
+function requestOrigin(req) {
+  const originHeader = cleanText(req.headers?.origin ?? "");
+  if (originHeader && originHeader !== "null") {
+    try {
+      return new URL(originHeader).origin;
+    } catch {
+      return "__invalid__";
+    }
+  }
+
+  const refererHeader = cleanText(req.headers?.referer ?? "");
+  if (refererHeader) {
+    try {
+      return new URL(refererHeader).origin;
+    } catch {
+      return "__invalid__";
+    }
+  }
+
+  return "";
+}
+
+function requireTrustedMutationOrigin(req, res, config) {
+  const origin = requestOrigin(req);
+  if (!origin) {
+    if (isLoopbackRequest(req)) {
+      return true;
+    }
+    writeJson(res, 403, { error: "origin-not-allowed" });
+    return false;
+  }
+  if (origin === "__invalid__") {
+    writeJson(res, 403, { error: "origin-not-allowed" });
+    return false;
+  }
+  if (!trustedMutationOrigins(config).has(origin)) {
+    writeJson(res, 403, { error: "origin-not-allowed" });
+    return false;
+  }
+  return true;
+}
+
+function requireMutatingApiSession(req, res, config, state) {
+  if (!requireTrustedMutationOrigin(req, res, config)) {
+    return null;
+  }
+  return requireApiSession(req, res, config, state);
+}
+
+function requireApiSession(req, res, config, state) {
+  const session = readSession(req, config, state);
+  if (session.authenticated) {
+    return session;
+  }
+
+  writeJson(res, 401, {
+    error: "authentication-required",
+    pairingAvailable: isPairingAvailableForState(config, state),
+  });
+  return null;
+}
+
+function renderMessageHtml(messageText, fallbackHtml = "<p></p>") {
+  return renderMarkdownHtml(messageText, { fallbackHtml });
+}
+
+function historyItemByToken(runtime, kind, token) {
+  return runtime.recentHistoryItems.find(
+    (item) => item.kind === kind && item.token === token
+  ) ?? null;
+}
+
+function listLatestPersistedUserInputRequests({ config, runtime, state }) {
+  const byToken = new Map();
+  for (const userInputRequest of runtime.userInputRequestsByToken.values()) {
+    byToken.set(userInputRequest.token, userInputRequest);
+  }
+
+  const pending = isPlainObject(state.pendingUserInputRequests) ? state.pendingUserInputRequests : {};
+  for (const raw of Object.values(pending)) {
+    const restored = restoreGenericUserInputRequest({ config, raw });
+    if (!restored) {
+      continue;
+    }
+    const existing = byToken.get(restored.token);
+    if (!existing || Number(restored.lastSeenAtMs ?? 0) >= Number(existing.lastSeenAtMs ?? 0)) {
+      byToken.set(restored.token, restored);
+      registerGenericUserInputRequest(runtime, restored);
+    }
+  }
+
+  return Array.from(byToken.values());
+}
+
+function hasLiveConversationRequest(runtime, conversationId, requestId) {
+  const threadState = runtime.threadStates.get(cleanText(conversationId));
+  if (!Array.isArray(threadState?.requests) || requestId == null) {
+    return false;
+  }
+
+  const normalizedRequestId = String(requestId);
+  return threadState.requests.some(
+    (request) => isPlainObject(request) && request.id != null && String(request.id) === normalizedRequestId
+  );
+}
+
+function shouldShowPlanRequestInPending(runtime, planRequest) {
+  return (
+    Boolean(planRequest?.isLiveRequestActive) ||
+    hasLiveConversationRequest(runtime, planRequest?.conversationId, planRequest?.requestId)
+  );
+}
+
+function shouldShowUserInputRequestInPending(runtime, userInputRequest) {
+  return (
+    Boolean(userInputRequest?.isLiveRequestActive) ||
+    hasLiveConversationRequest(runtime, userInputRequest?.conversationId, userInputRequest?.requestId)
+  );
+}
+
+function buildPendingInboxItems(runtime, state, config, locale) {
+  const now = Date.now();
+  const items = [];
+
+  for (const approval of runtime.nativeApprovalsByToken.values()) {
+    if (approval.resolved || approval.resolving) {
+      continue;
+    }
+    items.push({
+      kind: "approval",
+      token: approval.token,
+      threadId: cleanText(approval.conversationId || ""),
+      threadLabel: approval.threadLabel || "",
+      title: formatLocalizedTitle(locale, "server.title.approval", approval.threadLabel),
+      summary: formatNotificationBody(approval.messageText, 100) || approval.messageText,
+      primaryLabel: t(locale, "server.action.review"),
+      createdAtMs: Number(approval.createdAtMs) || now,
+    });
+  }
+
+  for (const planRequest of runtime.planRequestsByToken.values()) {
+    if (planRequest.resolved || planRequest.resolving || isPlanRequestExpired(planRequest, now)) {
+      continue;
+    }
+    if (!shouldShowPlanRequestInPending(runtime, planRequest)) {
+      continue;
+    }
+    items.push({
+      kind: "plan",
+      token: planRequest.token,
+      threadId: cleanText(planRequest.conversationId || ""),
+      threadLabel: planRequest.threadLabel || "",
+      title: formatLocalizedTitle(locale, "server.title.plan", planRequest.threadLabel),
+      summary: formatNotificationBody(planRequest.messageText, 100) || planRequest.messageText,
+      primaryLabel: t(locale, "server.action.review"),
+      createdAtMs: Number(planRequest.createdAtMs) || now,
+    });
+  }
+
+  for (const userInputRequest of listLatestPersistedUserInputRequests({ config, runtime, state })) {
+    if (userInputRequest.resolved || userInputRequest.resolving || isGenericUserInputRequestExpired(userInputRequest, now)) {
+      continue;
+    }
+    if (!shouldShowUserInputRequestInPending(runtime, userInputRequest)) {
+      continue;
+    }
+    items.push({
+      kind: "choice",
+      token: userInputRequest.token,
+      threadId: cleanText(userInputRequest.conversationId || ""),
+      threadLabel: userInputRequest.threadLabel || "",
+      title: formatLocalizedTitle(
+        locale,
+        userInputRequest.supported ? "server.title.choice" : "server.title.choiceReadOnly",
+        userInputRequest.threadLabel
+      ),
+      summary: userInputRequest.notificationText || formatNotificationBody(userInputRequest.messageText, 100),
+      primaryLabel: t(locale, userInputRequest.supported ? "server.action.select" : "server.action.detail"),
+      createdAtMs: Number(userInputRequest.createdAtMs) || now,
+    });
+  }
+
+  return items.sort((left, right) => Number(right.createdAtMs ?? 0) - Number(left.createdAtMs ?? 0));
+}
+
+function buildCompletedInboxItems(runtime, state, config, locale) {
+  const items = normalizeHistoryItems(state.recentHistoryItems ?? runtime.recentHistoryItems, config.maxHistoryItems);
+  runtime.recentHistoryItems = items;
+  return items
+    .slice()
+    .sort((left, right) => Number(right.createdAtMs ?? 0) - Number(left.createdAtMs ?? 0))
+    .map((item) => ({
+      kind: item.kind,
+      token: item.token,
+      threadId: cleanText(item.threadId || extractConversationIdFromStableId(item.stableId) || ""),
+      threadLabel: item.threadLabel || "",
+      title: item.threadLabel ? formatTitle(kindTitle(locale, item.kind), item.threadLabel) : item.title,
+      summary: item.summary,
+      primaryLabel: t(locale, "server.action.detail"),
+      createdAtMs: item.createdAtMs,
+    }));
+}
+
+function buildInboxResponse(runtime, state, config, locale) {
+  return {
+    pending: buildPendingInboxItems(runtime, state, config, locale),
+    completed: buildCompletedInboxItems(runtime, state, config, locale),
+  };
+}
+
+function buildOperationalTimelineEntries(runtime, state, config, locale) {
+  const now = Date.now();
+  const items = [];
+
+  for (const approval of runtime.nativeApprovalsByToken.values()) {
+    if (approval.resolved || approval.resolving) {
+      continue;
+    }
+    items.push(
+      normalizeTimelineEntry({
+        stableId: pendingApprovalStableId(approval),
+        token: approval.token,
+        kind: "approval",
+        threadId: cleanText(approval.conversationId || ""),
+        threadLabel: approval.threadLabel,
+        title: formatLocalizedTitle(locale, "server.title.approval", approval.threadLabel),
+        summary: formatNotificationBody(approval.messageText, 180) || approval.messageText,
+        messageText: approval.messageText,
+        createdAtMs: Number(approval.createdAtMs) || now,
+      })
+    );
+  }
+
+  for (const planRequest of runtime.planRequestsByToken.values()) {
+    if (planRequest.resolved || planRequest.resolving || isPlanRequestExpired(planRequest, now)) {
+      continue;
+    }
+    if (!shouldShowPlanRequestInPending(runtime, planRequest)) {
+      continue;
+    }
+    items.push(
+      normalizeTimelineEntry({
+        stableId: pendingPlanStableId(planRequest),
+        token: planRequest.token,
+        kind: "plan",
+        threadId: cleanText(planRequest.conversationId || ""),
+        threadLabel: planRequest.threadLabel,
+        title: formatLocalizedTitle(locale, "server.title.plan", planRequest.threadLabel),
+        summary: formatNotificationBody(planRequest.messageText, 180) || planRequest.messageText,
+        messageText: planRequest.messageText,
+        createdAtMs: Number(planRequest.createdAtMs) || now,
+      })
+    );
+  }
+
+  for (const userInputRequest of listLatestPersistedUserInputRequests({ config, runtime, state })) {
+    if (userInputRequest.resolved || userInputRequest.resolving || isGenericUserInputRequestExpired(userInputRequest, now)) {
+      continue;
+    }
+    if (!shouldShowUserInputRequestInPending(runtime, userInputRequest)) {
+      continue;
+    }
+    items.push(
+      normalizeTimelineEntry({
+        stableId: pendingChoiceStableId(userInputRequest),
+        token: userInputRequest.token,
+        kind: "choice",
+        threadId: cleanText(userInputRequest.conversationId || ""),
+        threadLabel: userInputRequest.threadLabel,
+        title: formatLocalizedTitle(
+          locale,
+          userInputRequest.supported ? "server.title.choice" : "server.title.choiceReadOnly",
+          userInputRequest.threadLabel
+        ),
+        summary: userInputRequest.notificationText || formatNotificationBody(userInputRequest.messageText, 180),
+        messageText: userInputRequest.messageText,
+        createdAtMs: Number(userInputRequest.createdAtMs) || now,
+      })
+    );
+  }
+
+  for (const historyItem of normalizeHistoryItems(state.recentHistoryItems ?? runtime.recentHistoryItems, config.maxHistoryItems)) {
+    if (!timelineKinds.has(historyItem.kind)) {
+      continue;
+    }
+    items.push(
+      normalizeTimelineEntry({
+        stableId: historyItem.stableId,
+        token: historyItem.token,
+        kind: historyItem.kind,
+        threadId: cleanText(extractConversationIdFromStableId(historyItem.stableId) || ""),
+        threadLabel: historyItem.threadLabel,
+        title: historyItem.threadLabel ? formatTitle(kindTitle(locale, historyItem.kind), historyItem.threadLabel) : historyItem.title,
+        summary: historyItem.summary,
+        messageText: historyItem.messageText,
+        createdAtMs: historyItem.createdAtMs,
+      })
+    );
+  }
+
+  return items.filter(Boolean);
+}
+
+function buildTimelineThreads(entries, config) {
+  const byThread = new Map();
+  for (const entry of entries) {
+    const threadId = cleanText(entry.threadId || "");
+    if (!threadId) {
+      continue;
+    }
+    const existing = byThread.get(threadId);
+    if (!existing) {
+      byThread.set(threadId, {
+        id: threadId,
+        label: cleanText(entry.threadLabel || entry.title || "") || t(DEFAULT_LOCALE, "server.fallback.codexTask"),
+        latestAtMs: Number(entry.createdAtMs) || 0,
+        preview: cleanText(entry.summary || entry.title || ""),
+        entryCount: 1,
+      });
+      continue;
+    }
+    existing.entryCount += 1;
+    if (Number(entry.createdAtMs) > Number(existing.latestAtMs)) {
+      existing.latestAtMs = Number(entry.createdAtMs) || existing.latestAtMs;
+      existing.label = cleanText(entry.threadLabel || entry.title || "") || existing.label;
+      existing.preview = cleanText(entry.summary || entry.title || "") || existing.preview;
+    }
+  }
+
+  return [...byThread.values()]
+    .sort((left, right) => Number(right.latestAtMs ?? 0) - Number(left.latestAtMs ?? 0))
+    .slice(0, config.maxTimelineThreads);
+}
+
+function buildTimelineResponse(runtime, state, config, locale) {
+  const messageEntries = normalizeTimelineEntries(
+    state.recentTimelineEntries ?? runtime.recentTimelineEntries,
+    config.maxTimelineEntries
+  );
+  runtime.recentTimelineEntries = messageEntries;
+  const entries = normalizeTimelineEntries(
+    [...messageEntries, ...buildOperationalTimelineEntries(runtime, state, config, locale)],
+    config.maxTimelineEntries
+  ).map((entry) => ({
+    kind: entry.kind,
+    token: entry.token,
+    title: entry.title,
+    threadId: entry.threadId,
+    threadLabel: entry.threadLabel,
+    summary: entry.summary,
+    createdAtMs: entry.createdAtMs,
+  }));
+
+  return {
+    threads: buildTimelineThreads(entries, config),
+    entries,
+  };
+}
+
+function buildPendingApprovalDetail(runtime, approval, locale) {
+  const previousContext = buildPreviousApprovalContext(runtime, approval);
+  return {
+    kind: "approval",
+    token: approval.token,
+    title: formatLocalizedTitle(locale, "server.title.approval", approval.threadLabel),
+    threadLabel: approval.threadLabel || "",
+    createdAtMs: Number(approval.createdAtMs) || 0,
+    messageHtml: renderMessageHtml(approval.messageText, `<p>${escapeHtml(t(locale, "detail.approvalRequested"))}</p>`),
+    previousContext,
+    readOnly: false,
+    actions: [
+      { label: t(locale, "server.action.approve"), tone: "primary", url: `/api/items/approval/${encodeURIComponent(approval.token)}/accept`, body: {} },
+      { label: t(locale, "server.action.reject"), tone: "danger", url: `/api/items/approval/${encodeURIComponent(approval.token)}/decline`, body: {} },
+    ],
+  };
+}
+
+function buildPreviousApprovalContext(runtime, approval) {
+  const threadId = cleanText(approval?.conversationId || "");
+  const approvalCreatedAtMs = Number(approval?.createdAtMs) || 0;
+  if (!threadId || !approvalCreatedAtMs) {
+    return null;
+  }
+
+  const previousEntry = runtime.recentTimelineEntries
+    .filter((entry) => {
+      if (!timelineMessageKinds.has(entry.kind)) {
+        return false;
+      }
+      if (cleanText(entry.threadId || "") !== threadId) {
+        return false;
+      }
+      return Number(entry.createdAtMs) > 0 && Number(entry.createdAtMs) < approvalCreatedAtMs;
+    })
+    .sort((left, right) => Number(right.createdAtMs ?? 0) - Number(left.createdAtMs ?? 0))[0];
+
+  if (!previousEntry) {
+    return null;
+  }
+
+  const sourceText = normalizeLongText(previousEntry.messageText || previousEntry.summary || "");
+  if (!sourceText) {
+    return null;
+  }
+
+  return {
+    kind: previousEntry.kind,
+    createdAtMs: Number(previousEntry.createdAtMs) || 0,
+    messageHtml: renderMessageHtml(sourceText, "<p></p>"),
+  };
+}
+
+function buildPendingPlanDetail(planRequest, locale) {
+  return {
+    kind: "plan",
+    token: planRequest.token,
+    title: formatLocalizedTitle(locale, "server.title.plan", planRequest.threadLabel),
+    threadLabel: planRequest.threadLabel || "",
+    createdAtMs: Number(planRequest.createdAtMs) || 0,
+    messageHtml: renderMessageHtml(planRequest.messageText, `<p>${escapeHtml(t(locale, "detail.planReady"))}</p>`),
+    readOnly: false,
+    actions: [
+      { label: t(locale, "server.action.implement"), tone: "primary", url: `/api/items/plan/${encodeURIComponent(planRequest.token)}/implement`, body: {} },
+      { label: t(locale, "server.action.reject"), tone: "secondary", url: `/api/items/plan/${encodeURIComponent(planRequest.token)}/decline`, body: {} },
+    ],
+  };
+}
+
+function normalizeDraftAnswersMap(value) {
+  if (!isPlainObject(value)) {
+    return {};
+  }
+
+  const output = {};
+  for (const [key, rawValue] of Object.entries(value)) {
+    const normalizedKey = cleanText(key);
+    const normalizedValue = cleanText(rawValue ?? "");
+    if (!normalizedKey || !normalizedValue) {
+      continue;
+    }
+    output[normalizedKey] = normalizedValue;
+  }
+  return output;
+}
+
+function getChoicePagination(userInputRequest, config) {
+  const questions = Array.isArray(userInputRequest.questions) ? userInputRequest.questions : [];
+  const pageSize = Math.max(1, Number(config.choicePageSize) || 5);
+  const totalPages = Math.max(1, Math.ceil(questions.length / pageSize));
+  const requestedPage = Math.max(1, Number(userInputRequest.draftPage) || 1);
+  const page = Math.min(requestedPage, totalPages);
+  const startIndex = (page - 1) * pageSize;
+  return {
+    pageSize,
+    totalPages,
+    page,
+    questions: questions.slice(startIndex, startIndex + pageSize),
+  };
+}
+
+function buildChoiceDetail(userInputRequest, config, locale) {
+  if (!userInputRequest.supported) {
+    return {
+      kind: "choice",
+      token: userInputRequest.token,
+      title: formatLocalizedTitle(locale, "server.title.choiceReadOnly", userInputRequest.threadLabel),
+      threadLabel: userInputRequest.threadLabel || "",
+      createdAtMs: Number(userInputRequest.createdAtMs) || 0,
+      readOnly: true,
+      supported: false,
+      messageHtml: renderMessageHtml(
+        `${userInputRequest.messageText}\n\n${t(locale, "choice.macOnly")}`,
+        `<p>${escapeHtml(t(locale, "choice.macOnly"))}</p>`
+      ),
+      actions: [],
+    };
+  }
+
+  const pagination = getChoicePagination(userInputRequest, config);
+  return {
+    kind: "choice",
+    token: userInputRequest.token,
+    title: formatLocalizedTitle(locale, "server.title.choice", userInputRequest.threadLabel),
+    threadLabel: userInputRequest.threadLabel || "",
+    createdAtMs: Number(userInputRequest.createdAtMs) || 0,
+    supported: true,
+    page: pagination.page,
+    totalPages: pagination.totalPages,
+    questions: pagination.questions,
+    draftAnswers: normalizeDraftAnswersMap(userInputRequest.draftAnswers),
+    readOnly: false,
+    actions: [],
+  };
+}
+
+function historyItemThreadId(item) {
+  return cleanText(item?.threadId || extractConversationIdFromStableId(item?.stableId) || "");
+}
+
+function isLatestCompletionHistoryItem(runtime, item) {
+  if (!runtime || cleanText(item?.kind || "") !== "completion") {
+    return false;
+  }
+
+  const threadId = historyItemThreadId(item);
+  const token = cleanText(item?.token || "");
+  if (!threadId || !token) {
+    return false;
+  }
+
+  const latestForThread = runtime.recentHistoryItems.find(
+    (entry) => cleanText(entry?.kind || "") === "completion" && historyItemThreadId(entry) === threadId
+  );
+  return cleanText(latestForThread?.token || "") === token;
+}
+
+function findNewerThreadMessageAfterCompletion(runtime, completionItem) {
+  if (!runtime || cleanText(completionItem?.kind || "") !== "completion") {
+    return null;
+  }
+
+  const threadId = historyItemThreadId(completionItem);
+  const completionCreatedAtMs = Number(completionItem?.createdAtMs) || 0;
+  if (!threadId || !completionCreatedAtMs) {
+    return null;
+  }
+
+  return runtime.recentTimelineEntries
+    .filter((entry) => {
+      if (!timelineMessageKinds.has(cleanText(entry?.kind || ""))) {
+        return false;
+      }
+      if (cleanText(entry?.threadId || "") !== threadId) {
+        return false;
+      }
+      return Number(entry?.createdAtMs) > completionCreatedAtMs;
+    })
+    .sort((left, right) => Number(right?.createdAtMs ?? 0) - Number(left?.createdAtMs ?? 0))[0] || null;
+}
+
+function buildHistoryDetail(item, locale, runtime = null) {
+  const threadId = historyItemThreadId(item);
+  const replyEnabled =
+    item.kind === "completion" &&
+    Boolean(threadId) &&
+    Boolean(runtime?.ipcClient) &&
+    isLatestCompletionHistoryItem(runtime, item);
+  return {
+    kind: item.kind,
+    token: item.token,
+    threadId,
+    title: item.threadLabel ? formatTitle(kindTitle(locale, item.kind), item.threadLabel) : item.title,
+    threadLabel: item.threadLabel || "",
+    createdAtMs: Number(item.createdAtMs) || 0,
+    messageHtml: renderMessageHtml(item.messageText, `<p>${escapeHtml(t(locale, "detail.detailUnavailable"))}</p>`),
+    readOnly: true,
+    reply: replyEnabled
+      ? {
+          enabled: true,
+          supportsPlanMode: true,
+          supportsImages: false,
+        }
+      : null,
+    actions: [],
+  };
+}
+
+function buildTimelineMessageDetail(entry, locale) {
+  return {
+    kind: entry.kind,
+    token: entry.token,
+    threadId: cleanText(entry.threadId || ""),
+    title: cleanText(entry.threadLabel || entry.title || "") || kindTitle(locale, entry.kind),
+    threadLabel: entry.threadLabel || "",
+    createdAtMs: Number(entry.createdAtMs) || 0,
+    messageHtml: renderMessageHtml(entry.messageText, `<p>${escapeHtml(t(locale, "detail.detailUnavailable"))}</p>`),
+    readOnly: true,
+    actions: [],
+  };
+}
+
+function findLatestPersistedUserInputRequest({ config, runtime, state, token }) {
+  let best = runtime.userInputRequestsByToken.get(token) ?? null;
+  const pending = isPlainObject(state.pendingUserInputRequests) ? state.pendingUserInputRequests : {};
+  for (const raw of Object.values(pending)) {
+    if (!isPlainObject(raw) || cleanText(raw.token) !== token) {
+      continue;
+    }
+    const restored = restoreGenericUserInputRequest({ config, raw });
+    if (!restored) {
+      continue;
+    }
+    if (!best || Number(restored.lastSeenAtMs ?? 0) > Number(best.lastSeenAtMs ?? 0)) {
+      best = restored;
+    }
+  }
+
+  if (best) {
+    registerGenericUserInputRequest(runtime, best);
+  }
+
+  return best;
+}
+
+function mergeChoiceDraftAnswers(userInputRequest, partialAnswers) {
+  const draftAnswers = normalizeDraftAnswersMap(userInputRequest.draftAnswers);
+  const nextAnswers = normalizeDraftAnswersMap(partialAnswers);
+  userInputRequest.draftAnswers = {
+    ...draftAnswers,
+    ...nextAnswers,
+  };
+}
+
+function buildChoiceHistoryText(userInputRequest, submittedAnswers) {
+  return formatSubmittedTestAnswers(userInputRequest, submittedAnswers) || t(DEFAULT_LOCALE, "server.message.choiceSummarySubmitted");
+}
+
+async function submitGenericUserInputDecision({ config, runtime, state, userInputRequest, submittedAnswers }) {
+  if (!userInputRequest.testRequest && !runtime.ipcClient) {
+    throw new Error("codex-ipc-not-connected");
+  }
+
+  const response = resolveGenericUserInputResponse(userInputRequest, submittedAnswers);
+  if (!userInputRequest.testRequest) {
+    await runtime.ipcClient.submitStructuredUserInput(
+      userInputRequest.conversationId,
+      userInputRequest.requestId,
+      response,
+      userInputRequest.ownerClientId
+    );
+  }
+
+  userInputRequest.resolved = true;
+  userInputRequest.resolving = false;
+  userInputRequest.isLiveRequestActive = false;
+  userInputRequest.lastSeenAtMs = Date.now();
+  userInputRequest.expiresAtMs = Date.now() + config.planRequestTtlMs;
+  userInputRequest.draftPage = 1;
+  let stateChanged = storePendingUserInputRequest(state, userInputRequest);
+  stateChanged = recordActionHistoryItem({
+    config,
+    runtime,
+    state,
+    kind: "choice",
+    stableId: `choice:${userInputRequest.requestKey}:${userInputRequest.lastSeenAtMs}`,
+    token: userInputRequest.token,
+    title: userInputRequest.title,
+    messageText: userInputRequest.testRequest
+      ? `${t(config.defaultLocale, "server.message.choiceSubmittedTest")}\n\n${buildChoiceHistoryText(userInputRequest, submittedAnswers)}`
+      : `${t(config.defaultLocale, "server.message.choiceSubmitted")}\n\n${buildChoiceHistoryText(userInputRequest, submittedAnswers)}`,
+    summary: userInputRequest.testRequest
+      ? t(config.defaultLocale, "server.message.choiceSummaryReceivedTest")
+      : t(config.defaultLocale, "server.message.choiceSummarySubmitted"),
+  }) || stateChanged;
+  if (stateChanged) {
+    await saveState(config.stateFile, state);
+  }
+}
+
+async function handleCompletionReply({ runtime, completionItem, text, planMode = false, force = false }) {
+  const messageText = cleanText(text ?? "");
+  if (!messageText) {
+    throw new Error("completion-reply-empty");
+  }
+  if (!runtime.ipcClient) {
+    throw new Error("codex-ipc-not-connected");
+  }
+
+  const conversationId = cleanText(completionItem?.threadId || extractConversationIdFromStableId(completionItem?.stableId) || "");
+  if (!conversationId) {
+    throw new Error("completion-reply-unavailable");
+  }
+  if (!isLatestCompletionHistoryItem(runtime, completionItem)) {
+    throw new Error("completion-reply-unavailable");
+  }
+  const newerThreadMessage = findNewerThreadMessageAfterCompletion(runtime, completionItem);
+  if (newerThreadMessage && !force) {
+    const error = new Error("completion-reply-thread-advanced");
+    error.warning = {
+      kind: cleanText(newerThreadMessage.kind || ""),
+      createdAtMs: Number(newerThreadMessage.createdAtMs) || 0,
+      summary: cleanText(newerThreadMessage.summary || newerThreadMessage.messageText || newerThreadMessage.title || ""),
+    };
+    throw error;
+  }
+
+  const threadState = runtime.threadStates.get(conversationId) ?? null;
+  const collaborationMode = buildRequestedCollaborationMode(
+    threadState,
+    planMode ? "plan" : "default"
+  );
+  const turnStartParams = {
+    input: buildTextInput(messageText),
+    attachments: [],
+    cwd: null,
+    approvalPolicy: null,
+    sandboxPolicy: null,
+    model: null,
+    serviceTier: null,
+    effort: null,
+    summary: "none",
+    personality: null,
+    outputSchema: null,
+    collaborationMode,
+  };
+
+  await runtime.ipcClient.startTurn(
+    conversationId,
+    turnStartParams,
+    runtime.threadOwnerClientIds.get(conversationId) ?? null
+  );
+}
+
+async function handlePlanDecision({ config, runtime, state, planRequest, decision }) {
+  let decisionTransport = "local-dismiss";
+  if (decision === "implement") {
+    if (!runtime.ipcClient) {
+      throw new Error("codex-ipc-not-connected");
+    }
+
+    const questionAnswer = resolvePlanDecisionAnswer(planRequest, decision);
+    if (!questionAnswer) {
+      const collaborationMode = buildDefaultCollaborationMode(
+        planRequest.latestCollaborationMode ??
+          runtime.threadStates.get(planRequest.conversationId) ??
+          planRequest.threadState
+      );
+      const turnStartParams = {
+        input: buildTextInput(buildImplementPlanPrompt(planRequest.rawPlanContent)),
+        attachments: [],
+        cwd: null,
+        approvalPolicy: null,
+        sandboxPolicy: null,
+        model: null,
+        serviceTier: null,
+        effort: null,
+        summary: "none",
+        personality: null,
+        outputSchema: null,
+        collaborationMode,
+      };
+      await runtime.ipcClient.startTurn(
+        planRequest.conversationId,
+        turnStartParams,
+        planRequest.ownerClientId
+      );
+      decisionTransport = "fallback";
+    } else {
+      await runtime.ipcClient.submitUserInputRequest(
+        planRequest.conversationId,
+        questionAnswer.requestId,
+        [questionAnswer.answerText],
+        questionAnswer.ownerClientId
+      );
+      decisionTransport = "user-input";
+    }
+  }
+
+  planRequest.resolved = true;
+  planRequest.resolving = false;
+  planRequest.isLiveRequestActive = false;
+  planRequest.lastSeenAtMs = Date.now();
+  planRequest.expiresAtMs = Date.now() + config.planRequestTtlMs;
+  let stateChanged = clearPlanTurnActive(state, planRequest.turnKey);
+  stateChanged = markPlanTurnSuppressed(state, planRequest.turnKey, config.maxSeenEvents) || stateChanged;
+  state.dismissedPlanRequests[planRequest.requestKey] = Date.now();
+  trimSeenEvents(state.dismissedPlanRequests, config.maxSeenEvents);
+  stateChanged = storePendingPlanRequest(state, planRequest) || stateChanged;
+  stateChanged = recordActionHistoryItem({
+    config,
+    runtime,
+    state,
+    kind: "plan",
+    stableId: `plan:${planRequest.requestKey}:${planRequest.lastSeenAtMs}`,
+    token: planRequest.token,
+    title: planRequest.title,
+    messageText: `${planDecisionMessage(decision, config.defaultLocale)}\n\n${planRequest.messageText}`,
+    summary: planDecisionMessage(decision, config.defaultLocale),
+  }) || stateChanged;
+  if (stateChanged) {
+    await saveState(config.stateFile, state);
+  }
+  console.log(`[plan-decision] ${planRequest.requestKey} | ${decision} | ${decisionTransport}`);
+}
+
+async function handleNativeApprovalDecision({ config, runtime, state, approval, decision }) {
+  await runtime.ipcClient?.sendApprovalDecision(approval, decision);
+  approval.resolved = true;
+  approval.resolving = false;
+  runtime.nativeApprovalsByToken.delete(approval.token);
+  runtime.nativeApprovalsByRequestKey.delete(approval.requestKey);
+  const stateChanged = recordActionHistoryItem({
+    config,
+    runtime,
+    state,
+    kind: "approval",
+    stableId: `approval:${approval.requestKey}:${Date.now()}`,
+    token: approval.token,
+    title: approval.title,
+    messageText: `${approvalDecisionMessage(decision, config.defaultLocale)}\n\n${approval.messageText}`,
+    summary: approvalDecisionMessage(decision, config.defaultLocale),
+  });
+  if (stateChanged) {
+    await saveState(config.stateFile, state);
+  }
+  console.log(`[native-decision] ${approval.requestKey} | ${decision}`);
+}
+
+function buildApiItemDetail({ config, runtime, state, kind, token, locale }) {
+  if (timelineMessageKinds.has(kind)) {
+    const entry = timelineEntryByToken(runtime, token, kind);
+    return entry ? buildTimelineMessageDetail(entry, locale) : null;
+  }
+  if (kind === "approval") {
+    const approval = runtime.nativeApprovalsByToken.get(token);
+    if (approval) {
+      return buildPendingApprovalDetail(runtime, approval, locale);
+    }
+    const historicalApproval = historyItemByToken(runtime, kind, token);
+    return historicalApproval ? buildHistoryDetail(historicalApproval, locale, runtime) : null;
+  }
+  if (kind === "plan") {
+    const planRequest = runtime.planRequestsByToken.get(token);
+    if (planRequest && !planRequest.resolved && !isPlanRequestExpired(planRequest)) {
+      return buildPendingPlanDetail(planRequest, locale);
+    }
+    const historicalPlan = historyItemByToken(runtime, kind, token);
+    return historicalPlan ? buildHistoryDetail(historicalPlan, locale, runtime) : null;
+  }
+  if (kind === "choice") {
+    const userInputRequest = findLatestPersistedUserInputRequest({ config, runtime, state, token });
+    if (userInputRequest && !userInputRequest.resolved && !isGenericUserInputRequestExpired(userInputRequest)) {
+      return buildChoiceDetail(userInputRequest, config, locale);
+    }
+    const historicalChoice = historyItemByToken(runtime, kind, token);
+    return historicalChoice ? buildHistoryDetail(historicalChoice, locale, runtime) : null;
+  }
+
+  const historyItem = historyItemByToken(runtime, kind, token);
+  return historyItem ? buildHistoryDetail(historyItem, locale, runtime) : null;
+}
+
+function resolveWebAsset(urlPath) {
+  let relativePath = cleanText(urlPath || "");
+  if (!relativePath || relativePath === "/") {
+    relativePath = "/index.html";
+  } else if (relativePath === "/app" || relativePath === "/app/") {
+    relativePath = "/index.html";
+  }
+
+  const resolved = path.resolve(webRoot, `.${relativePath}`);
+  if (!resolved.startsWith(`${webRoot}${path.sep}`) && resolved !== path.join(webRoot, "index.html")) {
+    return null;
+  }
+  return resolved;
+}
+
+function contentTypeForFile(filePath) {
+  const extension = path.extname(filePath).toLowerCase();
+  switch (extension) {
+    case ".html":
+      return "text/html; charset=utf-8";
+    case ".js":
+      return "application/javascript; charset=utf-8";
+    case ".css":
+      return "text/css; charset=utf-8";
+    case ".webmanifest":
+      return "application/manifest+json; charset=utf-8";
+    case ".json":
+      return "application/json; charset=utf-8";
+    case ".svg":
+      return "image/svg+xml";
+    case ".png":
+      return "image/png";
+    default:
+      return "application/octet-stream";
+  }
+}
+
+async function serveWebAsset(res, urlPath) {
+  const filePath = resolveWebAsset(urlPath);
+  if (!filePath) {
+    return false;
+  }
+
+  try {
+    const body = await fs.readFile(filePath);
+    res.statusCode = 200;
+    res.setHeader("Content-Type", contentTypeForFile(filePath));
+    res.setHeader("Cache-Control", "no-store, max-age=0");
+    if (urlPath === "/sw.js") {
+      res.setHeader("Service-Worker-Allowed", "/");
+    }
+    res.end(body);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function resolveManifestPairingToken({ config, state, requestedToken }) {
+  const token = cleanText(requestedToken);
+  if (!token) {
+    return "";
+  }
+  if (!isPairingAvailableForState(config, state)) {
+    return "";
+  }
+  return cleanText(config.pairingToken) === token ? token : "";
+}
+
+function buildWebManifest({ pairToken }) {
+  const startPath = pairToken
+    ? `/app?pairToken=${encodeURIComponent(pairToken)}`
+    : "/app";
+  return JSON.stringify(
+    {
+      id: "/app",
+      name: "viveworker",
+      short_name: "viveworker",
+      start_url: startPath,
+      scope: "/",
+      display: "standalone",
+      background_color: "#101418",
+      theme_color: "#101418",
+      icons: [
+        {
+          src: "/icons/viveworker-icon-192.png",
+          sizes: "192x192",
+          type: "image/png",
+        },
+        {
+          src: "/icons/viveworker-icon-512.png",
+          sizes: "512x512",
+          type: "image/png",
+        },
+      ],
+    },
+    null,
+    2
+  );
+}
+
+function buildWebAppHtml({ pairToken }) {
+  const manifestHref = pairToken
+    ? `/manifest.webmanifest?pairToken=${encodeURIComponent(pairToken)}`
+    : "/manifest.webmanifest";
+  return `<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+    <meta name="theme-color" content="#101418">
+    <meta name="apple-mobile-web-app-capable" content="yes">
+    <link rel="manifest" href="${escapeHtml(manifestHref)}">
+    <link rel="apple-touch-icon" href="/icons/apple-touch-icon.png">
+    <link rel="icon" type="image/png" sizes="192x192" href="/icons/viveworker-icon-192.png">
+    <link rel="stylesheet" href="/app.css">
+    <title>viveworker</title>
+  </head>
+  <body>
+    <div id="app"></div>
+    <script type="module" src="/app.js"></script>
+  </body>
+</html>`;
+}
+
+function resolvePagePairingToken({ req, config, state, requestedToken }) {
+  return resolveManifestPairingToken({ config, state, requestedToken });
+}
+
+function createNativeApprovalServer({ config, runtime, state }) {
+  const requestHandler = async (req, res) => {
+    try {
+      const url = new URL(req.url, config.nativeApprovalPublicBaseUrl);
+
+      if (url.pathname === "/health") {
+        return writeJson(res, 200, { ok: true });
+      }
+
+      if (url.pathname === "/ca/rootCA.pem" || url.pathname === "/downloads/rootCA.pem") {
+        const filePath = config.mkcertRootCaFile;
+        try {
+          const body = await fs.readFile(filePath, "utf8");
+          res.statusCode = 200;
+          res.setHeader("Content-Type", "application/x-pem-file");
+          res.setHeader("Content-Disposition", 'attachment; filename="rootCA.pem"');
+          res.end(body);
+          return;
+        } catch {
+          return writeJson(res, 404, { error: "mkcert-root-ca-not-found" });
+        }
+      }
+
+      if (url.pathname === "/manifest.webmanifest") {
+        const pairToken = resolveManifestPairingToken({
+          config,
+          state,
+          requestedToken: url.searchParams.get("pairToken"),
+        });
+        res.statusCode = 200;
+        res.setHeader("Content-Type", "application/manifest+json; charset=utf-8");
+        res.setHeader("Cache-Control", "no-store, max-age=0");
+        res.end(buildWebManifest({ pairToken }));
+        return;
+      }
+
+      if (url.pathname === "/" || url.pathname === "/app" || url.pathname === "/app/") {
+        const pairToken = resolvePagePairingToken({
+          req,
+          config,
+          state,
+          requestedToken: url.searchParams.get("pairToken"),
+        });
+        res.statusCode = 200;
+        res.setHeader("Content-Type", "text/html; charset=utf-8");
+        res.setHeader("Cache-Control", "no-store, max-age=0");
+        res.end(buildWebAppHtml({ pairToken }));
+        return;
+      }
+
+      if (
+        url.pathname === "/app.js" ||
+        url.pathname === "/app.css" ||
+        url.pathname === "/i18n.js" ||
+        url.pathname === "/sw.js" ||
+        url.pathname.startsWith("/icons/")
+      ) {
+        const served = await serveWebAsset(res, url.pathname);
+        if (served) {
+          return;
+        }
+      }
+
+      if (url.pathname === "/api/session" && req.method === "GET") {
+        const session = readSession(req, config, state);
+        const localeInfo = resolveDeviceLocaleInfo(config, state, session.deviceId);
+        if (session.authenticated && session.deviceId) {
+          const trustChanged = touchDeviceTrust(state, config, session.deviceId);
+          const metadataChanged = updateCurrentDeviceSnapshot(state, config, session.deviceId, {
+            userAgent: requestUserAgent(req),
+            lastLocale: localeInfo.locale,
+          });
+          if (trustChanged || metadataChanged) {
+            await saveState(config.stateFile, state);
+          }
+        }
+        if (session.authenticated && session.restoredFromDevice) {
+          setSessionCookie(res, config);
+        }
+        return writeJson(res, 200, {
+          authenticated: Boolean(session.authenticated),
+          expiresAtMs: Number(session.expiresAtMs) || 0,
+          pairingAvailable: isPairingAvailableForState(config, state),
+          webPushEnabled: config.webPushEnabled,
+          httpsEnabled: config.nativeApprovalPublicBaseUrl.startsWith("https://"),
+          appVersion: appPackageVersion,
+          deviceId: session.deviceId || null,
+          ...buildSessionLocalePayload(config, state, session.deviceId),
+        });
+      }
+
+      if (url.pathname === "/api/session/pair" && req.method === "POST") {
+        if (!requireTrustedMutationOrigin(req, res, config)) {
+          return;
+        }
+        const remoteAddress = readRemoteAddress(req);
+        const limitedRetryAfterSecs = getPairingRetryAfterSecs(runtime, remoteAddress);
+        if (limitedRetryAfterSecs > 0) {
+          return writePairingRateLimited(res, limitedRetryAfterSecs);
+        }
+
+        const payload = await parseJsonBody(req);
+        const validation = validatePairingPayload(payload, config, state);
+        if (!validation.ok) {
+          const retryAfterSecs = recordPairingFailure(runtime, remoteAddress);
+          if (retryAfterSecs > 0) {
+            return writePairingRateLimited(res, retryAfterSecs);
+          }
+          return writeJson(res, 400, { error: validation.error });
+        }
+
+        const pairedDeviceId = readDeviceId(req, config) || crypto.randomUUID();
+        if ("detectedLocale" in payload) {
+          upsertDetectedDeviceLocale(state, pairedDeviceId, payload.detectedLocale);
+        }
+        markDevicePaired(
+          state,
+          config,
+          pairedDeviceId,
+          {
+            userAgent: cleanText(payload?.userAgent ?? "") || requestUserAgent(req),
+            standalone: payload?.standalone === true,
+            lastLocale: normalizeSupportedLocale(payload?.detectedLocale),
+          }
+        );
+        markPairingConsumed(state, config);
+        clearPairingFailures(runtime, remoteAddress);
+        await saveState(config.stateFile, state);
+        setPairingCookies(res, config, pairedDeviceId);
+        return writeJson(res, 200, {
+          ok: true,
+          authenticated: true,
+          pairingAvailable: isPairingAvailableForState(config, state),
+        });
+      }
+
+      if (url.pathname === "/api/session/logout" && req.method === "POST") {
+        const session = requireMutatingApiSession(req, res, config, state);
+        if (!session) {
+          return;
+        }
+        const payload = await parseJsonBody(req);
+        const revokeCurrentDeviceTrust = payload?.revokeCurrentDeviceTrust === true;
+        let changed = false;
+        if (revokeCurrentDeviceTrust && session.deviceId) {
+          changed = revokeDeviceTrust(state, config, session.deviceId) || changed;
+          changed = deletePushSubscriptionsForDevice(state, session.deviceId) || changed;
+        }
+        if (changed) {
+          await saveState(config.stateFile, state);
+        }
+        if (revokeCurrentDeviceTrust) {
+          clearAuthCookies(res, config);
+        } else {
+          clearSessionCookie(res, config);
+        }
+        return writeJson(res, 200, {
+          ok: true,
+          revokeCurrentDeviceTrust,
+          currentDeviceRevoked: revokeCurrentDeviceTrust && Boolean(session.deviceId),
+        });
+      }
+
+      if (url.pathname === "/api/session/locale" && req.method === "POST") {
+        const session = requireMutatingApiSession(req, res, config, state);
+        if (!session) {
+          return;
+        }
+        if (!session.deviceId) {
+          return writeJson(res, 409, { error: "device-id-missing" });
+        }
+
+        const payload = await parseJsonBody(req);
+        let changed = false;
+        if ("detectedLocale" in payload) {
+          changed = upsertDetectedDeviceLocale(state, session.deviceId, payload.detectedLocale) || changed;
+        }
+        if ("overrideLocale" in payload) {
+          if (payload.overrideLocale == null || cleanText(payload.overrideLocale) === "") {
+            changed = clearDeviceLocaleOverride(state, session.deviceId) || changed;
+          } else {
+            changed = setDeviceLocaleOverride(state, session.deviceId, payload.overrideLocale) || changed;
+          }
+        }
+        changed = updateCurrentDeviceSnapshot(state, config, session.deviceId, {
+          userAgent: requestUserAgent(req),
+          lastLocale: resolveDeviceLocaleInfo(config, state, session.deviceId).locale,
+        }) || changed;
+        if (changed) {
+          await saveState(config.stateFile, state);
+        }
+        return writeJson(res, 200, {
+          ok: true,
+          ...buildSessionLocalePayload(config, state, session.deviceId),
+        });
+      }
+
+      if (url.pathname === "/api/push/status" && req.method === "GET") {
+        const session = requireApiSession(req, res, config, state);
+        if (!session) {
+          return;
+        }
+        return writeJson(res, 200, buildPushStatusResponse(config, state, session));
+      }
+
+      if (url.pathname === "/api/push/subscribe" && req.method === "POST") {
+        const session = requireMutatingApiSession(req, res, config, state);
+        if (!session) {
+          return;
+        }
+        if (!config.webPushEnabled) {
+          return writeJson(res, 409, { error: "web-push-disabled" });
+        }
+        if (!session.deviceId) {
+          return writeJson(res, 409, { error: "device-id-missing" });
+        }
+
+        const payload = await parseJsonBody(req);
+        const subscription = normalizePushSubscriptionBody(payload, session.deviceId);
+        if (!subscription) {
+          return writeJson(res, 400, { error: "invalid-push-subscription" });
+        }
+
+        const changed = upsertPushSubscription(state, subscription);
+        const metadataChanged = updateCurrentDeviceSnapshot(state, config, session.deviceId, {
+          userAgent: subscription.userAgent || requestUserAgent(req),
+          standalone: subscription.standalone === true,
+          lastLocale: resolveDeviceLocaleInfo(config, state, session.deviceId).locale,
+        });
+        if (changed || metadataChanged) {
+          await saveState(config.stateFile, state);
+        }
+        return writeJson(res, 200, {
+          ok: true,
+          subscribed: true,
+          subscriptionId: subscription.id,
+        });
+      }
+
+      if (url.pathname === "/api/push/unsubscribe" && req.method === "POST") {
+        const session = requireMutatingApiSession(req, res, config, state);
+        if (!session) {
+          return;
+        }
+        const payload = await parseJsonBody(req);
+        let changed = false;
+        const endpoint = cleanText(payload?.endpoint ?? "");
+        if (endpoint) {
+          changed = deletePushSubscriptionById(state, pushSubscriptionId(endpoint)) || changed;
+        } else if (session.deviceId) {
+          changed = deletePushSubscriptionsForDevice(state, session.deviceId) || changed;
+        }
+        if (changed) {
+          await saveState(config.stateFile, state);
+        }
+        return writeJson(res, 200, { ok: true, subscribed: false });
+      }
+
+      if (url.pathname === "/api/push/test" && req.method === "POST") {
+        const session = requireMutatingApiSession(req, res, config, state);
+        if (!session) {
+          return;
+        }
+        try {
+          await sendPushTestToDevice({ config, state, session });
+          await saveState(config.stateFile, state);
+          return writeJson(res, 200, { ok: true });
+        } catch (error) {
+          const statusCode = Number(error?.statusCode) || 0;
+          if (statusCode === 404 || statusCode === 410) {
+            deletePushSubscriptionsForDevice(state, session.deviceId);
+            await saveState(config.stateFile, state);
+            return writeJson(res, 410, { error: "push-subscription-expired" });
+          }
+          return writeJson(res, 500, { error: error.message });
+        }
+      }
+
+      if (url.pathname === "/api/devices" && req.method === "GET") {
+        const session = requireApiSession(req, res, config, state);
+        if (!session) {
+          return;
+        }
+        const locale = resolveDeviceLocaleInfo(config, state, session.deviceId).locale;
+        return writeJson(res, 200, buildDevicesResponse({ config, state, session, locale }));
+      }
+
+      const apiDeviceRevokeMatch = url.pathname.match(/^\/api\/devices\/([^/]+)\/revoke$/u);
+      if (apiDeviceRevokeMatch && req.method === "POST") {
+        const session = requireMutatingApiSession(req, res, config, state);
+        if (!session) {
+          return;
+        }
+        const deviceId = decodeURIComponent(apiDeviceRevokeMatch[1]);
+        const existing = getActiveDeviceTrustRecord(state, config, deviceId);
+        if (!existing) {
+          return writeJson(res, 404, { error: "device-not-found" });
+        }
+        let changed = false;
+        changed = revokeDeviceTrust(state, config, deviceId) || changed;
+        changed = deletePushSubscriptionsForDevice(state, deviceId) || changed;
+        if (changed) {
+          await saveState(config.stateFile, state);
+        }
+        const currentDeviceRevoked = deviceId === session.deviceId;
+        if (currentDeviceRevoked) {
+          clearAuthCookies(res, config);
+        }
+        return writeJson(res, 200, {
+          ok: true,
+          deviceId,
+          currentDeviceRevoked,
+        });
+      }
+
+      if (url.pathname === "/api/inbox" && req.method === "GET") {
+        const session = requireApiSession(req, res, config, state);
+        if (!session) {
+          return;
+        }
+        const locale = resolveDeviceLocaleInfo(config, state, session.deviceId).locale;
+        return writeJson(res, 200, buildInboxResponse(runtime, state, config, locale));
+      }
+
+      if (url.pathname === "/api/timeline" && req.method === "GET") {
+        const session = requireApiSession(req, res, config, state);
+        if (!session) {
+          return;
+        }
+        const locale = resolveDeviceLocaleInfo(config, state, session.deviceId).locale;
+        return writeJson(res, 200, buildTimelineResponse(runtime, state, config, locale));
+      }
+
+      const apiItemMatch = url.pathname.match(/^\/api\/items\/([^/]+)\/([^/]+)$/u);
+      if (apiItemMatch && req.method === "GET") {
+        const session = requireApiSession(req, res, config, state);
+        if (!session) {
+          return;
+        }
+        const kind = decodeURIComponent(apiItemMatch[1]);
+        const token = decodeURIComponent(apiItemMatch[2]);
+        const locale = resolveDeviceLocaleInfo(config, state, session.deviceId).locale;
+        const detail = buildApiItemDetail({ config, runtime, state, kind, token, locale });
+        if (!detail) {
+          return writeJson(res, 404, { error: "item-not-found" });
+        }
+        return writeJson(res, 200, detail);
+      }
+
+      const apiCompletionReplyMatch = url.pathname.match(/^\/api\/items\/completion\/([^/]+)\/reply$/u);
+      if (apiCompletionReplyMatch && req.method === "POST") {
+        const session = requireMutatingApiSession(req, res, config, state);
+        if (!session) {
+          return;
+        }
+
+        const token = decodeURIComponent(apiCompletionReplyMatch[1]);
+        const completionItem = historyItemByToken(runtime, "completion", token);
+        if (!completionItem) {
+          return writeJson(res, 404, { error: "item-not-found" });
+        }
+
+        try {
+          const payload = await parseJsonBody(req);
+          await handleCompletionReply({
+            runtime,
+            completionItem,
+            text: payload?.text ?? "",
+            planMode: payload?.planMode === true,
+            force: payload?.force === true,
+          });
+          return writeJson(res, 200, {
+            ok: true,
+            planMode: payload?.planMode === true,
+          });
+        } catch (error) {
+          if (error.message === "completion-reply-empty") {
+            return writeJson(res, 400, { error: error.message });
+          }
+          if (error.message === "completion-reply-unavailable") {
+            return writeJson(res, 409, { error: error.message });
+          }
+          if (error.message === "completion-reply-thread-advanced") {
+            return writeJson(res, 409, {
+              error: error.message,
+              warning: isPlainObject(error.warning) ? error.warning : null,
+            });
+          }
+          if (error.message === "codex-ipc-not-connected") {
+            return writeJson(res, 503, { error: error.message });
+          }
+          return writeJson(res, 500, { error: error.message });
+        }
+      }
+
+      const apiApprovalDecisionMatch = url.pathname.match(/^\/api\/items\/approval\/([^/]+)\/(accept|decline)$/u);
+      if (apiApprovalDecisionMatch && req.method === "POST") {
+        const session = requireMutatingApiSession(req, res, config, state);
+        if (!session) {
+          return;
+        }
+
+        const token = decodeURIComponent(apiApprovalDecisionMatch[1]);
+        const decision = apiApprovalDecisionMatch[2];
+        const approval = runtime.nativeApprovalsByToken.get(token);
+        if (!approval) {
+          return writeJson(res, 404, { error: "approval-not-found" });
+        }
+        if (approval.resolved || approval.resolving) {
+          return writeJson(res, 409, { error: "approval-already-handled" });
+        }
+
+        approval.resolving = true;
+        try {
+          await handleNativeApprovalDecision({ config, runtime, state, approval, decision });
+          return writeJson(res, 200, { ok: true, decision });
+        } catch (error) {
+          approval.resolving = false;
+          return writeJson(res, 500, { error: error.message });
+        }
+      }
+
+      const apiPlanDecisionMatch = url.pathname.match(/^\/api\/items\/plan\/([^/]+)\/(implement|decline)$/u);
+      if (apiPlanDecisionMatch && req.method === "POST") {
+        const session = requireMutatingApiSession(req, res, config, state);
+        if (!session) {
+          return;
+        }
+
+        const token = decodeURIComponent(apiPlanDecisionMatch[1]);
+        const decision = apiPlanDecisionMatch[2];
+        const planRequest = runtime.planRequestsByToken.get(token);
+        if (!planRequest) {
+          return writeJson(res, 404, { error: "plan-request-not-found" });
+        }
+        if (planRequest.resolved || planRequest.resolving) {
+          return writeJson(res, 409, { error: "plan-request-already-handled" });
+        }
+
+        planRequest.resolving = true;
+        try {
+          await handlePlanDecision({ config, runtime, state, planRequest, decision });
+          return writeJson(res, 200, { ok: true, decision });
+        } catch (error) {
+          planRequest.resolving = false;
+          console.error(`[plan-decision-error] ${planRequest.requestKey} | ${error.message}`);
+          return writeJson(res, 500, { error: error.message });
+        }
+      }
+
+      const apiChoiceDraftMatch = url.pathname.match(/^\/api\/items\/choice\/([^/]+)\/draft$/u);
+      if (apiChoiceDraftMatch && req.method === "POST") {
+        const session = requireMutatingApiSession(req, res, config, state);
+        if (!session) {
+          return;
+        }
+
+        const token = decodeURIComponent(apiChoiceDraftMatch[1]);
+        const userInputRequest = findLatestPersistedUserInputRequest({ config, runtime, state, token });
+        if (!userInputRequest) {
+          return writeJson(res, 404, { error: "choice-input-not-found" });
+        }
+        if (!userInputRequest.supported) {
+          return writeJson(res, 409, { error: "choice-input-read-only" });
+        }
+
+        const payload = await parseJsonBody(req);
+        mergeChoiceDraftAnswers(userInputRequest, payload?.answers ?? {});
+        const totalPages = Math.max(1, Math.ceil(userInputRequest.questions.length / Math.max(1, config.choicePageSize)));
+        userInputRequest.draftPage = Math.min(totalPages, Math.max(1, Number(payload?.page) || userInputRequest.draftPage || 1));
+        userInputRequest.lastSeenAtMs = Date.now();
+        const stateChanged = storePendingUserInputRequest(state, userInputRequest);
+        if (stateChanged) {
+          await saveState(config.stateFile, state);
+        }
+        return writeJson(res, 200, {
+          ok: true,
+          page: userInputRequest.draftPage,
+        });
+      }
+
+      const apiChoiceSubmitMatch = url.pathname.match(/^\/api\/items\/choice\/([^/]+)\/submit$/u);
+      if (apiChoiceSubmitMatch && req.method === "POST") {
+        const session = requireMutatingApiSession(req, res, config, state);
+        if (!session) {
+          return;
+        }
+
+        const token = decodeURIComponent(apiChoiceSubmitMatch[1]);
+        const userInputRequest = findLatestPersistedUserInputRequest({ config, runtime, state, token });
+        if (!userInputRequest) {
+          return writeJson(res, 404, { error: "choice-input-not-found" });
+        }
+        if (userInputRequest.resolved || userInputRequest.resolving) {
+          return writeJson(res, 409, { error: "choice-input-already-handled" });
+        }
+        if (!userInputRequest.supported) {
+          return writeJson(res, 409, { error: "choice-input-read-only" });
+        }
+
+        userInputRequest.resolving = true;
+        try {
+          const payload = await parseJsonBody(req);
+          mergeChoiceDraftAnswers(userInputRequest, payload?.answers ?? {});
+          await submitGenericUserInputDecision({
+            config,
+            runtime,
+            state,
+            userInputRequest,
+            submittedAnswers: userInputRequest.draftAnswers,
+          });
+          return writeJson(res, 200, { ok: true });
+        } catch (error) {
+          userInputRequest.resolving = false;
+          console.error(`[user-input-decision-error] ${userInputRequest.requestKey} | ${error.message}`);
+          return writeJson(res, 500, { error: error.message });
+        }
+      }
+
+      if (url.pathname === "/test/user-inputs") {
+        if (!isLoopbackRequest(req)) {
+          return writeJson(res, 403, { error: "Loopback only" });
+        }
+
+        if (req.method !== "POST") {
+          return writeJson(res, 405, { error: "Method not allowed" });
+        }
+
+        const payload = await parseJsonBody(req);
+        const userInputRequest = createTestGenericUserInputRequest({
+          config,
+          title: cleanText(payload?.title ?? "") || "Bridge test",
+          questions: payload?.questions ?? [],
+        });
+        if (!userInputRequest.questions.length) {
+          return writeJson(res, 400, { error: "questions required" });
+        }
+
+        registerGenericUserInputRequest(runtime, userInputRequest);
+        const stateChanged = storePendingUserInputRequest(state, userInputRequest);
+        if (stateChanged) {
+          await saveState(config.stateFile, state);
+        }
+
+        await publishNtfy(config, {
+          kind: userInputRequest.supported ? "user_input_test" : "user_input_test_read_only",
+          title: userInputRequest.title,
+          message: formatNotificationBody(
+            userInputRequest.notificationText || userInputRequest.messageText,
+            config.completionDetailThresholdChars
+          ),
+          priority: config.planPriority,
+          tags: config.planTags,
+          clickUrl: userInputRequest.reviewUrl,
+          actions: userInputRequest.supported
+            ? buildUserInputActions(userInputRequest.reviewUrl)
+            : buildUserInputFallbackActions(userInputRequest.reviewUrl),
+        });
+        console.log(`[user-input-test] ${userInputRequest.requestKey} | ${userInputRequest.title}`);
+        return writeJson(res, 200, {
+          ok: true,
+          title: userInputRequest.title,
+          token: userInputRequest.token,
+          supported: userInputRequest.supported,
+        });
+      }
+
+      const completionMatch = url.pathname.match(/^\/completion-details\/([a-f0-9]+)$/u);
+      if (completionMatch) {
+        const detail = runtime.completionDetailsByToken.get(completionMatch[1]);
+        if (!detail) {
+          return writeCompletionMissing(res, req, 404, config.defaultLocale);
+        }
+        return writeHtml(
+          res,
+          200,
+          renderMessagePage({
+            eyebrow: t(config.defaultLocale, "server.title.complete"),
+            title: detail.title,
+            messageText: detail.messageText,
+            locale: config.defaultLocale,
+          })
+        );
+      }
+
+      const planMatch = url.pathname.match(/^\/plan-details\/([a-f0-9]+)$/u);
+      if (planMatch) {
+        const detail = runtime.planDetailsByToken.get(planMatch[1]);
+        if (!detail) {
+          return writeCompletionMissing(res, req, 404, config.defaultLocale);
+        }
+        return writeHtml(
+          res,
+          200,
+          renderMessagePage({
+            eyebrow: t(config.defaultLocale, "server.title.planReady"),
+            title: detail.title,
+            messageText: detail.messageText,
+            locale: config.defaultLocale,
+          })
+        );
+      }
+
+      const userInputMatch = url.pathname.match(/^\/user-inputs\/([a-f0-9]+)$/u);
+      if (userInputMatch) {
+        const userInputRequest = findLatestPersistedUserInputRequest({
+          config,
+          runtime,
+          state,
+          token: userInputMatch[1],
+        });
+        if (!userInputRequest) {
+          return writeUserInputMissing(res, req, 404, config.defaultLocale);
+        }
+        if (isGenericUserInputRequestExpired(userInputRequest)) {
+          expireGenericUserInputRequest(runtime, userInputRequest.requestKey);
+          const stateChanged = deletePendingUserInputRequest(state, userInputRequest.requestKey);
+          if (stateChanged) {
+            await saveState(config.stateFile, state);
+          }
+          return writeUserInputMissing(res, req, 404, config.defaultLocale);
+        }
+
+        if (req.method === "GET") {
+          if (userInputRequest.resolved || userInputRequest.resolving) {
+            return writeApprovalHandled(res, req, userInputRequest.title, 409, config.defaultLocale);
+          }
+
+          if (!userInputRequest.supported) {
+            return writeHtml(
+              res,
+              200,
+              renderMessagePage({
+                eyebrow: t(config.defaultLocale, "server.title.choiceReadOnly"),
+                title: userInputRequest.title,
+                messageText: `${userInputRequest.messageText}\n\n${t(config.defaultLocale, "choice.macOnly")}`,
+                locale: config.defaultLocale,
+              })
+            );
+          }
+
+          return writeHtml(
+            res,
+            200,
+            renderUserInputPage({
+              eyebrow: t(config.defaultLocale, "server.title.choice"),
+              title: userInputRequest.title,
+              token: userInputRequest.token,
+              questions: userInputRequest.questions,
+              locale: config.defaultLocale,
+            })
+          );
+        }
+
+        if (req.method !== "POST") {
+          return writeJson(res, 405, { error: "Method not allowed" });
+        }
+
+        if (!requireTrustedMutationOrigin(req, res, config)) {
+          return;
+        }
+
+        if (userInputRequest.resolved || userInputRequest.resolving) {
+          return writeApprovalHandled(res, req, userInputRequest.title, 409, config.defaultLocale);
+        }
+
+        if (!userInputRequest.supported) {
+          return writeHtml(
+            res,
+            409,
+            renderStatusPage({
+              title: userInputRequest.title,
+              body: t(config.defaultLocale, "error.choiceInputReadOnly"),
+              tone: "neutral",
+            })
+          );
+        }
+
+        userInputRequest.resolving = true;
+        try {
+          const formValues = await parseFormBody(req);
+          mergeChoiceDraftAnswers(userInputRequest, formValues);
+          await submitGenericUserInputDecision({
+            config,
+            runtime,
+            state,
+            userInputRequest,
+            submittedAnswers: userInputRequest.draftAnswers,
+          });
+          console.log(`[user-input-decision] ${userInputRequest.requestKey} | submit`);
+
+          if (requestWantsHtml(req)) {
+            return writeHtml(
+              res,
+              200,
+              renderStatusPage({
+                title: userInputRequest.title,
+                body: userInputRequest.testRequest
+                  ? `${t(config.defaultLocale, "server.message.choiceSubmittedTest")}\n\n${formatSubmittedTestAnswers(userInputRequest, userInputRequest.draftAnswers)}`
+                  : t(config.defaultLocale, "server.message.choiceSubmitted"),
+                tone: "ok",
+              })
+            );
+          }
+
+          return writeJson(res, 200, {
+            ok: true,
+            title: userInputRequest.title,
+          });
+        } catch (error) {
+          userInputRequest.resolving = false;
+          console.error(`[user-input-decision-error] ${userInputRequest.requestKey} | ${error.message}`);
+          if (requestWantsHtml(req)) {
+            return writeHtml(
+              res,
+              500,
+              renderStatusPage({
+                title: userInputRequest.title,
+                body: error.message,
+                tone: "warn",
+              })
+            );
+          }
+          return writeJson(res, 500, { error: error.message });
+        }
+      }
+
+      const planRequestMatch = url.pathname.match(/^\/plan-requests\/([a-f0-9]+)$/u);
+      if (planRequestMatch) {
+        const planRequest = runtime.planRequestsByToken.get(planRequestMatch[1]);
+        if (!planRequest) {
+          return writeApprovalMissing(res, req, 404, config.defaultLocale);
+        }
+        if (isPlanRequestExpired(planRequest)) {
+          expirePlanImplementationRequest(runtime, planRequest.requestKey);
+          const stateChanged =
+            deletePendingPlanRequest(state, planRequest.turnKey) ||
+            clearPlanTurnActive(state, planRequest.turnKey);
+          if (stateChanged) {
+            await saveState(config.stateFile, state);
+          }
+          return writeApprovalMissing(res, req, 404, config.defaultLocale);
+        }
+        if (planRequest.resolved || planRequest.resolving) {
+          return writeApprovalHandled(res, req, planRequest.title, 409, config.defaultLocale);
+        }
+        return writeHtml(
+          res,
+          200,
+          renderApprovalPage({
+            eyebrow: t(config.defaultLocale, "server.title.plan"),
+            title: planRequest.title,
+            messageText: planRequest.messageText,
+            token: planRequest.token,
+            basePath: "plan-requests",
+            actions: [
+              { label: t(config.defaultLocale, "server.action.implement"), decision: "implement", tone: "approve" },
+              { label: t(config.defaultLocale, "server.action.reject"), decision: "decline", tone: "reject" },
+            ],
+            locale: config.defaultLocale,
+          })
+        );
+      }
+
+      const planDecisionMatch = url.pathname.match(/^\/plan-requests\/([a-f0-9]+)\/(implement|decline)$/u);
+      if (planDecisionMatch) {
+        const token = planDecisionMatch[1];
+        const decision = planDecisionMatch[2];
+        const planRequest = runtime.planRequestsByToken.get(token);
+        if (!planRequest) {
+          return writeApprovalMissing(res, req, 404, config.defaultLocale);
+        }
+        if (isPlanRequestExpired(planRequest)) {
+          expirePlanImplementationRequest(runtime, planRequest.requestKey);
+          const stateChanged =
+            deletePendingPlanRequest(state, planRequest.turnKey) ||
+            clearPlanTurnActive(state, planRequest.turnKey);
+          if (stateChanged) {
+            await saveState(config.stateFile, state);
+          }
+          return writeApprovalMissing(res, req, 404, config.defaultLocale);
+        }
+
+        if (req.method === "GET") {
+          if (planRequest.resolved || planRequest.resolving) {
+            return writeApprovalHandled(res, req, planRequest.title, 409, config.defaultLocale);
+          }
+          return writeHtml(
+            res,
+            200,
+            renderDecisionPage({
+              eyebrow: t(config.defaultLocale, "server.title.plan"),
+              title: planRequest.title,
+              messageText: planRequest.messageText,
+              token,
+              decision,
+              basePath: "plan-requests",
+              confirmBody:
+                decision === "implement"
+                  ? t(config.defaultLocale, "server.confirm.planImplement")
+                  : t(config.defaultLocale, "server.message.planDismissed"),
+              locale: config.defaultLocale,
+            })
+          );
+        }
+
+        if (!requireTrustedMutationOrigin(req, res, config)) {
+          return;
+        }
+
+        if (planRequest.resolved || planRequest.resolving) {
+          return writeApprovalHandled(res, req, planRequest.title, 409, config.defaultLocale);
+        }
+
+        planRequest.resolving = true;
+        try {
+          await handlePlanDecision({ config, runtime, state, planRequest, decision });
+
+          if (requestWantsHtml(req)) {
+            return writeHtml(
+              res,
+              200,
+              renderStatusPage({
+                title: planRequest.title,
+                body: planDecisionMessage(decision, config.defaultLocale),
+                tone: decision === "implement" ? "ok" : "neutral",
+              })
+            );
+          }
+
+          return writeJson(res, 200, {
+            ok: true,
+            decision,
+            title: planRequest.title,
+          });
+        } catch (error) {
+          planRequest.resolving = false;
+          console.error(`[plan-decision-error] ${planRequest.requestKey} | ${error.message}`);
+          if (requestWantsHtml(req)) {
+            return writeHtml(
+              res,
+              500,
+              renderStatusPage({
+                title: planRequest.title,
+                body: error.message,
+                tone: "warn",
+              })
+            );
+          }
+          return writeJson(res, 500, { error: error.message });
+        }
+      }
+
+      const pageMatch = url.pathname.match(/^\/native-approvals\/([a-f0-9]+)$/u);
+      if (pageMatch) {
+        const approval = runtime.nativeApprovalsByToken.get(pageMatch[1]);
+        if (!approval) {
+          return writeApprovalMissing(res, req, 404, config.defaultLocale);
+        }
+        return writeHtml(
+          res,
+          200,
+          renderApprovalPage({
+            eyebrow: t(config.defaultLocale, "server.title.approval"),
+            title: approval.title,
+            messageText: approval.messageText,
+            token: approval.token,
+            basePath: "native-approvals",
+            actions: [
+              { label: t(config.defaultLocale, "server.action.approve"), decision: "accept", tone: "approve" },
+              { label: t(config.defaultLocale, "server.action.reject"), decision: "decline", tone: "reject" },
+            ],
+            locale: config.defaultLocale,
+          })
+        );
+      }
+
+      const match = url.pathname.match(/^\/native-approvals\/([a-f0-9]+)\/(accept|decline)$/u);
+      if (!match) {
+        if (requestWantsHtml(req)) {
+          return writeHtml(
+            res,
+            404,
+            renderStatusPage({
+              title: t(config.defaultLocale, "server.page.notFoundTitle"),
+              body: t(config.defaultLocale, "server.page.notFoundBody"),
+              tone: "neutral",
+            })
+          );
+        }
+        return writeJson(res, 404, { error: "item-not-found" });
+      }
+
+      const token = match[1];
+      const decision = match[2];
+      const approval = runtime.nativeApprovalsByToken.get(token);
+      if (!approval) {
+        return writeApprovalMissing(res, req, 404, config.defaultLocale);
+      }
+
+      if (req.method === "GET") {
+        return writeHtml(
+          res,
+          200,
+          renderDecisionPage({
+            eyebrow: t(config.defaultLocale, "server.title.approval"),
+            title: approval.title,
+            messageText: approval.messageText,
+            token,
+            decision,
+            basePath: "native-approvals",
+            locale: config.defaultLocale,
+          })
+        );
+      }
+
+      if (!requireTrustedMutationOrigin(req, res, config)) {
+        return;
+      }
+
+      if (approval.resolved || approval.resolving) {
+        return writeApprovalHandled(res, req, approval.title, 409, config.defaultLocale);
+      }
+
+      approval.resolving = true;
+      try {
+        await handleNativeApprovalDecision({ config, runtime, state, approval, decision });
+
+        if (requestWantsHtml(req)) {
+          return writeHtml(
+            res,
+            200,
+            renderStatusPage({
+              title: approval.title,
+              body: approvalDecisionMessage(decision, config.defaultLocale),
+              tone: decisionTone(decision),
+            })
+          );
+        }
+
+        return writeJson(res, 200, {
+          ok: true,
+          decision,
+          title: approval.title,
+        });
+      } catch (error) {
+        approval.resolving = false;
+        if (requestWantsHtml(req)) {
+          return writeHtml(
+            res,
+            500,
+            renderStatusPage({
+              title: approval.title,
+              body: error.message,
+              tone: "warn",
+            })
+          );
+        }
+        return writeJson(res, 500, { error: error.message });
+      }
+    } catch (error) {
+      if (requestWantsHtml(req)) {
+        return writeHtml(
+          res,
+          500,
+          renderStatusPage({
+            title: t(config.defaultLocale, "server.title.approval"),
+            body: error.message,
+            tone: "warn",
+          })
+        );
+      }
+      return writeJson(res, 500, { error: error.message });
+    }
+  };
+
+  if (config.webPushEnabled) {
+    return createHttpsServer({
+      cert: readFileSync(config.tlsCertFile, "utf8"),
+      key: readFileSync(config.tlsKeyFile, "utf8"),
+    }, requestHandler);
+  }
+
+  return createHttpServer(requestHandler);
+}
+
+function requestWantsHtml(req) {
+  if (req.method === "GET") {
+    return true;
+  }
+  const accept = String(req.headers.accept || "");
+  return accept.includes("text/html");
+}
+
+async function parseFormBody(req) {
+  return new Promise((resolve, reject) => {
+    let body = "";
+
+    req.on("data", (chunk) => {
+      body += chunk.toString("utf8");
+      if (body.length > 1024 * 1024) {
+        reject(new Error("request-body-too-large"));
+        req.destroy();
+      }
+    });
+    req.on("end", () => {
+      const parsed = {};
+      const params = new URLSearchParams(body);
+      for (const [key, value] of params.entries()) {
+        parsed[key] = value;
+      }
+      resolve(parsed);
+    });
+    req.on("error", reject);
+  });
+}
+
+async function parseJsonBody(req) {
+  return new Promise((resolve, reject) => {
+    let body = "";
+
+    req.on("data", (chunk) => {
+      body += chunk.toString("utf8");
+      if (body.length > 1024 * 1024) {
+        reject(new Error("request-body-too-large"));
+        req.destroy();
+      }
+    });
+    req.on("end", () => {
+      try {
+        resolve(body ? JSON.parse(body) : {});
+      } catch {
+        reject(new Error("invalid-json-body"));
+      }
+    });
+    req.on("error", reject);
+  });
+}
+
+function isLoopbackRequest(req) {
+  const remoteAddress = cleanText(req.socket?.remoteAddress ?? "");
+  return (
+    remoteAddress === "127.0.0.1" ||
+    remoteAddress === "::1" ||
+    remoteAddress === "::ffff:127.0.0.1"
+  );
+}
+
+function writeApprovalMissing(res, req, statusCode, locale = DEFAULT_LOCALE) {
+  if (requestWantsHtml(req)) {
+    return writeHtml(
+      res,
+      statusCode,
+      renderStatusPage({
+        title: t(locale, "server.page.approvalExpired"),
+        body: t(locale, "error.approvalNotFound"),
+        tone: "neutral",
+      })
+    );
+  }
+  return writeJson(res, statusCode, { error: "approval-not-found" });
+}
+
+function writeUserInputMissing(res, req, statusCode, locale = DEFAULT_LOCALE) {
+  if (requestWantsHtml(req)) {
+    return writeHtml(
+      res,
+      statusCode,
+      renderStatusPage({
+        title: t(locale, "server.page.choiceExpired"),
+        body: t(locale, "error.choiceInputNotFound"),
+        tone: "neutral",
+      })
+    );
+  }
+  return writeJson(res, statusCode, { error: "choice-input-not-found" });
+}
+
+function writeApprovalHandled(res, req, title, statusCode, locale = DEFAULT_LOCALE) {
+  if (requestWantsHtml(req)) {
+    return writeHtml(
+      res,
+      statusCode,
+      renderStatusPage({
+        title,
+        body: t(locale, "error.approvalAlreadyHandled"),
+        tone: "neutral",
+      })
+    );
+  }
+  return writeJson(res, statusCode, { error: "approval-already-handled" });
+}
+
+function writeCompletionMissing(res, req, statusCode, locale = DEFAULT_LOCALE) {
+  if (requestWantsHtml(req)) {
+    return writeHtml(
+      res,
+      statusCode,
+      renderStatusPage({
+        title: t(locale, "server.page.detailExpired"),
+        body: t(locale, "server.page.detailMissing"),
+        tone: "neutral",
+      })
+    );
+  }
+  return writeJson(res, statusCode, { error: "item-not-found" });
+}
+
+function writeJson(res, statusCode, body) {
+  res.statusCode = statusCode;
+  res.setHeader("Content-Type", "application/json; charset=utf-8");
+  res.end(`${JSON.stringify(body)}\n`);
+}
+
+function writeHtml(res, statusCode, html) {
+  res.statusCode = statusCode;
+  res.setHeader("Content-Type", "text/html; charset=utf-8");
+  res.end(`${html}\n`);
+}
+
+function startHttpServer(server, host, port) {
+  return new Promise((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(port, host, () => {
+      server.off("error", reject);
+      resolve();
+    });
+  });
+}
+
+function stopHttpServer(server) {
+  return new Promise((resolve) => {
+    server.close(() => resolve());
+  });
+}
+
+function renderApprovalPage({ eyebrow, title, messageText, token, basePath, actions, locale = DEFAULT_LOCALE }) {
+  const messageHtml = renderMessageHtml(messageText, `<p>${escapeHtml(t(locale, "detail.approvalRequested"))}</p>`);
+  const actionsHtml = actions
+    .map(
+      (action) => `
+      <form method="post" action="/${escapeHtml(basePath)}/${escapeHtml(token)}/${escapeHtml(action.decision)}">
+          <button class="button ${action.tone}" type="submit">${escapeHtml(action.label)}</button>
+        </form>`
+    )
+    .join("\n");
+
+  return `<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>${escapeHtml(title)}</title>
+    <style>
+      :root {
+        color-scheme: light dark;
+        --bg: #101418;
+        --panel: #172027;
+        --text: #f7fbff;
+        --muted: #9cb2c3;
+        --approve: #2f8f67;
+        --reject: #b94747;
+      }
+      * { box-sizing: border-box; }
+      body {
+        margin: 0;
+        min-height: 100vh;
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+        background:
+          radial-gradient(circle at top, rgba(61, 126, 93, 0.25), transparent 32%),
+          linear-gradient(180deg, #0d1115 0%, var(--bg) 100%);
+        color: var(--text);
+      }
+      main {
+        max-width: 42rem;
+        margin: 0 auto;
+        padding: 2rem 1rem 3rem;
+      }
+      .card {
+        background: rgba(23, 32, 39, 0.94);
+        border: 1px solid rgba(156, 178, 195, 0.18);
+        border-radius: 20px;
+        padding: 1.25rem;
+        box-shadow: 0 24px 60px rgba(0, 0, 0, 0.24);
+      }
+      .eyebrow {
+        margin: 0 0 0.75rem;
+        color: var(--muted);
+        font-size: 0.9rem;
+        letter-spacing: 0.04em;
+        text-transform: uppercase;
+      }
+      h1 {
+        margin: 0;
+        font-size: 1.65rem;
+        line-height: 1.25;
+      }
+      ${markdownMessageStyles()}
+      .hint {
+        margin-top: 1rem;
+        color: var(--muted);
+        font-size: 0.95rem;
+      }
+      .actions {
+        display: grid;
+        gap: 0.8rem;
+        margin-top: 1.5rem;
+      }
+      form {
+        margin: 0;
+      }
+      .button {
+        display: block;
+        width: 100%;
+        border: 0;
+        border-radius: 14px;
+        padding: 0.95rem 1rem;
+        font: inherit;
+        font-size: 1rem;
+        font-weight: 700;
+        text-align: center;
+        text-decoration: none;
+        color: white;
+        cursor: pointer;
+      }
+      .link {
+        background: rgba(156, 178, 195, 0.12);
+        color: var(--text);
+      }
+      .approve { background: var(--approve); }
+      .reject { background: var(--reject); }
+    </style>
+  </head>
+  <body>
+    <main>
+      <section class="card">
+        <p class="eyebrow">${escapeHtml(eyebrow)}</p>
+        <h1>${escapeHtml(title)}</h1>
+        <div class="message">
+          ${messageHtml}
+        </div>
+        <p class="hint">${escapeHtml(t(locale, "summary.approval"))}</p>
+        <div class="actions">
+          ${actionsHtml}
+          <a class="button link" href="#" onclick="history.back(); return false;">${escapeHtml(t(locale, "common.back"))}</a>
+        </div>
+      </section>
+    </main>
+  </body>
+</html>`;
+}
+
+function renderUserInputPage({ eyebrow, title, token, questions, locale = DEFAULT_LOCALE }) {
+  const questionSections = (Array.isArray(questions) ? questions : [])
+    .map((question, index) => {
+      const prompt = question.prompt || question.header || t(locale, "choice.questionHeading", { index: index + 1 });
+      const fieldsetLabel = question.header || t(locale, "choice.questionHeading", { index: index + 1 });
+      const questionHint = normalizeQuestionHintText(question);
+      const optionsHtml = (Array.isArray(question.options) ? question.options : [])
+        .map((option) => {
+          const optionValue = cleanText(option.id ?? "") || option.label;
+          const optionDescription = cleanText(
+            option.description ?? option.hint ?? option.hintText ?? option.helpText ?? option.subtitle ?? option.detail ?? ""
+          );
+          return `
+            <label class="option">
+              <input type="radio" name="${escapeHtml(question.id)}" value="${escapeHtml(optionValue)}" required>
+              <span class="option-copy">
+                <span>${escapeHtml(option.label)}</span>
+                ${optionDescription ? `<small>${escapeHtml(optionDescription)}</small>` : ""}
+              </span>
+            </label>`;
+        })
+        .join("\n");
+
+      return `
+        <fieldset class="question">
+          <legend>${escapeHtml(fieldsetLabel)}</legend>
+          <p class="question-text">${escapeHtml(prompt)}</p>
+          ${questionHint ? `<p class="question-hint">${escapeHtml(questionHint)}</p>` : ""}
+          <div class="option-list">
+            ${optionsHtml}
+          </div>
+        </fieldset>`;
+    })
+    .join("\n");
+
+  return `<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>${escapeHtml(title)}</title>
+    <style>
+      :root {
+        color-scheme: light dark;
+        --bg: #101418;
+        --panel: #172027;
+        --text: #f7fbff;
+        --muted: #9cb2c3;
+        --accent: #2f8f67;
+      }
+      * { box-sizing: border-box; }
+      body {
+        margin: 0;
+        min-height: 100vh;
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+        background:
+          radial-gradient(circle at top, rgba(61, 126, 93, 0.25), transparent 32%),
+          linear-gradient(180deg, #0d1115 0%, var(--bg) 100%);
+        color: var(--text);
+      }
+      main {
+        max-width: 42rem;
+        margin: 0 auto;
+        padding: 2rem 1rem 3rem;
+      }
+      .card {
+        background: rgba(23, 32, 39, 0.94);
+        border: 1px solid rgba(156, 178, 195, 0.18);
+        border-radius: 20px;
+        padding: 1.25rem;
+        box-shadow: 0 24px 60px rgba(0, 0, 0, 0.24);
+      }
+      .eyebrow {
+        margin: 0 0 0.75rem;
+        color: var(--muted);
+        font-size: 0.9rem;
+        letter-spacing: 0.04em;
+        text-transform: uppercase;
+      }
+      h1 {
+        margin: 0;
+        font-size: 1.65rem;
+        line-height: 1.25;
+      }
+      .lead {
+        margin-top: 0.9rem;
+        color: #e8f0f7;
+        line-height: 1.55;
+      }
+      form {
+        margin-top: 1.4rem;
+      }
+      .question {
+        margin: 0 0 1rem;
+        border: 1px solid rgba(156, 178, 195, 0.18);
+        border-radius: 16px;
+        padding: 1rem;
+      }
+      .question:last-of-type {
+        margin-bottom: 0;
+      }
+      legend {
+        padding: 0 0.35rem;
+        color: var(--muted);
+        font-size: 0.95rem;
+      }
+      .question-text {
+        margin: 0 0 0.9rem;
+        line-height: 1.5;
+      }
+      .question-hint {
+        margin: -0.35rem 0 0.9rem;
+        color: var(--muted);
+        font-size: 0.88rem;
+        line-height: 1.45;
+      }
+      .option-list {
+        display: grid;
+        gap: 0.7rem;
+      }
+      .option {
+        display: flex;
+        gap: 0.75rem;
+        align-items: flex-start;
+        padding: 0.85rem 0.95rem;
+        border-radius: 14px;
+        background: rgba(156, 178, 195, 0.08);
+      }
+      .option-copy {
+        display: grid;
+        gap: 0.2rem;
+      }
+      .option-copy small {
+        color: var(--muted);
+        font-size: 0.88rem;
+        line-height: 1.4;
+      }
+      input[type="radio"] {
+        margin-top: 0.18rem;
+      }
+      .actions {
+        display: grid;
+        gap: 0.8rem;
+        margin-top: 1.5rem;
+      }
+      .button,
+      .link {
+        display: block;
+        width: 100%;
+        border: 0;
+        border-radius: 14px;
+        padding: 0.95rem 1rem;
+        font: inherit;
+        font-size: 1rem;
+        font-weight: 700;
+        text-align: center;
+        text-decoration: none;
+      }
+      .button {
+        background: var(--accent);
+        color: white;
+        cursor: pointer;
+      }
+      .link {
+        background: rgba(156, 178, 195, 0.12);
+        color: var(--text);
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <section class="card">
+        <p class="eyebrow">${escapeHtml(eyebrow)}</p>
+        <h1>${escapeHtml(title)}</h1>
+        <p class="lead">${escapeHtml(t(locale, "choice.submitHelp"))}</p>
+        <form method="post" action="/user-inputs/${escapeHtml(token)}">
+          ${questionSections}
+          <div class="actions">
+            <button class="button" type="submit">${escapeHtml(t(locale, "choice.submit"))}</button>
+            <a class="link" href="#" onclick="history.back(); return false;">${escapeHtml(t(locale, "common.back"))}</a>
+          </div>
+        </form>
+      </section>
+    </main>
+  </body>
+</html>`;
+}
+
+function renderDecisionPage({ eyebrow, title, messageText, token, decision, basePath, confirmBody = null, locale = DEFAULT_LOCALE }) {
+  const label = decisionLabel(decision, locale);
+  const tone = decisionToneClass(decision);
+  const body = confirmBody ?? approvalDecisionConfirm(decision, locale);
+  const messageHtml = renderMessageHtml(messageText, `<p>${escapeHtml(t(locale, "detail.approvalRequested"))}</p>`);
+
+  return `<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>${escapeHtml(label)} | ${escapeHtml(title)}</title>
+    <style>
+      :root {
+        color-scheme: light dark;
+        --bg: #101418;
+        --panel: #172027;
+        --text: #f7fbff;
+        --muted: #9cb2c3;
+        --approve: #2f8f67;
+        --reject: #b94747;
+      }
+      * { box-sizing: border-box; }
+      body {
+        margin: 0;
+        min-height: 100vh;
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+        background:
+          radial-gradient(circle at top, rgba(61, 126, 93, 0.25), transparent 32%),
+          linear-gradient(180deg, #0d1115 0%, var(--bg) 100%);
+        color: var(--text);
+      }
+      main {
+        max-width: 42rem;
+        margin: 0 auto;
+        padding: 2rem 1rem 3rem;
+      }
+      .card {
+        background: rgba(23, 32, 39, 0.94);
+        border: 1px solid rgba(156, 178, 195, 0.18);
+        border-radius: 20px;
+        padding: 1.25rem;
+        box-shadow: 0 24px 60px rgba(0, 0, 0, 0.24);
+      }
+      .eyebrow {
+        margin: 0 0 0.75rem;
+        color: var(--muted);
+        font-size: 0.9rem;
+        letter-spacing: 0.04em;
+        text-transform: uppercase;
+      }
+      h1 {
+        margin: 0;
+        font-size: 1.65rem;
+        line-height: 1.25;
+      }
+      .lead {
+        margin-top: 0.85rem;
+        color: #e8f0f7;
+        line-height: 1.55;
+      }
+      ${markdownMessageStyles()}
+      .actions {
+        display: grid;
+        gap: 0.8rem;
+        margin-top: 1.5rem;
+      }
+      form {
+        margin: 0;
+      }
+      .button,
+      .link {
+        display: block;
+        width: 100%;
+        border: 0;
+        border-radius: 14px;
+        padding: 0.95rem 1rem;
+        font: inherit;
+        font-size: 1rem;
+        font-weight: 700;
+        text-align: center;
+        text-decoration: none;
+      }
+      .button {
+        color: white;
+        cursor: pointer;
+      }
+      .link {
+        background: rgba(156, 178, 195, 0.12);
+        color: var(--text);
+      }
+      .approve { background: var(--approve); }
+      .reject { background: var(--reject); }
+    </style>
+  </head>
+  <body>
+    <main>
+      <section class="card">
+        <p class="eyebrow">${escapeHtml(eyebrow)}</p>
+        <h1>${escapeHtml(label)}</h1>
+        <p class="lead">${escapeHtml(body)}</p>
+        <div class="message">
+          ${messageHtml}
+        </div>
+        <div class="actions">
+          <form method="post" action="/${escapeHtml(basePath)}/${escapeHtml(token)}/${escapeHtml(decision)}">
+            <button class="button ${tone}" type="submit">${escapeHtml(label)}</button>
+          </form>
+          <a class="link" href="/${escapeHtml(basePath)}/${escapeHtml(token)}">${escapeHtml(t(locale, "common.back"))}</a>
+        </div>
+      </section>
+    </main>
+  </body>
+</html>`;
+}
+
+function renderMessagePage({ eyebrow, title, messageText, locale = DEFAULT_LOCALE }) {
+  const messageHtml = renderMessageHtml(messageText, `<p>${escapeHtml(t(locale, "server.message.taskFinished"))}</p>`);
+
+  return `<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>${escapeHtml(title)}</title>
+    <style>
+      :root {
+        color-scheme: light dark;
+        --bg: #101418;
+        --panel: #172027;
+        --text: #f7fbff;
+        --muted: #9cb2c3;
+      }
+      * { box-sizing: border-box; }
+      body {
+        margin: 0;
+        min-height: 100vh;
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+        background:
+          radial-gradient(circle at top, rgba(61, 126, 93, 0.24), transparent 32%),
+          linear-gradient(180deg, #0d1115 0%, var(--bg) 100%);
+        color: var(--text);
+      }
+      main {
+        max-width: 46rem;
+        margin: 0 auto;
+        padding: 2rem 1rem 3rem;
+      }
+      .card {
+        background: rgba(23, 32, 39, 0.94);
+        border: 1px solid rgba(156, 178, 195, 0.18);
+        border-radius: 20px;
+        padding: 1.25rem;
+        box-shadow: 0 24px 60px rgba(0, 0, 0, 0.24);
+      }
+      .eyebrow {
+        margin: 0 0 0.75rem;
+        color: var(--muted);
+        font-size: 0.9rem;
+        letter-spacing: 0.04em;
+        text-transform: uppercase;
+      }
+      h1 {
+        margin: 0;
+        font-size: 1.65rem;
+        line-height: 1.25;
+      }
+      ${markdownMessageStyles()}
+    </style>
+  </head>
+  <body>
+    <main>
+      <section class="card">
+        <p class="eyebrow">${escapeHtml(eyebrow)}</p>
+        <h1>${escapeHtml(title)}</h1>
+        <div class="message">
+          ${messageHtml}
+        </div>
+      </section>
+    </main>
+  </body>
+</html>`;
+}
+
+function renderStatusPage({ title, body, tone }) {
+  return `<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>${escapeHtml(title)}</title>
+    <style>
+      :root {
+        color-scheme: light dark;
+        --bg: #101418;
+        --panel: #172027;
+        --text: #f7fbff;
+        --muted: #9cb2c3;
+        --accent: ${statusAccent(tone)};
+      }
+      * { box-sizing: border-box; }
+      body {
+        margin: 0;
+        min-height: 100vh;
+        display: grid;
+        place-items: center;
+        padding: 1rem;
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+        background:
+          radial-gradient(circle at top, rgba(61, 126, 93, 0.24), transparent 32%),
+          linear-gradient(180deg, #0d1115 0%, var(--bg) 100%);
+        color: var(--text);
+      }
+      .card {
+        width: min(32rem, 100%);
+        background: rgba(23, 32, 39, 0.94);
+        border: 1px solid rgba(156, 178, 195, 0.18);
+        border-radius: 20px;
+        padding: 1.4rem;
+        box-shadow: 0 24px 60px rgba(0, 0, 0, 0.24);
+      }
+      .chip {
+        display: inline-block;
+        margin-bottom: 0.8rem;
+        padding: 0.35rem 0.6rem;
+        border-radius: 999px;
+        background: var(--accent);
+        color: white;
+        font-size: 0.85rem;
+        font-weight: 700;
+      }
+      h1 {
+        margin: 0;
+        font-size: 1.4rem;
+      }
+      p {
+        margin: 0.9rem 0 0;
+        color: #e8f0f7;
+        line-height: 1.55;
+      }
+      .muted {
+        color: var(--muted);
+      }
+    </style>
+  </head>
+  <body>
+    <section class="card">
+      <span class="chip">Codex</span>
+      <h1>${escapeHtml(title)}</h1>
+      <p>${escapeHtml(body)}</p>
+      <p class="muted">このページは閉じて大丈夫です。</p>
+    </section>
+  </body>
+</html>`;
+}
+
+function markdownMessageStyles() {
+  return `
+      .message {
+        margin-top: 1rem;
+        color: #e8f0f7;
+        line-height: 1.6;
+      }
+      .message > :first-child {
+        margin-top: 0;
+      }
+      .message > :last-child {
+        margin-bottom: 0;
+      }
+      .message p,
+      .message ul,
+      .message ol,
+      .message blockquote,
+      .message pre,
+      .message hr {
+        margin: 0 0 0.9rem;
+      }
+      .message h1,
+      .message h2,
+      .message h3,
+      .message h4,
+      .message h5,
+      .message h6 {
+        margin: 1.2rem 0 0.7rem;
+        line-height: 1.3;
+      }
+      .message h1 { font-size: 1.4rem; }
+      .message h2 { font-size: 1.25rem; }
+      .message h3 { font-size: 1.1rem; }
+      .message ul,
+      .message ol {
+        padding-left: 1.35rem;
+      }
+      .message li {
+        margin: 0.35rem 0;
+      }
+      .message blockquote {
+        border-left: 3px solid rgba(156, 178, 195, 0.32);
+        padding-left: 0.9rem;
+        color: #d7e6f2;
+      }
+      .message code {
+        font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+        background: rgba(156, 178, 195, 0.14);
+        border-radius: 8px;
+        padding: 0.08rem 0.38rem;
+        font-size: 0.94em;
+      }
+      .message pre {
+        overflow: auto;
+        padding: 0.9rem 1rem;
+        border-radius: 14px;
+        background: rgba(11, 16, 20, 0.92);
+        border: 1px solid rgba(156, 178, 195, 0.12);
+      }
+      .message pre code {
+        background: transparent;
+        padding: 0;
+        border-radius: 0;
+      }
+      .message a {
+        color: #8dd2ff;
+        text-decoration: none;
+      }
+      .message a:hover {
+        text-decoration: underline;
+      }
+      .message hr {
+        border: 0;
+        height: 1px;
+        background: rgba(156, 178, 195, 0.18);
+      }`;
+}
+
+function approvalDecisionMessage(decision, locale = config?.defaultLocale || DEFAULT_LOCALE) {
+  if (decision === "accept") {
+    return t(locale, "server.message.approvalAccepted");
+  }
+  return t(locale, "server.message.approvalRejected");
+}
+
+function planDecisionMessage(decision, locale = config?.defaultLocale || DEFAULT_LOCALE) {
+  if (decision === "implement") {
+    return t(locale, "server.message.planImplemented");
+  }
+  return t(locale, "server.message.planDismissed");
+}
+
+function decisionTone(decision) {
+  return decision === "accept" || decision === "implement" ? "ok" : "warn";
+}
+
+function decisionLabel(decision, locale = config?.defaultLocale || DEFAULT_LOCALE) {
+  if (decision === "implement") {
+    return t(locale, "server.action.implement");
+  }
+  return decision === "accept" ? t(locale, "server.action.approve") : t(locale, "server.action.reject");
+}
+
+function approvalDecisionConfirm(decision, locale = config?.defaultLocale || DEFAULT_LOCALE) {
+  if (decision === "implement") {
+    return t(locale, "server.confirm.planImplement");
+  }
+  if (decision === "accept") {
+    return t(locale, "server.confirm.approve");
+  }
+  return t(locale, "server.confirm.reject");
+}
+
+function resolvePlanDecisionAnswer(planRequest, decision) {
+  const requestId = cleanText(planRequest?.questionRequestId ?? "");
+  if (!requestId) {
+    return null;
+  }
+
+  const option = selectPlanDecisionOption(planRequest.questionOptions, decision);
+  if (!option) {
+    return null;
+  }
+
+  return {
+    requestId,
+    answerText: option.label,
+    ownerClientId: cleanText(planRequest.questionOwnerClientId ?? "") || planRequest.ownerClientId || null,
+  };
+}
+
+function selectPlanDecisionOption(options, decision) {
+  const normalizedOptions = Array.isArray(options) ? options : [];
+  const preferredIdNeedles =
+    decision === "implement"
+      ? ["implement", "start_coding", "default"]
+      : ["stay_in_plan", "stay", "decline"];
+  const preferredLabelNeedles =
+    decision === "implement"
+      ? ["implement this plan", "start coding", "実装"]
+      : ["stay in plan mode", "plan mode のまま", "plan mode"];
+
+  for (const option of normalizedOptions) {
+    const optionId = cleanText(option.id ?? "").toLowerCase();
+    if (optionId && preferredIdNeedles.some((needle) => optionId.includes(needle))) {
+      return option;
+    }
+  }
+
+  for (const option of normalizedOptions) {
+    const label = cleanText(option.label ?? "").toLowerCase();
+    if (label && preferredLabelNeedles.some((needle) => label.includes(needle))) {
+      return option;
+    }
+  }
+
+  if (decision === "decline" && normalizedOptions.length >= 2) {
+    const implementOption = selectPlanDecisionOption(normalizedOptions, "implement");
+    const fallback = normalizedOptions.find((option) => option !== implementOption && !option.isOther);
+    if (fallback) {
+      return fallback;
+    }
+  }
+
+  return null;
+}
+
+function resolveGenericUserInputResponse(userInputRequest, submittedAnswers) {
+  const questions = Array.isArray(userInputRequest?.questions) ? userInputRequest.questions : [];
+  const answers = {};
+
+  for (const question of questions) {
+    const questionId = cleanText(question.id ?? "");
+    if (!questionId) {
+      throw new Error("question-id-missing");
+    }
+
+    const submittedValue = cleanText(submittedAnswers?.[questionId] ?? "");
+    if (!submittedValue) {
+      throw new Error(`question-not-answered:${questionId}`);
+    }
+
+    const option = findQuestionOption(question, submittedValue);
+    if (!option) {
+      throw new Error(`option-not-found:${questionId}`);
+    }
+
+    answers[questionId] = {
+      answers: [option.label],
+    };
+  }
+
+  return { answers };
+}
+
+function formatSubmittedTestAnswers(userInputRequest, submittedAnswers) {
+  const questions = Array.isArray(userInputRequest?.questions) ? userInputRequest.questions : [];
+  return questions
+    .map((question, index) => {
+      const submittedValue = cleanText(submittedAnswers?.[question.id] ?? "");
+      const option = findQuestionOption(question, submittedValue);
+      const label = option?.label || submittedValue || "(none)";
+      const title = question.header || question.prompt || `Question ${index + 1}`;
+      return `${title}: ${label}`;
+    })
+    .join("\n");
+}
+
+function findQuestionOption(question, submittedValue) {
+  const normalizedValue = cleanText(submittedValue);
+  const options = Array.isArray(question?.options) ? question.options : [];
+  for (const option of options) {
+    if (cleanText(option.id ?? "") === normalizedValue) {
+      return option;
+    }
+  }
+  for (const option of options) {
+    if (cleanText(option.label ?? "") === normalizedValue) {
+      return option;
+    }
+  }
+  return null;
+}
+
+function decisionToneClass(decision) {
+  return decision === "accept" || decision === "implement" ? "approve" : "reject";
+}
+
+function statusAccent(tone) {
+  if (tone === "ok") {
+    return "#2f8f67";
+  }
+  if (tone === "warn") {
+    return "#b94747";
+  }
+  return "#5d6670";
+}
+
+function escapeHtml(value) {
+  return String(value ?? "")
+    .replace(/&/gu, "&amp;")
+    .replace(/</gu, "&lt;")
+    .replace(/>/gu, "&gt;")
+    .replace(/"/gu, "&quot;")
+    .replace(/'/gu, "&#39;");
+}
+
+function serializeActions(actions) {
+  if (!Array.isArray(actions) || actions.length === 0) {
+    return "";
+  }
+
+  return actions
+    .map((action) =>
+      [
+        `action=${action.action}`,
+        `label=${quoteHeaderValue(action.label)}`,
+        action.url ? `url=${quoteHeaderValue(action.url)}` : "",
+        action.method ? `method=${action.method}` : "",
+        action.clear ? "clear=true" : "",
+      ]
+        .filter(Boolean)
+        .join(", ")
+    )
+    .join("; ");
+}
+
+function quoteHeaderValue(value) {
+  const text = String(value ?? "");
+  if (/^[A-Za-z0-9._~:/?#\[\]@!$&'()*+=-]+$/u.test(text)) {
+    return text;
+  }
+  return `"${text.replace(/"/gu, '\\"')}"`;
+}
+
+function isLoopbackHostname(value) {
+  const normalized = cleanText(value || "").toLowerCase().replace(/^\[/u, "").replace(/\]$/u, "");
+  return normalized === "127.0.0.1" || normalized === "::1" || normalized === "localhost";
+}
+
+function buildConfig(cli) {
+  const codexHome = resolvePath(process.env.CODEX_HOME || path.join(os.homedir(), ".codex"));
+  return {
+    dryRun: cli.dryRun || truthy(process.env.DRY_RUN),
+    once: cli.once,
+    codexHome,
+    webUiEnabled: boolEnv("WEB_UI_ENABLED", true),
+    authRequired: boolEnv("AUTH_REQUIRED", true),
+    webPushEnabled: boolEnv("WEB_PUSH_ENABLED", false),
+    allowInsecureLanHttp: boolEnv("ALLOW_INSECURE_LAN_HTTP", false),
+    enableNtfy: boolEnv("ENABLE_NTFY", Boolean(process.env.NTFY_TOPIC)),
+    sessionsDir: resolvePath(process.env.SESSIONS_DIR || path.join(codexHome, "sessions")),
+    sessionIndexFile: resolvePath(process.env.SESSION_INDEX_FILE || path.join(codexHome, "session_index.jsonl")),
+    historyFile: resolvePath(process.env.HISTORY_FILE || path.join(codexHome, "history.jsonl")),
+    codexLogsDbFile: resolvePath(process.env.CODEX_LOGS_DB_FILE || ""),
+    stateFile: resolvePath(process.env.STATE_FILE || path.join(workspaceRoot, ".viveworker-state.json")),
+    pollIntervalMs: numberEnv("POLL_INTERVAL_MS", 2500),
+    replaySeconds: numberEnv("REPLAY_SECONDS", 300),
+    sessionIndexRefreshMs: numberEnv("SESSION_INDEX_REFRESH_MS", 30000),
+    directoryScanIntervalMs: numberEnv("DIRECTORY_SCAN_INTERVAL_MS", 30000),
+    planRequestTtlMs: numberEnv("PLAN_REQUEST_TTL_MS", 900000),
+    notifyApprovals: boolEnv("NOTIFY_APPROVALS", true),
+    notifyCompletions: boolEnv("NOTIFY_COMPLETIONS", true),
+    notifyPlans: boolEnv("NOTIFY_PLANS", true),
+    nativeApprovals: boolEnv("NATIVE_APPROVALS", true),
+    ntfyBaseUrl: stripTrailingSlash(process.env.NTFY_BASE_URL || "https://ntfy.sh"),
+    ntfyPublishBaseUrl: stripTrailingSlash(process.env.NTFY_PUBLISH_BASE_URL || process.env.NTFY_BASE_URL || "https://ntfy.sh"),
+    ntfyTopic: process.env.NTFY_TOPIC || "",
+    defaultLocale: normalizeSupportedLocale(process.env.DEFAULT_LOCALE, DEFAULT_LOCALE) || DEFAULT_LOCALE,
+    approvalTitle: process.env.APPROVAL_TITLE || t(normalizeSupportedLocale(process.env.DEFAULT_LOCALE, DEFAULT_LOCALE), "server.title.approval"),
+    completeTitle: process.env.COMPLETE_TITLE || t(normalizeSupportedLocale(process.env.DEFAULT_LOCALE, DEFAULT_LOCALE), "server.title.complete"),
+    planTitle: process.env.PLAN_TITLE || t(normalizeSupportedLocale(process.env.DEFAULT_LOCALE, DEFAULT_LOCALE), "server.title.plan"),
+    planReadyTitle: process.env.PLAN_READY_TITLE || t(normalizeSupportedLocale(process.env.DEFAULT_LOCALE, DEFAULT_LOCALE), "server.title.planReady"),
+    approvalPriority: ntfyPriority("NTFY_APPROVAL_PRIORITY", "high"),
+    completePriority: ntfyPriority("NTFY_COMPLETE_PRIORITY", "default"),
+    planPriority: ntfyPriority("NTFY_PLAN_PRIORITY", "high"),
+    approvalTags: csvEnv("NTFY_APPROVAL_TAGS", ["warning", "computer"]),
+    completeTags: csvEnv("NTFY_COMPLETE_TAGS", ["white_check_mark", "computer"]),
+    planTags: csvEnv("NTFY_PLAN_TAGS", ["memo", "computer"]),
+    clickUrl: process.env.NTFY_CLICK_URL || "",
+    maxSeenEvents: numberEnv("MAX_SEEN_EVENTS", 500),
+    maxHistoryItems: numberEnv("MAX_HISTORY_ITEMS", 100),
+    maxTimelineEntries: numberEnv("MAX_TIMELINE_ENTRIES", 250),
+    maxTimelineThreads: numberEnv("MAX_TIMELINE_THREADS", 20),
+    maxReadBytes: numberEnv("MAX_READ_BYTES", 2 * 1024 * 1024),
+    maxMessageChars: numberEnv("MAX_MESSAGE_CHARS", 320),
+    maxCommandChars: numberEnv("MAX_COMMAND_CHARS", 220),
+    maxJustificationChars: numberEnv("MAX_JUSTIFICATION_CHARS", 220),
+    completionDetailThresholdChars: numberEnv("COMPLETION_DETAIL_THRESHOLD_CHARS", 100),
+    maxCompletionDetails: numberEnv("MAX_COMPLETION_DETAILS", 200),
+    ntfyConnectTimeoutSecs: numberEnv("NTFY_CONNECT_TIMEOUT_SECS", 5),
+    ntfyMaxTimeSecs: numberEnv("NTFY_MAX_TIME_SECS", 12),
+    nativeApprovalPublicBaseUrl: stripTrailingSlash(
+      process.env.NATIVE_APPROVAL_SERVER_PUBLIC_BASE_URL || "http://127.0.0.1:8789"
+    ),
+    nativeApprovalListenHost: process.env.NATIVE_APPROVAL_SERVER_HOST || "127.0.0.1",
+    nativeApprovalListenPort: numberEnv("NATIVE_APPROVAL_SERVER_PORT", 8789),
+    tlsCertFile: resolvePath(process.env.TLS_CERT_FILE || ""),
+    tlsKeyFile: resolvePath(process.env.TLS_KEY_FILE || ""),
+    webPushVapidPublicKey: cleanText(process.env.WEB_PUSH_VAPID_PUBLIC_KEY || ""),
+    webPushVapidPrivateKey: cleanText(process.env.WEB_PUSH_VAPID_PRIVATE_KEY || ""),
+    webPushSubject: cleanText(process.env.WEB_PUSH_SUBJECT || "mailto:viveworker@example.com"),
+    mkcertRootCaFile: resolvePath(
+      process.env.MKCERT_ROOT_CA_FILE || "~/Library/Application Support/mkcert/rootCA.pem"
+    ),
+    ipcSocketPath: resolvePath(process.env.CODEX_IPC_SOCKET_PATH || defaultIpcSocketPath()),
+    ipcReconnectMs: numberEnv("IPC_RECONNECT_MS", 1500),
+    ipcRequestTimeoutMs: numberEnv("IPC_REQUEST_TIMEOUT_MS", 12000),
+    choicePageSize: numberEnv("CHOICE_PAGE_SIZE", 5),
+    deviceTrustTtlMs: numberEnv("DEVICE_TRUST_TTL_MS", DEFAULT_DEVICE_TRUST_TTL_MS),
+    sessionTtlMs: numberEnv("SESSION_TTL_MS", 30 * 24 * 60 * 60 * 1000),
+    pairingCode: process.env.PAIRING_CODE || "",
+    pairingToken: process.env.PAIRING_TOKEN || "",
+    pairingExpiresAtMs: numberEnv("PAIRING_EXPIRES_AT_MS", 0),
+    sessionSecret: process.env.SESSION_SECRET || "",
+  };
+}
+
+function validateConfig(config) {
+  let publicBaseUrl = null;
+  try {
+    publicBaseUrl = new URL(config.nativeApprovalPublicBaseUrl);
+  } catch {
+    throw new Error(`Invalid NATIVE_APPROVAL_SERVER_PUBLIC_BASE_URL: ${config.nativeApprovalPublicBaseUrl}`);
+  }
+
+  if (config.authRequired && !config.sessionSecret) {
+    throw new Error("SESSION_SECRET is required when AUTH_REQUIRED=1");
+  }
+
+  const isHttps = publicBaseUrl.protocol === "https:";
+  const isLoopback = isLoopbackHostname(publicBaseUrl.hostname);
+  if (config.authRequired && !isHttps && !isLoopback && !config.allowInsecureLanHttp) {
+    throw new Error(
+      "LAN auth requires HTTPS. Use setup defaults, switch to a loopback URL, or set ALLOW_INSECURE_LAN_HTTP=1 intentionally."
+    );
+  }
+
+  if (config.webPushEnabled) {
+    if (!isHttps) {
+      throw new Error("WEB_PUSH_ENABLED=1 requires NATIVE_APPROVAL_SERVER_PUBLIC_BASE_URL to use https://");
+    }
+    if (!config.tlsCertFile || !config.tlsKeyFile) {
+      throw new Error("WEB_PUSH_ENABLED=1 requires TLS_CERT_FILE and TLS_KEY_FILE");
+    }
+    if (!config.webPushVapidPublicKey || !config.webPushVapidPrivateKey) {
+      throw new Error("WEB_PUSH_ENABLED=1 requires WEB_PUSH_VAPID_PUBLIC_KEY and WEB_PUSH_VAPID_PRIVATE_KEY");
+    }
+  }
+}
+
+function defaultIpcSocketPath() {
+  const uid = process.getuid?.();
+  const socketName = uid ? `ipc-${uid}.sock` : "ipc.sock";
+  return `${os.tmpdir()}/codex-ipc/${socketName}`;
+}
+
+function parseCliArgs(args) {
+  const parsed = {
+    dryRun: false,
+    once: false,
+    envFile: null,
+  };
+
+  for (let index = 0; index < args.length; index += 1) {
+    const arg = args[index];
+    if (arg === "--dry-run") {
+      parsed.dryRun = true;
+    } else if (arg === "--once") {
+      parsed.once = true;
+    } else if (arg === "--env-file") {
+      parsed.envFile = args[index + 1] ?? null;
+      index += 1;
+    } else if (arg === "--help" || arg === "-h") {
+      printHelp();
+      process.exit(0);
+    } else {
+      console.error(`Unknown argument: ${arg}`);
+      printHelp();
+      process.exit(1);
+    }
+  }
+
+  return parsed;
+}
+
+function printHelp() {
+  console.log(`Usage: node scripts/viveworker-bridge.mjs [--dry-run] [--once] [--env-file path]`);
+}
+
+function resolveEnvFile(explicitPath) {
+  if (explicitPath) {
+    return resolvePath(explicitPath);
+  }
+
+  const fromEnv = process.env.VIVEWORKER_ENV_FILE;
+  if (fromEnv) {
+    return resolvePath(fromEnv);
+  }
+
+  return path.join(workspaceRoot, "viveworker.env");
+}
+
+function loadEnvFile(filePath) {
+  try {
+    const text = readFileSync(filePath, "utf8");
+    for (const rawLine of text.split(/\r?\n/u)) {
+      const line = rawLine.trim();
+      if (!line || line.startsWith("#")) {
+        continue;
+      }
+
+      const separator = line.indexOf("=");
+      if (separator === -1) {
+        continue;
+      }
+
+      const key = line.slice(0, separator).trim();
+      let value = line.slice(separator + 1).trim();
+      if ((value.startsWith("\"") && value.endsWith("\"")) || (value.startsWith("'") && value.endsWith("'"))) {
+        value = value.slice(1, -1);
+      }
+      if (!process.env[key]) {
+        process.env[key] = value;
+      }
+    }
+  } catch {
+    // Optional env file.
+  }
+}
+
+async function maybeRotateStartupPairingEnv(envFile) {
+  if (!truthy(process.env.AUTH_REQUIRED)) {
+    return;
+  }
+
+  const shouldRotate = shouldRotatePairing({
+    pairingCode: process.env.PAIRING_CODE || "",
+    pairingToken: process.env.PAIRING_TOKEN || "",
+    pairingExpiresAtMs: process.env.PAIRING_EXPIRES_AT_MS || 0,
+  });
+
+  if (!shouldRotate) {
+    return;
+  }
+
+  const nextPairing = generatePairingCredentials();
+  const updates = {
+    PAIRING_CODE: nextPairing.pairingCode,
+    PAIRING_TOKEN: nextPairing.pairingToken,
+    PAIRING_EXPIRES_AT_MS: String(nextPairing.pairingExpiresAtMs),
+  };
+
+  Object.assign(process.env, updates);
+
+  if (!envFile) {
+    return;
+  }
+
+  let currentText = "";
+  try {
+    currentText = readFileSync(envFile, "utf8");
+  } catch {
+    currentText = "";
+  }
+
+  const nextText = upsertEnvText(currentText, updates);
+  await fs.mkdir(path.dirname(envFile), { recursive: true });
+  await fs.writeFile(envFile, nextText, "utf8");
+}
+
+async function loadState(stateFile) {
+  try {
+    const raw = await fs.readFile(stateFile, "utf8");
+    const parsed = JSON.parse(raw);
+    return {
+      fileOffsets: parsed.fileOffsets ?? {},
+      seenEvents: parsed.seenEvents ?? {},
+      pairedDevices: parsed.pairedDevices ?? {},
+      deviceLocales: parsed.deviceLocales ?? {},
+      pushDeliveries: parsed.pushDeliveries ?? {},
+      pushSubscriptions: parsed.pushSubscriptions ?? {},
+      activePlanRequestTurns: parsed.activePlanRequestTurns ?? {},
+      dismissedPlanRequests: parsed.dismissedPlanRequests ?? {},
+      suppressedPlanReadyTurns: parsed.suppressedPlanReadyTurns ?? {},
+      pendingPlanRequests: parsed.pendingPlanRequests ?? {},
+      pendingUserInputRequests: parsed.pendingUserInputRequests ?? {},
+      recentHistoryItems: parsed.recentHistoryItems ?? [],
+      recentTimelineEntries: parsed.recentTimelineEntries ?? [],
+      sqliteCompletionCursorId: Number(parsed.sqliteCompletionCursorId) || 0,
+      sqliteCompletionSourceFile: cleanText(parsed.sqliteCompletionSourceFile ?? ""),
+      sqliteMessageCursorId: Number(parsed.sqliteMessageCursorId) || 0,
+      sqliteMessageSourceFile: cleanText(parsed.sqliteMessageSourceFile ?? ""),
+      historyFileOffset: Number(parsed.historyFileOffset) || 0,
+      historyFileSourceFile: cleanText(parsed.historyFileSourceFile ?? ""),
+      pairingConsumedAt: Number(parsed.pairingConsumedAt) || 0,
+      pairingConsumedCredential: cleanText(parsed.pairingConsumedCredential ?? ""),
+    };
+  } catch {
+    return {
+      fileOffsets: {},
+      seenEvents: {},
+      pairedDevices: {},
+      deviceLocales: {},
+      pushDeliveries: {},
+      pushSubscriptions: {},
+      activePlanRequestTurns: {},
+      dismissedPlanRequests: {},
+      suppressedPlanReadyTurns: {},
+      pendingPlanRequests: {},
+      pendingUserInputRequests: {},
+      recentHistoryItems: [],
+      recentTimelineEntries: [],
+      sqliteCompletionCursorId: 0,
+      sqliteCompletionSourceFile: "",
+      sqliteMessageCursorId: 0,
+      sqliteMessageSourceFile: "",
+      historyFileOffset: 0,
+      historyFileSourceFile: "",
+      pairingConsumedAt: 0,
+      pairingConsumedCredential: "",
+    };
+  }
+}
+
+async function saveState(stateFile, state) {
+  const output = JSON.stringify(state, null, 2);
+  await fs.mkdir(path.dirname(stateFile), { recursive: true });
+  await fs.writeFile(stateFile, `${output}\n`, "utf8");
+}
+
+async function loadSessionIndex(filePath) {
+  const result = new Map();
+  try {
+    const raw = await fs.readFile(filePath, "utf8");
+    for (const line of raw.split(/\r?\n/u)) {
+      if (!line.trim()) {
+        continue;
+      }
+      try {
+        const entry = JSON.parse(line);
+        if (entry.id) {
+          result.set(entry.id, entry.thread_name || entry.title || entry.id);
+        }
+      } catch {
+        // Ignore malformed rows.
+      }
+    }
+  } catch {
+    return result;
+  }
+  return result;
+}
+
+function extractThreadLabelFromState(threadState) {
+  if (!isPlainObject(threadState)) {
+    return "";
+  }
+  const candidates = [
+    threadState.thread_name,
+    threadState.threadName,
+    threadState.title,
+    threadState.name,
+    threadState.conversationTitle,
+    threadState.threadTitle,
+    threadState.label,
+    threadState.summary,
+    threadState.metadata?.thread_name,
+    threadState.metadata?.threadName,
+    threadState.metadata?.title,
+    threadState.thread?.title,
+    threadState.thread?.name,
+  ];
+  for (const candidate of candidates) {
+    const normalized = truncate(cleanText(candidate || ""), 90);
+    if (normalized) {
+      return normalized;
+    }
+  }
+  return "";
+}
+
+function sanitizeResolvedThreadLabel(value, conversationId) {
+  const normalized = truncate(cleanText(value || ""), 90);
+  if (!normalized) {
+    return "";
+  }
+
+  const normalizedConversationId = cleanText(conversationId || "");
+  if (normalizedConversationId) {
+    if (normalized === normalizedConversationId || normalized === shortId(normalizedConversationId)) {
+      return "";
+    }
+  }
+
+  if (/^[0-9a-f]{8}(?:-[0-9a-f]{4}){0,4}$/iu.test(normalized)) {
+    return "";
+  }
+
+  return normalized;
+}
+
+async function listRolloutFiles(rootDir) {
+  const result = [];
+
+  async function walk(currentDir) {
+    let entries;
+    try {
+      entries = await fs.readdir(currentDir, { withFileTypes: true });
+    } catch {
+      return;
+    }
+
+    for (const entry of entries) {
+      const fullPath = path.join(currentDir, entry.name);
+      if (entry.isDirectory()) {
+        await walk(fullPath);
+      } else if (entry.isFile() && entry.name.startsWith("rollout-") && entry.name.endsWith(".jsonl")) {
+        result.push(fullPath);
+      }
+    }
+  }
+
+  await walk(rootDir);
+  result.sort();
+  return result;
+}
+
+function extractRolloutMessageText(content) {
+  if (!Array.isArray(content)) {
+    return "";
+  }
+  return cleanText(
+    content
+      .map((entry) =>
+        isPlainObject(entry) && (entry.type === "input_text" || entry.type === "output_text")
+          ? String(entry.text ?? "")
+          : ""
+      )
+      .filter(Boolean)
+      .join("\n")
+  );
+}
+
+function deriveRolloutThreadTitleCandidate(text) {
+  const normalized = cleanText(normalizeNotificationText(text));
+  if (!normalized) {
+    return "";
+  }
+
+  if (
+    normalized.startsWith("# AGENTS.md instructions") ||
+    normalized.startsWith("AGENTS.md instructions") ||
+    normalized.startsWith("<INSTRUCTIONS>") ||
+    normalized.startsWith("INSTRUCTIONS") ||
+    normalized.startsWith("<environment_context>") ||
+    normalized.startsWith("environment_context") ||
+    normalized.startsWith("<permissions instructions>") ||
+    normalized.startsWith("permissions instructions") ||
+    normalized.startsWith("<collaboration_mode>") ||
+    normalized.startsWith("collaboration_mode") ||
+    normalized.startsWith("<skills_instructions>") ||
+    normalized.startsWith("skills_instructions")
+  ) {
+    return "";
+  }
+
+  const withoutPlanPrefix = normalized.startsWith(IMPLEMENT_PLAN_PROMPT_PREFIX)
+    ? cleanText(normalized.slice(IMPLEMENT_PLAN_PROMPT_PREFIX.length))
+    : normalized;
+  const sentence = summarizeNotificationText(withoutPlanPrefix) || withoutPlanPrefix;
+  const candidate = truncate(cleanText(sentence), 90);
+
+  if (!candidate) {
+    return "";
+  }
+
+  if (/^(?:ok|okay|yes|no|thanks|thank you|はい|了解|お願い|お願いします|進めて|続けて)$/iu.test(candidate)) {
+    return "";
+  }
+
+  return candidate;
+}
+
+async function extractRolloutThreadMetadata(filePath) {
+  const metadata = {
+    filePath,
+    threadId: extractThreadIdFromRolloutPath(filePath),
+    forkedFromId: "",
+    cwd: "",
+    titleCandidate: "",
+  };
+
+  let stream = null;
+  let rl = null;
+  try {
+    stream = createReadStream(filePath, {
+      encoding: "utf8",
+      highWaterMark: 64 * 1024,
+    });
+    rl = createInterface({
+      input: stream,
+      crlfDelay: Infinity,
+    });
+
+    for await (const line of rl) {
+      if (!line.trim()) {
+        continue;
+      }
+
+      let entry;
+      try {
+        entry = JSON.parse(line);
+      } catch {
+        continue;
+      }
+
+      if (entry.type === "session_meta" && isPlainObject(entry.payload)) {
+        if (!metadata.threadId) {
+          metadata.threadId = cleanText(entry.payload.id || metadata.threadId);
+        }
+        if (!metadata.forkedFromId) {
+          metadata.forkedFromId = cleanText(entry.payload.forked_from_id || entry.payload.forkedFromId || "");
+        }
+        if (!metadata.cwd) {
+          metadata.cwd = cleanText(entry.payload.cwd || "");
+        }
+        if (metadata.titleCandidate) {
+          break;
+        }
+        continue;
+      }
+
+      if (!metadata.titleCandidate && entry.payload?.type === "message" && entry.payload?.role === "user") {
+        const titleCandidate = deriveRolloutThreadTitleCandidate(extractRolloutMessageText(entry.payload.content));
+        if (titleCandidate) {
+          metadata.titleCandidate = titleCandidate;
+          if (metadata.threadId) {
+            break;
+          }
+        }
+      }
+    }
+  } catch {
+    return null;
+  } finally {
+    rl?.close();
+    stream?.destroy();
+  }
+
+  return metadata.threadId ? metadata : null;
+}
+
+async function buildRolloutThreadLabelIndex(knownFiles, sessionIndex) {
+  const entries = new Map();
+  for (const filePath of Array.isArray(knownFiles) ? knownFiles : []) {
+    const metadata = await extractRolloutThreadMetadata(filePath);
+    if (metadata?.threadId) {
+      entries.set(metadata.threadId, metadata);
+    }
+  }
+
+  const resolved = new Map();
+  const resolving = new Set();
+
+  function resolve(threadId) {
+    const normalizedThreadId = cleanText(threadId || "");
+    if (!normalizedThreadId) {
+      return "";
+    }
+    if (resolved.has(normalizedThreadId)) {
+      return resolved.get(normalizedThreadId) || "";
+    }
+    if (sessionIndex.has(normalizedThreadId)) {
+      const label = truncate(cleanText(sessionIndex.get(normalizedThreadId) || ""), 90);
+      if (label) {
+        resolved.set(normalizedThreadId, label);
+        return label;
+      }
+    }
+    if (resolving.has(normalizedThreadId)) {
+      return "";
+    }
+
+    resolving.add(normalizedThreadId);
+    const metadata = entries.get(normalizedThreadId);
+    const titleCandidate = metadata?.titleCandidate || "";
+    const parentLabel = metadata?.forkedFromId ? resolve(metadata.forkedFromId) : "";
+    let label = titleCandidate;
+
+    // Forked threads often inherit the parent thread title before Codex writes
+    // a fresh session index row. Prefer the parent title when the prompt-derived
+    // fallback is very long or still looks like a question.
+    if (titleCandidate && parentLabel && (titleCandidate.length > 48 || /[?？]$/u.test(titleCandidate))) {
+      label = parentLabel;
+    } else if (!label) {
+      label = parentLabel;
+    }
+    if (!label && metadata?.cwd) {
+      label = truncate(cleanText(path.basename(metadata.cwd)), 90);
+    }
+    if (!label && metadata?.filePath) {
+      label = truncate(cleanText(path.basename(metadata.filePath, ".jsonl")), 90);
+    }
+
+    resolving.delete(normalizedThreadId);
+    if (label) {
+      resolved.set(normalizedThreadId, label);
+    }
+    return label;
+  }
+
+  for (const threadId of entries.keys()) {
+    resolve(threadId);
+  }
+
+  return resolved;
+}
+
+async function findLatestCodexLogsDbFile(codexHome) {
+  let entries;
+  try {
+    entries = await fs.readdir(codexHome, { withFileTypes: true });
+  } catch {
+    return "";
+  }
+
+  const candidates = [];
+  for (const entry of entries) {
+    if (!entry.isFile()) {
+      continue;
+    }
+    if (!/^logs(?:_\d+)?\.sqlite$/u.test(entry.name)) {
+      continue;
+    }
+    const fullPath = path.join(codexHome, entry.name);
+    try {
+      const stat = await fs.stat(fullPath);
+      candidates.push({ filePath: fullPath, mtimeMs: stat.mtimeMs });
+    } catch {
+      // Ignore entries that disappear while scanning.
+    }
+  }
+
+  candidates.sort((left, right) => right.mtimeMs - left.mtimeMs);
+  return candidates[0]?.filePath ?? "";
+}
+
+function extractThreadIdFromRolloutPath(filePath) {
+  const match = path
+    .basename(filePath)
+    .match(/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})/iu);
+  return match?.[1] ?? null;
+}
+
+function getThreadName(sessionIndex, rolloutThreadLabels, threadId, cwd, filePath) {
+  if (threadId && sessionIndex.has(threadId)) {
+    return sessionIndex.get(threadId);
+  }
+  if (threadId && rolloutThreadLabels?.has(threadId)) {
+    return rolloutThreadLabels.get(threadId);
+  }
+  if (cwd) {
+    return path.basename(cwd);
+  }
+  return path.basename(filePath, ".jsonl");
+}
+
+function describeContext({ threadName }) {
+  const threadLabel = truncate(cleanText(threadName || ""), 90) || "Codex task";
+  return { threadLabel };
+}
+
+function extractConversationIdFromStableId(stableId) {
+  return String(stableId || "").match(/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})/iu)?.[1] ?? "";
+}
+
+function refreshResolvedThreadLabels({ config, runtime, state }) {
+  let changed = false;
+
+  for (const planRequest of runtime.planRequestsByTurnKey.values()) {
+    const threadLabel = getNativeThreadLabel({
+      runtime,
+      conversationId: planRequest.conversationId,
+      cwd: planRequest.threadState?.cwd ?? "",
+    });
+    const nextTitle = formatTitle(config.planTitle, threadLabel);
+    if (threadLabel !== planRequest.threadLabel || nextTitle !== planRequest.title) {
+      planRequest.threadLabel = threadLabel;
+      planRequest.title = nextTitle;
+      changed = storePendingPlanRequest(state, planRequest) || changed;
+    }
+  }
+
+  for (const userInputRequest of runtime.userInputRequestsByToken.values()) {
+    const threadLabel = getNativeThreadLabel({
+      runtime,
+      conversationId: userInputRequest.conversationId,
+      cwd: "",
+    });
+    const nextTitle = formatTitle(
+      userInputRequest.supported ? t(config.defaultLocale, "server.title.choice") : t(config.defaultLocale, "server.title.choiceReadOnly"),
+      threadLabel
+    );
+    if (threadLabel !== userInputRequest.threadLabel || nextTitle !== userInputRequest.title) {
+      userInputRequest.threadLabel = threadLabel;
+      userInputRequest.title = nextTitle;
+      changed = storePendingUserInputRequest(state, userInputRequest) || changed;
+    }
+  }
+
+  const nextHistoryItems = normalizeHistoryItems(
+    runtime.recentHistoryItems.map((item) => {
+      const conversationId = extractConversationIdFromStableId(item.stableId);
+      if (!conversationId) {
+        return item;
+      }
+      const threadLabel = getNativeThreadLabel({
+        runtime,
+        conversationId,
+        cwd: "",
+      });
+      const title = formatTitle(kindTitle(config.defaultLocale, item.kind), threadLabel);
+      if (threadLabel === item.threadLabel && title === item.title) {
+        return item;
+      }
+      changed = true;
+      return {
+        ...item,
+        threadLabel,
+        title,
+      };
+    }),
+    config.maxHistoryItems
+  );
+
+  if (
+    JSON.stringify(nextHistoryItems.map((item) => [item.stableId, item.title, item.threadLabel])) !==
+    JSON.stringify(runtime.recentHistoryItems.map((item) => [item.stableId, item.title, item.threadLabel]))
+  ) {
+    runtime.recentHistoryItems = nextHistoryItems;
+    state.recentHistoryItems = nextHistoryItems;
+    changed = true;
+  }
+
+  const nextTimelineEntries = normalizeTimelineEntries(
+    runtime.recentTimelineEntries.map((entry) => {
+      const threadId = cleanText(entry.threadId || "");
+      if (!threadId) {
+        return entry;
+      }
+      const threadLabel = getNativeThreadLabel({
+        runtime,
+        conversationId: threadId,
+        cwd: "",
+      });
+      const title = threadLabel || kindTitle(config.defaultLocale, entry.kind);
+      if (threadLabel === entry.threadLabel && title === entry.title) {
+        return entry;
+      }
+      changed = true;
+      return {
+        ...entry,
+        threadLabel,
+        title,
+      };
+    }),
+    config.maxTimelineEntries
+  );
+
+  if (
+    JSON.stringify(nextTimelineEntries.map((entry) => [entry.stableId, entry.title, entry.threadLabel])) !==
+    JSON.stringify(runtime.recentTimelineEntries.map((entry) => [entry.stableId, entry.title, entry.threadLabel]))
+  ) {
+    runtime.recentTimelineEntries = nextTimelineEntries;
+    state.recentTimelineEntries = nextTimelineEntries;
+    changed = true;
+  }
+
+  return changed;
+}
+
+function formatMessage(lines, maxChars) {
+  return truncate(
+    lines
+      .map((line) => cleanText(line))
+      .filter(Boolean)
+      .join("\n"),
+    maxChars
+  );
+}
+
+function formatCompletionDetailText(value, locale = config?.defaultLocale || DEFAULT_LOCALE) {
+  const normalized = normalizeLongText(value);
+  return normalized || t(locale, "server.message.taskFinished");
+}
+
+function formatPlanDetailText(value, locale = config?.defaultLocale || DEFAULT_LOCALE) {
+  const normalized = normalizeLongText(value);
+  return normalized || t(locale, "server.message.planReady");
+}
+
+function summarizeNotificationText(value) {
+  const normalized = cleanText(normalizeNotificationText(value));
+  if (!normalized) {
+    return "";
+  }
+
+  const sentence = normalized.match(/^.+?[。.!?](?:\s|$)/u)?.[0]?.trim();
+  if (sentence) {
+    return sentence;
+  }
+
+  return normalized;
+}
+
+function normalizeLongText(value) {
+  return String(stripMarkdownLinks(value) || "")
+    .replace(/\r\n/gu, "\n")
+    .replace(/[ \t]+\n/gu, "\n")
+    .replace(/\n{3,}/gu, "\n\n")
+    .trim();
+}
+
+function normalizeNotificationText(value) {
+  return normalizeLongText(stripNotificationMarkup(value))
+    .replace(/\n{2,}/gu, "\n")
+    .trim();
+}
+
+function notificationNeedsDetail(value, thresholdChars) {
+  return cleanText(value).length > thresholdChars;
+}
+
+function formatNotificationBody(value, thresholdChars) {
+  const normalized = normalizeNotificationText(value);
+  if (!notificationNeedsDetail(normalized, thresholdChars)) {
+    return normalized;
+  }
+  return truncate(cleanText(normalized), thresholdChars);
+}
+
+function formatTitle(baseTitle, threadLabel) {
+  if (!threadLabel) {
+    return baseTitle;
+  }
+  return truncate(`${baseTitle} | ${threadLabel}`, 90);
+}
+
+function trimSeenEvents(seenEvents, maxEntries) {
+  const entries = Object.entries(seenEvents);
+  if (entries.length <= maxEntries) {
+    return;
+  }
+
+  entries.sort((left, right) => right[1] - left[1]);
+  for (const [key] of entries.slice(maxEntries)) {
+    delete seenEvents[key];
+  }
+}
+
+function trimMap(map, maxEntries) {
+  while (map.size > maxEntries) {
+    const firstKey = map.keys().next().value;
+    if (firstKey == null) {
+      break;
+    }
+    map.delete(firstKey);
+  }
+}
+
+function safeJsonParse(value) {
+  if (!value || typeof value !== "string") {
+    return null;
+  }
+  try {
+    return JSON.parse(value);
+  } catch {
+    return null;
+  }
+}
+
+function cleanText(value) {
+  return String(value || "").replace(/\s+/gu, " ").trim();
+}
+
+function stripMarkdownLinks(value) {
+  return String(value || "").replace(/\[([^\]]+)\]\(([^)]+)\)/gu, "$1");
+}
+
+function stripNotificationMarkup(value) {
+  return String(value || "")
+    .replace(/^\s*<\/?proposed_plan>\s*$/gimu, "")
+    .replace(/<\/?proposed_plan>/giu, "")
+    .replace(/!\[([^\]]*)\]\(([^)]+)\)/gu, "$1")
+    .replace(/\[([^\]]+)\]\(([^)]+)\)/gu, "$1")
+    .replace(/^\s{0,3}#{1,6}\s+/gmu, "")
+    .replace(/^\s{0,3}>\s?/gmu, "")
+    .replace(/^\s*[-*+]\s+\[(?: |x|X)\]\s+/gmu, "")
+    .replace(/^\s*(?:[-*+])\s+/gmu, "")
+    .replace(/^\s*\d+[.)]\s+/gmu, "")
+    .replace(/```+[\s\S]*?```/gu, (match) =>
+      match
+        .replace(/```+[^\n]*\n?/gu, "")
+        .replace(/```+/gu, "")
+    )
+    .replace(/`([^`]+)`/gu, "$1")
+    .replace(/(\*\*|__)(.*?)\1/gu, "$2")
+    .replace(/(^|[^\w])(\*|_)([^*_]+)\2(?=[^\w]|$)/gu, "$1$3")
+    .replace(/[ \t]+\n/gu, "\n");
+}
+
+function singleLine(value) {
+  return cleanText(value);
+}
+
+function truncate(value, maxChars) {
+  if (!value || value.length <= maxChars) {
+    return value;
+  }
+  return `${value.slice(0, Math.max(0, maxChars - 1)).trimEnd()}...`;
+}
+
+function compactPath(value) {
+  if (!value) {
+    return "";
+  }
+
+  const home = os.homedir();
+  if (value === home) {
+    return "~";
+  }
+  if (value.startsWith(`${home}${path.sep}`)) {
+    return `~${path.sep}${path.relative(home, value)}`;
+  }
+  return value;
+}
+
+function shortId(value) {
+  const text = cleanText(value || "");
+  if (!text) {
+    return "";
+  }
+  return text.length > 8 ? text.slice(0, 8) : text;
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function resolvePath(value) {
+  if (!value) {
+    return value;
+  }
+  if (value === "~") {
+    return os.homedir();
+  }
+  if (value.startsWith("~/")) {
+    return path.join(os.homedir(), value.slice(2));
+  }
+  return path.resolve(value);
+}
+
+function truthy(value) {
+  return /^(1|true|yes|on)$/iu.test(String(value || "").trim());
+}
+
+function numberEnv(name, fallback) {
+  const raw = process.env[name];
+  if (!raw) {
+    return fallback;
+  }
+  const parsed = Number.parseInt(raw, 10);
+  return Number.isFinite(parsed) ? parsed : fallback;
+}
+
+function boolEnv(name, fallback) {
+  const raw = process.env[name];
+  if (raw == null || raw === "") {
+    return fallback;
+  }
+  return truthy(raw);
+}
+
+function csvEnv(name, fallback) {
+  const raw = process.env[name];
+  if (!raw) {
+    return fallback;
+  }
+  const values = raw
+    .split(",")
+    .map((value) => cleanText(value))
+    .filter(Boolean);
+  return values.length > 0 ? values : fallback;
+}
+
+function ntfyPriority(name, fallback) {
+  const raw = cleanText(process.env[name] || "");
+  if (!raw) {
+    return fallback;
+  }
+  return raw;
+}
+
+function stripTrailingSlash(value) {
+  return String(value || "").replace(/\/+$/u, "");
+}
+
+function buildTopicUrl(baseUrl, topic) {
+  return `${stripTrailingSlash(baseUrl)}/${encodeURIComponent(topic)}`;
+}
+
+function buildAuthHeader() {
+  const accessToken = cleanText(process.env.NTFY_ACCESS_TOKEN || "");
+  if (accessToken) {
+    return `Bearer ${accessToken}`;
+  }
+
+  const username = process.env.NTFY_USERNAME || "";
+  const password = process.env.NTFY_PASSWORD || "";
+  if (!username && !password) {
+    return "";
+  }
+
+  const basic = Buffer.from(`${username}:${password}`, "utf8").toString("base64");
+  return `Basic ${basic}`;
+}
+
+function cloneJson(value) {
+  if (value == null) {
+    return value;
+  }
+  return JSON.parse(JSON.stringify(value));
+}
+
+function isPlainObject(value) {
+  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
+
+await main();
+
+async function main() {
+  if (!config.dryRun && config.enableNtfy) {
+    const missing = ["NTFY_BASE_URL", "NTFY_TOPIC"].filter((key) => !process.env[key]);
+    if (missing.length > 0) {
+      console.error(`Missing required env vars: ${missing.join(", ")}`);
+      process.exit(1);
+    }
+  }
+
+  runtime.sessionIndex = await loadSessionIndex(config.sessionIndexFile);
+  runtime.lastSessionIndexLoadAt = Date.now();
+  runtime.knownFiles = await listRolloutFiles(config.sessionsDir);
+  runtime.logsDbFile = config.codexLogsDbFile || (await findLatestCodexLogsDbFile(config.codexHome)) || "";
+  runtime.lastDirectoryScanAt = Date.now();
+  runtime.rolloutThreadLabels = await buildRolloutThreadLabelIndex(runtime.knownFiles, runtime.sessionIndex);
+
+  console.log(
+    [
+      "Codex ntfy bridge",
+      `dryRun=${config.dryRun}`,
+      `once=${config.once}`,
+      `codexHome=${config.codexHome}`,
+      `webUiEnabled=${config.webUiEnabled}`,
+      `webPushEnabled=${config.webPushEnabled}`,
+      `ntfyBaseUrl=${config.ntfyBaseUrl}`,
+      `ntfyPublishBaseUrl=${config.ntfyPublishBaseUrl}`,
+      `ntfyTopic=${config.ntfyTopic}`,
+      `nativeApprovals=${config.nativeApprovals}`,
+      `notifyPlans=${config.notifyPlans}`,
+      `nativeApprovalServer=${config.nativeApprovalPublicBaseUrl}`,
+      `pollMs=${config.pollIntervalMs}`,
+      `replaySeconds=${config.replaySeconds}`,
+    ].join(" | ")
+  );
+
+  let approvalServer = null;
+
+  process.on("SIGINT", handleSignal);
+  process.on("SIGTERM", handleSignal);
+
+  try {
+    if (config.webPushEnabled) {
+      webPush.setVapidDetails(
+        config.webPushSubject,
+        config.webPushVapidPublicKey,
+        config.webPushVapidPrivateKey
+      );
+    }
+
+    if (
+      migratedPairedDevicesStateChanged ||
+      restoredPendingPlanStateChanged ||
+      restoredPendingUserInputStateChanged ||
+      refreshResolvedThreadLabels({ config, runtime, state })
+    ) {
+      await saveState(config.stateFile, state);
+    }
+
+    if (
+      !config.dryRun &&
+      (
+        config.webUiEnabled ||
+        config.notifyCompletions ||
+        config.notifyPlans ||
+        (config.notifyApprovals && config.nativeApprovals)
+      )
+    ) {
+      approvalServer = createNativeApprovalServer({ config, runtime, state });
+      await startHttpServer(approvalServer, config.nativeApprovalListenHost, config.nativeApprovalListenPort);
+      console.log(`Native approval server: ${config.nativeApprovalPublicBaseUrl}`);
+
+      if (config.nativeApprovals && (config.notifyApprovals || config.webUiEnabled)) {
+        runtime.ipcClient = new NativeIpcClient({
+          config,
+          runtime,
+          onThreadStateChanged: async ({ conversationId, previousRequests, nextRequests, sourceClientId }) => {
+            await syncNativeApprovals({
+          config,
+          runtime,
+          state,
+          conversationId,
+          previousRequests,
+          nextRequests,
+              sourceClientId,
+            });
+            await syncPlanImplementationRequests({
+              config,
+              runtime,
+              state,
+              conversationId,
+              previousRequests,
+              nextRequests,
+              sourceClientId,
+            });
+            await syncPlanUserInputRequests({
+              config,
+              runtime,
+              state,
+              conversationId,
+              nextRequests,
+              sourceClientId,
+            });
+            await syncGenericUserInputRequests({
+              config,
+              runtime,
+              state,
+              conversationId,
+              previousRequests,
+              nextRequests,
+              sourceClientId,
+            });
+          },
+          onUserInputRequested: async ({ conversationId, nextRequests, sourceClientId }) => {
+            await syncPlanUserInputRequests({
+              config,
+              runtime,
+              state,
+              conversationId,
+              nextRequests,
+              sourceClientId,
+            });
+            await syncGenericUserInputRequests({
+              config,
+              runtime,
+              state,
+              conversationId,
+              previousRequests: [],
+              nextRequests,
+              sourceClientId,
+            });
+          },
+        });
+        runtime.ipcClient.start();
+      }
+    }
+
+    while (!runtime.stopping) {
+      try {
+        const dirty = await scanOnce({ config, runtime, state });
+        if (dirty) {
+          await saveState(config.stateFile, state);
+        }
+      } catch (error) {
+        console.error(`[scan-error] ${error.message}`);
+      }
+
+      if (config.once) {
+        break;
+      }
+
+      await sleep(config.pollIntervalMs);
+    }
+  } finally {
+    runtime.stopping = true;
+
+    if (runtime.ipcClient) {
+      runtime.ipcClient.stop();
+    }
+
+    if (approvalServer) {
+      await stopHttpServer(approvalServer);
+    }
+  }
+}

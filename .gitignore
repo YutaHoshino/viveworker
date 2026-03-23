@@ -1,0 +1,35 @@
+# OS / editor noise
+.DS_Store
+
+# Dependencies
+node_modules/
+
+# Runtime output
+*.pid
+*.log
+.logs/
+
+# Local databases and caches
+*.db
+*.sqlite
+*.sqlite3
+.ntfy-data/
+
+# Local TLS / certificate material
+*.pem
+*.crt
+*.key
+
+# Generated local config and state
+.viveworker/
+viveworker.env
+.viveworker-state.json
+.tmp-viveworker-state.json
+
+# Local launchd output
+launchd/*.plist
+!launchd/*.plist.example
+
+# Optional local ntfy overrides
+ntfy/docker-compose.yml
+ntfy/server.yml

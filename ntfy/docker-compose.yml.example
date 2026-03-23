@@ -1,0 +1,10 @@
+services:
+  ntfy:
+    image: binwiederhier/ntfy:latest
+    restart: unless-stopped
+    command: serve
+    ports:
+      - "8080:80"
+    volumes:
+      - ./server.yml:/etc/ntfy/server.yml:ro
+      - ../.ntfy-data:/var/lib/ntfy

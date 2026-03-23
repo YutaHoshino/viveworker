@@ -1,0 +1,28 @@
+# Trusted-LAN ntfy setup for viveworker notifications.
+# Use HTTP like this only on a Wi-Fi/LAN you trust.
+# If you want remote access or stronger transport security, put ntfy behind HTTPS.
+
+# This URL must exactly match the Default Server you configure in the mobile app.
+base-url: "http://YOUR-MAC-IP-OR-HOSTNAME:8080"
+
+# The container listens on port 80 internally; Docker maps 8080 -> 80.
+listen-http: ":80"
+
+# Persistent cache is required so iPhone can fetch message contents after a poll request.
+cache-file: "/var/lib/ntfy/cache.db"
+
+# User, ACL, and token database. Created automatically if it does not exist.
+auth-file: "/var/lib/ntfy/auth.db"
+auth-default-access: "deny-all"
+
+# Login is handy for debugging, but self-signup should stay off on a private instance.
+enable-login: true
+enable-signup: false
+
+# Needed for near-instant iPhone delivery on a self-hosted server.
+# Only a poll request is forwarded upstream, not your real message body.
+upstream-base-url: "https://ntfy.sh"
+
+# Production-safe defaults: do not log message bodies.
+log-level: "info"
+log-format: "json"

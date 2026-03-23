@@ -1,0 +1,39 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+  <dict>
+    <!--
+      This file is only for manual launchd setups.
+      Most users should run `npx viveworker setup`, which generates the real LaunchAgent automatically.
+    -->
+    <key>Label</key>
+    <string>io.viveworker.app</string>
+
+    <key>ProgramArguments</key>
+    <array>
+      <string>/ABSOLUTE/PATH/TO/node</string>
+      <string>/ABSOLUTE/PATH/TO/viveworker/scripts/viveworker-bridge.mjs</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>/ABSOLUTE/PATH/TO/viveworker</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+      <key>VIVEWORKER_ENV_FILE</key>
+      <string>/ABSOLUTE/PATH/TO/.viveworker/config.env</string>
+    </dict>
+
+    <key>KeepAlive</key>
+    <true/>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>StandardOutPath</key>
+    <string>/ABSOLUTE/PATH/TO/.viveworker/logs/viveworker.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>/ABSOLUTE/PATH/TO/.viveworker/logs/viveworker.log</string>
+  </dict>
+</plist>

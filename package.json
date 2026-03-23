@@ -1,0 +1,24 @@
+{
+  "name": "viveworker",
+  "version": "0.1.0",
+  "description": "A local iPhone companion for Codex Desktop approvals, plans, questions, and completions.",
+  "type": "module",
+  "bin": {
+    "viveworker": "./scripts/viveworker.mjs"
+  },
+  "files": [
+    "scripts/viveworker.mjs",
+    "scripts/viveworker-bridge.mjs",
+    "scripts/lib",
+    "web",
+    "README.md",
+    "viveworker.env.example",
+    "launchd/io.viveworker.app.plist.example",
+    "ntfy/server.yml.example",
+    "ntfy/docker-compose.yml.example"
+  ],
+  "dependencies": {
+    "qrcode-terminal": "^0.12.0",
+    "web-push": "^3.6.7"
+  }
+}
