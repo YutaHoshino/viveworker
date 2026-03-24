@@ -6,6 +6,7 @@ const PUSH_BANNER_DISMISS_KEY = "viveworker-push-banner-dismissed-v1";
 const INITIAL_DETECTED_LOCALE = detectBrowserLocale();
 const TIMELINE_MESSAGE_KINDS = new Set(["user_message", "assistant_commentary", "assistant_final"]);
 const TIMELINE_OPERATIONAL_KINDS = new Set(["approval", "plan", "plan_ready", "choice", "completion"]);
+const THREAD_FILTER_INTERACTION_DEFER_MS = 8000;
 
 const state = {
   session: null,
@@ -29,6 +30,7 @@ const state = {
   pendingDetailScrollReset: false,
   listScrollState: null,
   pendingListScrollRestore: false,
+  threadFilterInteractionUntilMs: 0,
   choiceLocalDrafts: {},
   completionReplyDrafts: {},
   pairError: "",
@@ -124,7 +126,7 @@ async function boot() {
       return;
     }
     await refreshAuthenticatedState();
-    if (!shouldDeferRenderForActiveReplyComposer()) {
+    if (!shouldDeferRenderForActiveInteraction()) {
       await renderShell();
     }
   }, 3000);
@@ -674,15 +676,30 @@ function currentViewportScrollY() {
   return window.scrollY || window.pageYOffset || document.documentElement?.scrollTop || 0;
 }
 
-function shouldDeferRenderForActiveReplyComposer() {
+function markThreadFilterInteraction() {
+  state.threadFilterInteractionUntilMs = Date.now() + THREAD_FILTER_INTERACTION_DEFER_MS;
+}
+
+function clearThreadFilterInteraction() {
+  state.threadFilterInteractionUntilMs = 0;
+}
+
+function shouldDeferRenderForActiveInteraction() {
   const activeElement = document.activeElement;
-  if (!(activeElement instanceof HTMLTextAreaElement)) {
-    return false;
+  if (
+    activeElement instanceof HTMLTextAreaElement &&
+    activeElement.matches("[data-completion-reply-textarea]") &&
+    normalizeClientText(activeElement.dataset.replyToken) === normalizeClientText(state.currentItem?.token)
+  ) {
+    return true;
   }
-  if (!activeElement.matches("[data-completion-reply-textarea]")) {
-    return false;
+  if (
+    activeElement instanceof HTMLSelectElement &&
+    activeElement.matches("[data-timeline-thread-select], [data-completed-thread-select]")
+  ) {
+    return true;
   }
-  return normalizeClientText(activeElement.dataset.replyToken) === normalizeClientText(state.currentItem?.token);
+  return state.threadFilterInteractionUntilMs > Date.now();
 }
 
 function normalizeChoiceAnswersMap(value) {
@@ -2712,7 +2729,18 @@ function bindShellInteractions() {
   }
 
   for (const select of document.querySelectorAll("[data-timeline-thread-select]")) {
+    const handleInteractionStart = () => {
+      markThreadFilterInteraction();
+    };
+    const handleInteractionEnd = () => {
+      clearThreadFilterInteraction();
+    };
+    select.addEventListener("pointerdown", handleInteractionStart);
+    select.addEventListener("click", handleInteractionStart);
+    select.addEventListener("focus", handleInteractionStart);
+    select.addEventListener("blur", handleInteractionEnd);
     select.addEventListener("change", async () => {
+      clearThreadFilterInteraction();
       state.timelineThreadFilter = select.value || "all";
       alignCurrentItemToVisibleEntries();
       await renderShell();
@@ -2720,7 +2748,18 @@ function bindShellInteractions() {
   }
 
   for (const select of document.querySelectorAll("[data-completed-thread-select]")) {
+    const handleInteractionStart = () => {
+      markThreadFilterInteraction();
+    };
+    const handleInteractionEnd = () => {
+      clearThreadFilterInteraction();
+    };
+    select.addEventListener("pointerdown", handleInteractionStart);
+    select.addEventListener("click", handleInteractionStart);
+    select.addEventListener("focus", handleInteractionStart);
+    select.addEventListener("blur", handleInteractionEnd);
     select.addEventListener("change", async () => {
+      clearThreadFilterInteraction();
       state.completedThreadFilter = select.value || "all";
       alignCurrentItemToVisibleEntries();
       await renderShell();

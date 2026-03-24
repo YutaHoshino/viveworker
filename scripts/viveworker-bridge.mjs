@@ -8502,7 +8502,7 @@ function summarizeNotificationText(value) {
 }
 
 function normalizeLongText(value) {
-  return String(stripMarkdownLinks(value) || "")
+  return String(stripEnvironmentContextBlocks(stripMarkdownLinks(value)) || "")
     .replace(/\r\n/gu, "\n")
     .replace(/[ \t]+\n/gu, "\n")
     .replace(/\n{3,}/gu, "\n\n")
@@ -8573,6 +8573,13 @@ function cleanText(value) {
 
 function stripMarkdownLinks(value) {
   return String(value || "").replace(/\[([^\]]+)\]\(([^)]+)\)/gu, "$1");
+}
+
+function stripEnvironmentContextBlocks(value) {
+  return String(value || "")
+    .replace(/<environment_context>[\s\S]*?<\/environment_context>\s*/giu, "")
+    .replace(/^\s*<environment_context>[\s\S]*$/giu, "")
+    .replace(/^\s*environment_context\s*$/gimu, "");
 }
 
 function stripNotificationMarkup(value) {
