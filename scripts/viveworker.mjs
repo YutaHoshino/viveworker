@@ -265,7 +265,7 @@ async function runSetup(cliOptions) {
   if (allowInsecureHttpLan) {
     console.log(t(locale, "cli.setup.warning.insecureHttpLan"));
   }
-  if (canShowCaDownload && !cliOptions.installMkcert) {
+  if (canShowCaDownload && !cliOptions.installMkcert && !cliOptions.pair) {
     console.log(t(locale, "cli.setup.caDownloadLocal", { url: caDownloadLocalUrl }));
     console.log(t(locale, "cli.setup.caDownloadIp", { url: caDownloadIpUrl }));
   }
@@ -280,7 +280,7 @@ async function runSetup(cliOptions) {
   console.log("");
   console.log(t(locale, "cli.setup.qrPairing"));
   await printQrCode(`${publicBaseUrl}${pairPath}`);
-  if (canShowCaDownload && !cliOptions.installMkcert) {
+  if (canShowCaDownload && !cliOptions.installMkcert && !cliOptions.pair) {
     console.log("");
     console.log(t(locale, "cli.setup.qrCaDownload"));
     await printQrCode(caDownloadIpUrl);

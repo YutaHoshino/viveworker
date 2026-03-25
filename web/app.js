@@ -89,7 +89,10 @@ async function boot() {
 
   if (!state.session?.authenticated && initialPairToken && shouldAutoPairFromBootstrapToken()) {
     try {
-      await pair({ token: initialPairToken });
+      await pair({
+        token: initialPairToken,
+        temporary: shouldUseTemporaryBootstrapPairing(),
+      });
     } catch (error) {
       state.pairError = error.message || String(error);
     }
@@ -532,7 +535,9 @@ function renderPair() {
 
 async function pair(payload) {
   const result = await apiPost("/api/session/pair", payload);
-  syncPairingTokenState("");
+  if (result?.temporaryPairing !== true) {
+    syncPairingTokenState("");
+  }
   return result;
 }
 
@@ -4069,7 +4074,7 @@ function syncPairingTokenState(pairToken) {
 }
 
 function desiredBootstrapPairingToken() {
-  if (state.session?.authenticated) {
+  if (state.session?.authenticated && !state.session?.temporaryPairing) {
     return "";
   }
   return initialPairToken;
@@ -4079,13 +4084,11 @@ function shouldAutoPairFromBootstrapToken() {
   if (!initialPairToken) {
     return false;
   }
-  if (isStandaloneMode()) {
-    return true;
-  }
-  if (isProbablySafari()) {
-    return false;
-  }
   return true;
+}
+
+function shouldUseTemporaryBootstrapPairing() {
+  return Boolean(initialPairToken) && !isStandaloneMode() && isProbablySafari();
 }
 
 function urlBase64ToUint8Array(base64String) {

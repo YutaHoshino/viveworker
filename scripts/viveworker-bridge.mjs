@@ -4409,6 +4409,7 @@ function readSession(req, config, state) {
     pairedAtMs: Number(payload.pairedAtMs) || 0,
     expiresAtMs: Number(payload.expiresAtMs) || 0,
     deviceId,
+    temporaryPairing: payload?.temporaryPairing === true,
   };
 }
 
@@ -4459,6 +4460,22 @@ function buildSetCookieHeader({ value, maxAgeSecs, secure = false }) {
 function setSessionCookie(res, config) {
   const secure = config.nativeApprovalPublicBaseUrl.startsWith("https://");
   const token = buildSessionCookie(config);
+  res.setHeader("Set-Cookie", buildSetCookieHeader({
+    value: token,
+    maxAgeSecs: Math.max(1, Math.floor(config.sessionTtlMs / 1000)),
+    secure,
+  }));
+}
+
+function setTemporarySessionCookie(res, config) {
+  const secure = config.nativeApprovalPublicBaseUrl.startsWith("https://");
+  const now = Date.now();
+  const token = signSessionPayload({
+    sessionId: crypto.randomUUID(),
+    pairedAtMs: now,
+    expiresAtMs: now + config.sessionTtlMs,
+    temporaryPairing: true,
+  }, config.sessionSecret);
   res.setHeader("Set-Cookie", buildSetCookieHeader({
     value: token,
     maxAgeSecs: Math.max(1, Math.floor(config.sessionTtlMs / 1000)),
@@ -4623,15 +4640,27 @@ function pairingCredentialConsumed(config, state) {
 }
 
 function isPairingAvailableForState(config, state) {
-  return isPairingAvailable(config) && !pairingCredentialConsumed(config, state);
+  return isPairingAvailable(config) && !pairingCodeConsumed(config, state);
 }
 
-function markPairingConsumed(state, config, now = Date.now()) {
-  const current = currentPairingCredential(config);
+function pairingCodeConsumed(config, state) {
+  const code = cleanText(config?.pairingCode ?? "").toUpperCase();
+  if (!code) {
+    return false;
+  }
+  const consumedAtMs = Number(state?.pairingConsumedAt) || 0;
+  const consumedCredential = cleanText(state?.pairingConsumedCredential ?? "");
+  return consumedAtMs > 0 && consumedCredential === `code:${code}`;
+}
+
+function markPairingConsumed(state, credential, now = Date.now()) {
+  const current = cleanText(credential || "");
   if (!current) {
     return false;
   }
-  if (pairingCredentialConsumed(config, state)) {
+  const consumedAtMs = Number(state?.pairingConsumedAt) || 0;
+  const consumedCredential = cleanText(state?.pairingConsumedCredential ?? "");
+  if (consumedAtMs > 0 && consumedCredential === current) {
     return false;
   }
   state.pairingConsumedAt = now;
@@ -4643,7 +4672,7 @@ function validatePairingPayload(payload, config, state) {
   if (!config.authRequired) {
     return { ok: true };
   }
-  if (!isPairingAvailableForState(config, state)) {
+  if (!isPairingAvailable(config)) {
     return { ok: false, error: "pairing-unavailable" };
   }
 
@@ -4651,10 +4680,16 @@ function validatePairingPayload(payload, config, state) {
   const token = cleanText(payload?.token ?? "");
   const matchesCode = code && cleanText(config.pairingCode).toUpperCase() === code;
   const matchesToken = token && cleanText(config.pairingToken) === token;
-  if (!matchesCode && !matchesToken) {
-    return { ok: false, error: "invalid-pairing-credentials" };
+  if (matchesToken) {
+    return { ok: true, credential: `token:${token}` };
   }
-  return { ok: true };
+  if (matchesCode) {
+    if (pairingCodeConsumed(config, state)) {
+      return { ok: false, error: "pairing-unavailable" };
+    }
+    return { ok: true, credential: `code:${code}` };
+  }
+  return { ok: false, error: "invalid-pairing-credentials" };
 }
 
 function readRemoteAddress(req) {
@@ -5707,7 +5742,7 @@ function resolveManifestPairingToken({ config, state, requestedToken }) {
   if (!token) {
     return "";
   }
-  if (!isPairingAvailableForState(config, state)) {
+  if (!isPairingAvailable(config)) {
     return "";
   }
   return cleanText(config.pairingToken) === token ? token : "";
@@ -5860,6 +5895,7 @@ function createNativeApprovalServer({ config, runtime, state }) {
           httpsEnabled: config.nativeApprovalPublicBaseUrl.startsWith("https://"),
           appVersion: appPackageVersion,
           deviceId: session.deviceId || null,
+          temporaryPairing: session.temporaryPairing === true,
           ...buildSessionLocalePayload(config, state, session.deviceId),
         });
       }
@@ -5884,6 +5920,17 @@ function createNativeApprovalServer({ config, runtime, state }) {
           return writeJson(res, 400, { error: validation.error });
         }
 
+        if (payload?.temporary === true && cleanText(payload?.token || "")) {
+          clearPairingFailures(runtime, remoteAddress);
+          setTemporarySessionCookie(res, config);
+          return writeJson(res, 200, {
+            ok: true,
+            authenticated: true,
+            pairingAvailable: isPairingAvailableForState(config, state),
+            temporaryPairing: true,
+          });
+        }
+
         const pairedDeviceId = readDeviceId(req, config) || crypto.randomUUID();
         if ("detectedLocale" in payload) {
           upsertDetectedDeviceLocale(state, pairedDeviceId, payload.detectedLocale);
@@ -5898,7 +5945,9 @@ function createNativeApprovalServer({ config, runtime, state }) {
             lastLocale: normalizeSupportedLocale(payload?.detectedLocale),
           }
         );
-        markPairingConsumed(state, config);
+        if (String(validation.credential || "").startsWith("code:")) {
+          markPairingConsumed(state, validation.credential);
+        }
         clearPairingFailures(runtime, remoteAddress);
         await saveState(config.stateFile, state);
         setPairingCookies(res, config, pairedDeviceId);
