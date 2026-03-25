@@ -87,7 +87,7 @@ async function boot() {
 
   await refreshSession();
 
-  if (!state.session?.authenticated && initialPairToken) {
+  if (!state.session?.authenticated && initialPairToken && shouldAutoPairFromBootstrapToken()) {
     try {
       await pair({ token: initialPairToken });
     } catch (error) {
@@ -480,6 +480,7 @@ function syncCompletedThreadFilter() {
 }
 
 function renderPair() {
+  const shouldInstallFromHomeScreen = Boolean(initialPairToken) && !shouldAutoPairFromBootstrapToken();
   app.innerHTML = `
     <main class="onboarding-shell">
       <section class="onboarding-card">
@@ -488,6 +489,7 @@ function renderPair() {
         <p class="hero-copy">${escapeHtml(L("pair.copy"))}</p>
         ${state.pairNotice ? `<p class="inline-alert inline-alert--success">${escapeHtml(state.pairNotice)}</p>` : ""}
         ${state.pairError ? `<p class="inline-alert inline-alert--danger">${escapeHtml(state.pairError)}</p>` : ""}
+        ${shouldInstallFromHomeScreen ? `<p class="inline-alert inline-alert--warning">${escapeHtml(L("pair.installFromHomeScreen"))}</p>` : ""}
         <form id="pair-form" class="pair-form">
           <label class="field">
             <span class="field-label">${escapeHtml(L("pair.codeLabel"))}</span>
@@ -555,6 +557,7 @@ function resetAuthenticatedState() {
   state.detailLoadingItem = null;
   state.detailOpen = false;
   state.choiceLocalDrafts = {};
+  clearAllCompletionReplyDrafts();
   state.completionReplyDrafts = {};
   state.settingsSubpage = "";
   state.settingsScrollState = null;
@@ -765,11 +768,70 @@ function normalizeReplyMode(value) {
   return normalizeClientText(value).toLowerCase() === "plan" ? "plan" : "default";
 }
 
+const COMPLETION_REPLY_IMAGE_SUPPORT = false;
+
+function normalizeCompletionReplyAttachment(value) {
+  if (!COMPLETION_REPLY_IMAGE_SUPPORT) {
+    return null;
+  }
+  if (!value || typeof value !== "object") {
+    return null;
+  }
+  const file = typeof File !== "undefined" && value.file instanceof File ? value.file : null;
+  const name = normalizeClientText(value.name || file?.name || "");
+  const type = normalizeClientText(value.type || file?.type || "");
+  const size = Number(value.size ?? file?.size) || 0;
+  const previewUrl = normalizeClientText(value.previewUrl || "");
+  if (!file || !name || !type.startsWith("image/") || size <= 0) {
+    return null;
+  }
+  return {
+    file,
+    name,
+    type,
+    size,
+    previewUrl,
+  };
+}
+
+function createCompletionReplyAttachment(file) {
+  if (!COMPLETION_REPLY_IMAGE_SUPPORT) {
+    return null;
+  }
+  if (!(typeof File !== "undefined" && file instanceof File)) {
+    return null;
+  }
+  if (!normalizeClientText(file.type).startsWith("image/")) {
+    return null;
+  }
+  return normalizeCompletionReplyAttachment({
+    file,
+    name: file.name,
+    type: file.type,
+    size: file.size,
+    previewUrl: typeof URL !== "undefined" && typeof URL.createObjectURL === "function"
+      ? URL.createObjectURL(file)
+      : "",
+  });
+}
+
+function releaseCompletionReplyAttachment(attachment) {
+  if (!attachment?.previewUrl || typeof URL === "undefined" || typeof URL.revokeObjectURL !== "function") {
+    return;
+  }
+  try {
+    URL.revokeObjectURL(attachment.previewUrl);
+  } catch {
+    // Ignore best-effort object URL cleanup errors.
+  }
+}
+
 function getCompletionReplyDraft(token) {
   if (!token) {
     return {
       text: "",
       sentText: "",
+      attachment: null,
       mode: "default",
       notice: "",
       error: "",
@@ -784,6 +846,7 @@ function getCompletionReplyDraft(token) {
   return {
     text: String(draft.text ?? ""),
     sentText: normalizeClientText(draft.sentText ?? ""),
+    attachment: normalizeCompletionReplyAttachment(draft.attachment),
     mode: normalizeReplyMode(draft.mode),
     notice: normalizeClientText(draft.notice),
     error: normalizeClientText(draft.error),
@@ -815,13 +878,22 @@ function setCompletionReplyDraft(token, partialDraft) {
   if (!token) {
     return;
   }
+  const previousStoredDraft = state.completionReplyDrafts?.[token] || {};
+  const previousAttachment = normalizeCompletionReplyAttachment(previousStoredDraft.attachment);
   const nextDraft = {
     ...getCompletionReplyDraft(token),
     ...(partialDraft || {}),
   };
+  const nextAttachment = Object.prototype.hasOwnProperty.call(partialDraft || {}, "attachment")
+    ? normalizeCompletionReplyAttachment(partialDraft?.attachment)
+    : normalizeCompletionReplyAttachment(nextDraft.attachment);
+  if (previousAttachment?.previewUrl && previousAttachment.previewUrl !== nextAttachment?.previewUrl) {
+    releaseCompletionReplyAttachment(previousAttachment);
+  }
   state.completionReplyDrafts[token] = {
     text: String(nextDraft.text ?? ""),
     sentText: normalizeClientText(nextDraft.sentText ?? ""),
+    attachment: nextAttachment,
     mode: normalizeReplyMode(nextDraft.mode),
     notice: normalizeClientText(nextDraft.notice),
     error: normalizeClientText(nextDraft.error),
@@ -836,7 +908,14 @@ function clearCompletionReplyDraft(token) {
   if (!token || !state.completionReplyDrafts?.[token]) {
     return;
   }
+  releaseCompletionReplyAttachment(state.completionReplyDrafts[token]?.attachment);
   delete state.completionReplyDrafts[token];
+}
+
+function clearAllCompletionReplyDrafts() {
+  for (const token of Object.keys(state.completionReplyDrafts || {})) {
+    clearCompletionReplyDraft(token);
+  }
 }
 
 function syncCompletionReplyComposerLiveState(replyForm, draft) {
@@ -2210,6 +2289,8 @@ function renderCompletionReplyComposer(detail, options = {}) {
   const warningTimestamp = draft.warning?.createdAtMs ? formatTimelineTimestamp(draft.warning.createdAtMs) : "";
   const showCollapsedState =
     draft.collapsedAfterSend && Boolean(draft.notice) && !draft.error && !draft.warning && !draft.sending;
+  const attachmentName = draft.attachment?.name ? escapeHtml(draft.attachment.name) : "";
+  const attachmentPreviewUrl = draft.attachment?.previewUrl ? escapeHtml(draft.attachment.previewUrl) : "";
 
   return `
     <section class="detail-card detail-card--reply ${options.mobile ? "detail-card--mobile" : ""}">
@@ -2275,6 +2356,55 @@ function renderCompletionReplyComposer(detail, options = {}) {
                     data-reply-token="${escapeHtml(detail.token)}"
                   >${escapeHtml(draft.text)}</textarea>
                 </label>
+                ${
+                  detail.reply?.supportsImages
+                    ? `
+                      <div class="reply-attachment-field">
+                        <div class="reply-attachment-field__header">
+                          <span class="field-label">${escapeHtml(L("reply.imageLabel"))}</span>
+                          ${
+                            draft.attachment
+                              ? `
+                                <button
+                                  class="secondary secondary--compact"
+                                  type="button"
+                                  data-reply-image-remove
+                                  data-reply-token="${escapeHtml(detail.token)}"
+                                >
+                                  ${escapeHtml(L("reply.imageRemove"))}
+                                </button>
+                              `
+                              : ""
+                          }
+                        </div>
+                        <label class="reply-attachment-picker">
+                          <input
+                            class="reply-attachment-picker__input"
+                            type="file"
+                            accept="image/*"
+                            data-reply-image-input
+                            data-reply-token="${escapeHtml(detail.token)}"
+                          >
+                          <span class="reply-attachment-picker__label">${escapeHtml(L(draft.attachment ? "reply.imageReplace" : "reply.imageAdd"))}</span>
+                          <span class="reply-attachment-picker__hint">${escapeHtml(L("reply.imageHint"))}</span>
+                        </label>
+                        ${
+                          draft.attachment
+                            ? `
+                              <div class="reply-image-preview">
+                                <img class="reply-image-preview__image" src="${attachmentPreviewUrl}" alt="${attachmentName}">
+                                <div class="reply-image-preview__copy">
+                                  <p class="reply-image-preview__name">${attachmentName}</p>
+                                  <p class="reply-image-preview__meta">${escapeHtml(L("reply.imageAttached"))}</p>
+                                </div>
+                              </div>
+                            `
+                            : ""
+                        }
+                      </div>
+                    `
+                    : ""
+                }
                 ${
                   detail.reply?.supportsPlanMode
                     ? `
@@ -2841,6 +2971,46 @@ function bindShellInteractions() {
     });
   }
 
+  for (const input of document.querySelectorAll("[data-reply-image-input][data-reply-token]")) {
+    input.addEventListener("change", async () => {
+      const token = input.dataset.replyToken || "";
+      const [file] = Array.from(input.files || []);
+      const nextAttachment = createCompletionReplyAttachment(file);
+      if (!nextAttachment && file) {
+        setCompletionReplyDraft(token, {
+          error: L("error.completionReplyImageInvalidType"),
+          notice: "",
+          warning: null,
+          confirmOverride: false,
+        });
+        await renderShell();
+        return;
+      }
+      setCompletionReplyDraft(token, {
+        attachment: nextAttachment,
+        notice: "",
+        error: "",
+        warning: null,
+        confirmOverride: false,
+      });
+      await renderShell();
+    });
+  }
+
+  for (const button of document.querySelectorAll("[data-reply-image-remove][data-reply-token]")) {
+    button.addEventListener("click", async () => {
+      const token = button.dataset.replyToken || "";
+      setCompletionReplyDraft(token, {
+        attachment: null,
+        notice: "",
+        error: "",
+        warning: null,
+        confirmOverride: false,
+      });
+      await renderShell();
+    });
+  }
+
   for (const button of document.querySelectorAll("[data-open-logout-confirm]")) {
     button.addEventListener("click", async () => {
       state.logoutConfirmOpen = true;
@@ -3010,14 +3180,18 @@ function bindShellInteractions() {
       await renderShell();
 
       try {
-        await apiPost(`/api/items/completion/${encodeURIComponent(token)}/reply`, {
-          text,
-          planMode: draft.mode === "plan",
-          force: draft.confirmOverride === true,
-        });
+        const requestBody = new FormData();
+        requestBody.set("text", text);
+        requestBody.set("planMode", draft.mode === "plan" ? "true" : "false");
+        requestBody.set("force", draft.confirmOverride === true ? "true" : "false");
+        if (COMPLETION_REPLY_IMAGE_SUPPORT && draft.attachment?.file) {
+          requestBody.append("image", draft.attachment.file, draft.attachment.name || draft.attachment.file.name);
+        }
+        await apiPost(`/api/items/completion/${encodeURIComponent(token)}/reply`, requestBody);
         setCompletionReplyDraft(token, {
           text: "",
           sentText: text,
+          attachment: null,
           mode: draft.mode,
           sending: false,
           error: "",
@@ -3032,6 +3206,7 @@ function bindShellInteractions() {
           setCompletionReplyDraft(token, {
             text,
             sentText: "",
+            attachment: draft.attachment,
             mode: draft.mode,
             sending: false,
             notice: "",
@@ -3046,6 +3221,7 @@ function bindShellInteractions() {
         setCompletionReplyDraft(token, {
           text,
           sentText: "",
+          attachment: draft.attachment,
           mode: draft.mode,
           sending: false,
           notice: "",
@@ -3759,14 +3935,19 @@ async function apiGet(url) {
 }
 
 async function apiPost(url, body) {
+  const isFormDataBody = typeof FormData !== "undefined" && body instanceof FormData;
   const response = await fetch(url, {
     method: "POST",
     credentials: "same-origin",
-    headers: {
-      "Content-Type": "application/json",
-      Accept: "application/json",
-    },
-    body: JSON.stringify(body || {}),
+    headers: isFormDataBody
+      ? {
+          Accept: "application/json",
+        }
+      : {
+          "Content-Type": "application/json",
+          Accept: "application/json",
+        },
+    body: isFormDataBody ? body : JSON.stringify(body || {}),
   });
   if (!response.ok) {
     const errorInfo = await readError(response);
@@ -3809,6 +3990,11 @@ function localizeApiError(value) {
     "completion-reply-unavailable": "error.completionReplyUnavailable",
     "completion-reply-thread-advanced": "error.completionReplyThreadAdvanced",
     "completion-reply-empty": "error.completionReplyEmpty",
+    "completion-reply-image-invalid-type": "error.completionReplyImageInvalidType",
+    "completion-reply-image-too-large": "error.completionReplyImageTooLarge",
+    "completion-reply-image-limit": "error.completionReplyImageLimit",
+    "completion-reply-image-invalid-upload": "error.completionReplyImageInvalidUpload",
+    "completion-reply-image-disabled": "error.completionReplyImageDisabled",
     "codex-ipc-not-connected": "error.codexIpcNotConnected",
     "approval-not-found": "error.approvalNotFound",
     "approval-already-handled": "error.approvalAlreadyHandled",
@@ -3887,6 +4073,19 @@ function desiredBootstrapPairingToken() {
     return "";
   }
   return initialPairToken;
+}
+
+function shouldAutoPairFromBootstrapToken() {
+  if (!initialPairToken) {
+    return false;
+  }
+  if (isStandaloneMode()) {
+    return true;
+  }
+  if (isProbablySafari()) {
+    return false;
+  }
+  return true;
 }
 
 function urlBase64ToUint8Array(base64String) {

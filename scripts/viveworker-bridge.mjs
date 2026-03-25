@@ -31,6 +31,9 @@ const DEFAULT_DEVICE_TRUST_TTL_MS = 30 * 24 * 60 * 60 * 1000;
 const MAX_PAIRED_DEVICES = 200;
 const PAIRING_RATE_LIMIT_WINDOW_MS = 15 * 60 * 1000;
 const PAIRING_RATE_LIMIT_MAX_ATTEMPTS = 8;
+const DEFAULT_COMPLETION_REPLY_IMAGE_MAX_BYTES = 15 * 1024 * 1024;
+const DEFAULT_COMPLETION_REPLY_UPLOAD_TTL_MS = 24 * 60 * 60 * 1000;
+const MAX_COMPLETION_REPLY_IMAGE_COUNT = 1;
 
 const cli = parseCliArgs(process.argv.slice(2));
 const envFile = resolveEnvFile(cli.envFile);
@@ -5437,8 +5440,25 @@ async function submitGenericUserInputDecision({ config, runtime, state, userInpu
   }
 }
 
-async function handleCompletionReply({ runtime, completionItem, text, planMode = false, force = false }) {
+function normalizeCompletionReplyLocalImagePaths(paths) {
+  if (!Array.isArray(paths)) {
+    return [];
+  }
+  return paths
+    .map((value) => resolvePath(cleanText(value || "")))
+    .filter(Boolean);
+}
+
+async function handleCompletionReply({
+  runtime,
+  completionItem,
+  text,
+  planMode = false,
+  force = false,
+  localImagePaths = [],
+}) {
   const messageText = cleanText(text ?? "");
+  const normalizedLocalImagePaths = normalizeCompletionReplyLocalImagePaths(localImagePaths);
   if (!messageText) {
     throw new Error("completion-reply-empty");
   }
@@ -5472,6 +5492,10 @@ async function handleCompletionReply({ runtime, completionItem, text, planMode =
   const turnStartParams = {
     input: buildTextInput(messageText),
     attachments: [],
+    localImagePaths: normalizedLocalImagePaths,
+    local_image_paths: normalizedLocalImagePaths,
+    remoteImageUrls: [],
+    remote_image_urls: [],
     cwd: null,
     approvalPolicy: null,
     sandboxPolicy: null,
@@ -6112,20 +6136,34 @@ function createNativeApprovalServer({ config, runtime, state }) {
         }
 
         try {
-          const payload = await parseJsonBody(req);
+          const contentType = String(req.headers["content-type"] || "");
+          const payload = contentType.includes("multipart/form-data")
+            ? await stageCompletionReplyImages(config, req)
+            : await parseJsonBody(req);
           await handleCompletionReply({
             runtime,
             completionItem,
             text: payload?.text ?? "",
             planMode: payload?.planMode === true,
             force: payload?.force === true,
+            localImagePaths: Array.isArray(payload?.localImagePaths) ? payload.localImagePaths : [],
           });
           return writeJson(res, 200, {
             ok: true,
             planMode: payload?.planMode === true,
+            imageCount: Array.isArray(payload?.localImagePaths) ? payload.localImagePaths.length : 0,
           });
         } catch (error) {
           if (error.message === "completion-reply-empty") {
+            return writeJson(res, 400, { error: error.message });
+          }
+          if (
+            error.message === "completion-reply-image-limit" ||
+            error.message === "completion-reply-image-invalid-type" ||
+            error.message === "completion-reply-image-too-large" ||
+            error.message === "completion-reply-image-invalid-upload" ||
+            error.message === "completion-reply-image-disabled"
+          ) {
             return writeJson(res, 400, { error: error.message });
           }
           if (error.message === "completion-reply-unavailable") {
@@ -6766,6 +6804,20 @@ async function parseFormBody(req) {
   });
 }
 
+async function parseMultipartBody(req) {
+  const contentLength = Number(req.headers["content-length"]) || 0;
+  if (contentLength > 32 * 1024 * 1024) {
+    throw new Error("request-body-too-large");
+  }
+  const request = new Request("http://localhost/upload", {
+    method: req.method || "POST",
+    headers: req.headers,
+    body: req,
+    duplex: "half",
+  });
+  return request.formData();
+}
+
 async function parseJsonBody(req) {
   return new Promise((resolve, reject) => {
     let body = "";
@@ -6786,6 +6838,94 @@ async function parseJsonBody(req) {
     });
     req.on("error", reject);
   });
+}
+
+function guessUploadExtension(fileName, mimeType) {
+  const explicitExtension = path.extname(cleanText(fileName || ""));
+  if (explicitExtension) {
+    return explicitExtension.toLowerCase();
+  }
+  const normalizedMimeType = cleanText(mimeType || "").toLowerCase();
+  const knownExtensions = {
+    "image/jpeg": ".jpg",
+    "image/png": ".png",
+    "image/webp": ".webp",
+    "image/gif": ".gif",
+    "image/heic": ".heic",
+    "image/heif": ".heif",
+  };
+  return knownExtensions[normalizedMimeType] || ".img";
+}
+
+async function cleanupExpiredCompletionReplyUploads(config) {
+  try {
+    const entries = await fs.readdir(config.replyUploadsDir, { withFileTypes: true });
+    const cutoffMs = Date.now() - config.completionReplyUploadTtlMs;
+    await Promise.all(entries.map(async (entry) => {
+      if (!entry.isFile()) {
+        return;
+      }
+      const filePath = path.join(config.replyUploadsDir, entry.name);
+      try {
+        const stat = await fs.stat(filePath);
+        if (Number(stat.mtimeMs) < cutoffMs) {
+          await fs.rm(filePath, { force: true });
+        }
+      } catch {
+        // Ignore best-effort cleanup errors.
+      }
+    }));
+  } catch {
+    // Ignore missing upload dir.
+  }
+}
+
+async function stageCompletionReplyImages(config, req) {
+  const formData = await parseMultipartBody(req);
+  const files = formData
+    .getAll("image")
+    .filter((value) => typeof File !== "undefined" && value instanceof File);
+
+  if (files.length > 0) {
+    throw new Error("completion-reply-image-disabled");
+  }
+
+  if (files.length > MAX_COMPLETION_REPLY_IMAGE_COUNT) {
+    throw new Error("completion-reply-image-limit");
+  }
+
+  await cleanupExpiredCompletionReplyUploads(config);
+  await fs.mkdir(config.replyUploadsDir, { recursive: true });
+
+  const localImagePaths = [];
+  for (const file of files) {
+    const mimeType = cleanText(file.type || "").toLowerCase();
+    if (!mimeType.startsWith("image/")) {
+      throw new Error("completion-reply-image-invalid-type");
+    }
+    if (!Number.isFinite(file.size) || file.size <= 0) {
+      throw new Error("completion-reply-image-invalid-upload");
+    }
+    if (file.size > config.completionReplyImageMaxBytes) {
+      throw new Error("completion-reply-image-too-large");
+    }
+
+    const extension = guessUploadExtension(file.name, mimeType);
+    const stagedFilePath = path.join(
+      config.replyUploadsDir,
+      `${Date.now()}-${crypto.randomUUID()}${extension}`
+    );
+    const buffer = Buffer.from(await file.arrayBuffer());
+    await fs.writeFile(stagedFilePath, buffer, { mode: 0o600 });
+    localImagePaths.push(stagedFilePath);
+  }
+
+  return {
+    text: cleanText(formData.get("text") ?? ""),
+    planMode: String(formData.get("planMode") ?? "") === "true",
+    force: String(formData.get("force") ?? "") === "true",
+    localImagePaths,
+  };
 }
 
 function isLoopbackRequest(req) {
@@ -7727,6 +7867,7 @@ function isLoopbackHostname(value) {
 
 function buildConfig(cli) {
   const codexHome = resolvePath(process.env.CODEX_HOME || path.join(os.homedir(), ".codex"));
+  const stateFile = resolvePath(process.env.STATE_FILE || path.join(workspaceRoot, ".viveworker-state.json"));
   return {
     dryRun: cli.dryRun || truthy(process.env.DRY_RUN),
     once: cli.once,
@@ -7740,7 +7881,8 @@ function buildConfig(cli) {
     sessionIndexFile: resolvePath(process.env.SESSION_INDEX_FILE || path.join(codexHome, "session_index.jsonl")),
     historyFile: resolvePath(process.env.HISTORY_FILE || path.join(codexHome, "history.jsonl")),
     codexLogsDbFile: resolvePath(process.env.CODEX_LOGS_DB_FILE || ""),
-    stateFile: resolvePath(process.env.STATE_FILE || path.join(workspaceRoot, ".viveworker-state.json")),
+    stateFile,
+    replyUploadsDir: resolvePath(process.env.REPLY_UPLOADS_DIR || path.join(path.dirname(stateFile), "uploads")),
     pollIntervalMs: numberEnv("POLL_INTERVAL_MS", 2500),
     replaySeconds: numberEnv("REPLAY_SECONDS", 300),
     sessionIndexRefreshMs: numberEnv("SESSION_INDEX_REFRESH_MS", 30000),
@@ -7794,6 +7936,14 @@ function buildConfig(cli) {
     ipcReconnectMs: numberEnv("IPC_RECONNECT_MS", 1500),
     ipcRequestTimeoutMs: numberEnv("IPC_REQUEST_TIMEOUT_MS", 12000),
     choicePageSize: numberEnv("CHOICE_PAGE_SIZE", 5),
+    completionReplyImageMaxBytes: numberEnv(
+      "COMPLETION_REPLY_IMAGE_MAX_BYTES",
+      DEFAULT_COMPLETION_REPLY_IMAGE_MAX_BYTES
+    ),
+    completionReplyUploadTtlMs: numberEnv(
+      "COMPLETION_REPLY_UPLOAD_TTL_MS",
+      DEFAULT_COMPLETION_REPLY_UPLOAD_TTL_MS
+    ),
     deviceTrustTtlMs: numberEnv("DEVICE_TRUST_TTL_MS", DEFAULT_DEVICE_TRUST_TTL_MS),
     sessionTtlMs: numberEnv("SESSION_TTL_MS", 30 * 24 * 60 * 60 * 1000),
     pairingCode: process.env.PAIRING_CODE || "",
@@ -7907,9 +8057,7 @@ function loadEnvFile(filePath) {
       if ((value.startsWith("\"") && value.endsWith("\"")) || (value.startsWith("'") && value.endsWith("'"))) {
         value = value.slice(1, -1);
       }
-      if (!process.env[key]) {
-        process.env[key] = value;
-      }
+      process.env[key] = value;
     }
   } catch {
     // Optional env file.

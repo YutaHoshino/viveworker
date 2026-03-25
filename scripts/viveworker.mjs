@@ -200,7 +200,14 @@ async function runSetup(cliOptions) {
 
   progress.update("cli.setup.progress.health");
   const healthy = await waitForHealth(buildLoopbackHealthUrl(publicBaseUrl));
-  progress.done(healthy ? "cli.setup.complete" : "cli.setup.completePending");
+  const pairingReady = healthy
+    ? await waitForExpectedPairing(publicBaseUrl, pairToken)
+    : false;
+  progress.done(healthy && pairingReady ? "cli.setup.complete" : "cli.setup.completePending");
+  if (healthy && !pairingReady) {
+    console.log("");
+    console.log(t(locale, "cli.setup.warning.stalePairingServer", { port }));
+  }
 
   const pairPath = `/app?pairToken=${encodeURIComponent(pairToken)}`;
   const mkcertRootCaFile = resolvePath(
@@ -309,7 +316,14 @@ async function runStart(cliOptions) {
     await execCommand(["launchctl", "kickstart", "-k", `gui/${process.getuid()}/${defaultLabel}`]);
     progress.update("cli.start.progress.health");
     const healthy = await waitForHealth(healthUrl);
-    progress.done(healthy ? "cli.start.launchdStarted" : "cli.start.launchdStartedPending");
+    const pairingReady = healthy && rotatedPairing.rotated
+      ? await waitForExpectedPairing(config.NATIVE_APPROVAL_SERVER_PUBLIC_BASE_URL || "", rotatedPairing.pairingToken)
+      : true;
+    progress.done(healthy && pairingReady ? "cli.start.launchdStarted" : "cli.start.launchdStartedPending");
+    if (healthy && !pairingReady) {
+      console.log("");
+      console.log(t(locale, "cli.setup.warning.stalePairingServer", { port: config.NATIVE_APPROVAL_SERVER_PORT || defaultServerPort }));
+    }
     if (rotatedPairing.rotated) {
       await printPairingInfo(locale, config);
     }
@@ -324,7 +338,14 @@ async function runStart(cliOptions) {
   });
   progress.update("cli.start.progress.health");
   const healthy = await waitForHealth(healthUrl);
-  progress.done(healthy ? "cli.start.bridgeStarted" : "cli.start.bridgeStartedPending");
+  const pairingReady = healthy && rotatedPairing.rotated
+    ? await waitForExpectedPairing(config.NATIVE_APPROVAL_SERVER_PUBLIC_BASE_URL || "", rotatedPairing.pairingToken)
+    : true;
+  progress.done(healthy && pairingReady ? "cli.start.bridgeStarted" : "cli.start.bridgeStartedPending");
+  if (healthy && !pairingReady) {
+    console.log("");
+    console.log(t(locale, "cli.setup.warning.stalePairingServer", { port: config.NATIVE_APPROVAL_SERVER_PORT || defaultServerPort }));
+  }
   if (rotatedPairing.rotated) {
     await printPairingInfo(locale, config);
   }
@@ -982,6 +1003,33 @@ function buildLoopbackHealthUrl(baseUrl) {
   }
 }
 
+function buildLoopbackUrl(baseUrl, pathname, searchParams = null) {
+  if (!baseUrl) {
+    return "";
+  }
+  try {
+    const url = new URL(baseUrl);
+    url.hostname = "127.0.0.1";
+    url.pathname = pathname;
+    url.search = "";
+    url.hash = "";
+    if (searchParams && Object.keys(searchParams).length > 0) {
+      const params = new URLSearchParams();
+      for (const [key, value] of Object.entries(searchParams)) {
+        if (value == null || value === "") {
+          continue;
+        }
+        params.set(key, String(value));
+      }
+      const serialized = params.toString();
+      url.search = serialized ? `?${serialized}` : "";
+    }
+    return url.toString();
+  } catch {
+    return "";
+  }
+}
+
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
@@ -1102,6 +1150,34 @@ async function waitForHealth(url, { attempts = 8, intervalMs = 500 } = {}) {
       await sleep(intervalMs);
     }
   }
+  return false;
+}
+
+async function waitForExpectedPairing(baseUrl, pairToken, { attempts = 8, intervalMs = 500 } = {}) {
+  const token = String(pairToken || "").trim();
+  const manifestUrl = buildLoopbackUrl(baseUrl, "/manifest.webmanifest", { pairToken: token });
+  const expectedStartUrl = `/app?pairToken=${encodeURIComponent(token)}`;
+  if (!token || !manifestUrl) {
+    return false;
+  }
+
+  for (let attempt = 0; attempt < attempts; attempt += 1) {
+    const result = await execCommand(buildHealthCheckArgs(manifestUrl), { ignoreError: true });
+    if (result.ok) {
+      try {
+        const payload = JSON.parse(result.stdout);
+        if (String(payload?.start_url || "").trim() === expectedStartUrl) {
+          return true;
+        }
+      } catch {
+        // Keep retrying while the new bridge instance comes up.
+      }
+    }
+    if (attempt < attempts - 1) {
+      await sleep(intervalMs);
+    }
+  }
+
   return false;
 }
 

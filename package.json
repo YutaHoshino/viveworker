@@ -1,13 +1,22 @@
 {
   "name": "viveworker",
   "version": "0.1.1",
-  "description": "A local iPhone companion for Codex Desktop approvals, plans, questions, and completions.",
+  "description": "Local iPhone companion for Codex Desktop approvals, plan checks, questions, and notifications on your LAN.",
   "author": "Yuta Hoshino <hoshino.lireneo@gmail.com>",
   "license": "MIT",
   "keywords": [
-    "vivecoding",
     "codex",
-    "remote"
+    "codex-desktop",
+    "macos",
+    "iphone",
+    "ios",
+    "pwa",
+    "web-push",
+    "notifications",
+    "approvals",
+    "lan",
+    "companion-app",
+    "vivecoding"
   ],
   "homepage": "https://lp.hazbase.com/",
   "repository": "viveworker-dev/viveworker",

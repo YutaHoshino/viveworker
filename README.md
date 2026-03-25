@@ -2,6 +2,9 @@
 
 # viveworker
 
+[![npm version](https://badge.fury.io/js/viveworker.svg)](https://badge.fury.io/js/viveworker)
+[![License](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)
+
 `viveworker` brings Codex Desktop to your iPhone.
 
 When Codex needs an approval, asks whether to implement a plan, wants you to choose from options, or finishes a task while you are away from your desk, `viveworker` keeps all of that within reach on your phone. Instead of breaking your rhythm, it helps you keep vivecoding going from anywhere in your home or office.
