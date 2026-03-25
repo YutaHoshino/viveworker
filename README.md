@@ -1,3 +1,5 @@
+![viveworker social preview](./assets/app-screenshot.png)
+
 # viveworker
 
 `viveworker` brings Codex Desktop to your iPhone.

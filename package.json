@@ -2,14 +2,15 @@
   "name": "viveworker",
   "version": "0.1.1",
   "description": "A local iPhone companion for Codex Desktop approvals, plans, questions, and completions.",
-  "author": "oeneril <hoshino.lireneo@gmail.com>",
+  "author": "Yuta Hoshino <hoshino.lireneo@gmail.com>",
+  "license": "MIT",
   "keywords": [
     "vivecoding",
     "codex",
     "remote"
   ],
   "homepage": "https://lp.hazbase.com/",
-  "repository": "viveworker/viveworker",
+  "repository": "viveworker-dev/viveworker",
   "type": "module",
   "bin": {
     "viveworker": "./scripts/viveworker.mjs"
