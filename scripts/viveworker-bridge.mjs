@@ -10,6 +10,7 @@ import os from "node:os";
 import path from "node:path";
 import process from "node:process";
 import { createInterface } from "node:readline";
+import { inspect } from "node:util";
 import { fileURLToPath } from "node:url";
 import webPush from "web-push";
 import { DEFAULT_LOCALE, SUPPORTED_LOCALES, localeDisplayName, normalizeLocale, resolveLocalePreference, t } from "../web/i18n.js";
@@ -33,7 +34,7 @@ const PAIRING_RATE_LIMIT_WINDOW_MS = 15 * 60 * 1000;
 const PAIRING_RATE_LIMIT_MAX_ATTEMPTS = 8;
 const DEFAULT_COMPLETION_REPLY_IMAGE_MAX_BYTES = 15 * 1024 * 1024;
 const DEFAULT_COMPLETION_REPLY_UPLOAD_TTL_MS = 24 * 60 * 60 * 1000;
-const MAX_COMPLETION_REPLY_IMAGE_COUNT = 1;
+const MAX_COMPLETION_REPLY_IMAGE_COUNT = 4;
 
 const cli = parseCliArgs(process.argv.slice(2));
 const envFile = resolveEnvFile(cli.envFile);
@@ -58,6 +59,7 @@ const runtime = {
     sourceFile: "",
   },
   rolloutThreadLabels: new Map(),
+  rolloutThreadCwds: new Map(),
   threadStates: new Map(),
   threadOwnerClientIds: new Map(),
   nativeApprovalsByToken: new Map(),
@@ -83,6 +85,7 @@ const restoredPendingPlanStateChanged = restorePendingPlanRequests({ config, run
 const restoredPendingUserInputStateChanged = restorePendingUserInputRequests({ config, runtime, state });
 runtime.recentHistoryItems = normalizeHistoryItems(state.recentHistoryItems ?? [], config.maxHistoryItems);
 runtime.recentTimelineEntries = normalizeTimelineEntries(state.recentTimelineEntries ?? [], config.maxTimelineEntries);
+const restoredTimelineImagePathsStateChanged = await backfillPersistedTimelineImagePaths({ config, runtime, state });
 runtime.historyFileState.offset = Number(state.historyFileOffset) || 0;
 runtime.historyFileState.sourceFile = cleanText(state.historyFileSourceFile ?? "");
 
@@ -216,6 +219,29 @@ function kindTitle(locale, kind) {
   }
 }
 
+function looksLikeGeneratedThreadTitle(value) {
+  const normalized = cleanText(value || "");
+  if (!normalized.includes("|")) {
+    return false;
+  }
+  const prefix = cleanText(normalized.split("|", 1)[0] || "");
+  if (!prefix) {
+    return false;
+  }
+  const titleKeys = [
+    "server.title.userMessage",
+    "server.title.assistantCommentary",
+    "server.title.assistantFinal",
+    "server.title.approval",
+    "server.title.plan",
+    "server.title.planReady",
+    "server.title.choice",
+    "server.title.choiceReadOnly",
+    "server.title.complete",
+  ];
+  return SUPPORTED_LOCALES.some((locale) => titleKeys.some((key) => t(locale, key) === prefix));
+}
+
 function formatLocalizedTitle(locale, baseKeyOrTitle, threadLabel) {
   const baseTitle = baseKeyOrTitle.includes(".") ? t(locale, baseKeyOrTitle) : baseKeyOrTitle;
   return formatTitle(baseTitle, threadLabel);
@@ -277,7 +303,7 @@ function normalizeHistoryItem(raw) {
   const stableId = cleanText(raw.stableId ?? raw.id ?? "");
   const kind = cleanText(raw.kind ?? "");
   const title = cleanText(raw.title ?? "");
-  const messageText = normalizeLongText(raw.messageText ?? "");
+  const messageText = normalizeTimelineMessageText(raw.messageText ?? "");
   const createdAtMs = Number(raw.createdAtMs) || Date.now();
   if (!stableId || !historyKinds.has(kind) || !title) {
     return null;
@@ -292,6 +318,7 @@ function normalizeHistoryItem(raw) {
     threadLabel: cleanText(raw.threadLabel ?? ""),
     summary: normalizeNotificationText(raw.summary ?? "") || formatNotificationBody(messageText, 100) || "",
     messageText,
+    imagePaths: normalizeTimelineImagePaths(raw.imagePaths ?? raw.localImagePaths ?? []),
     createdAtMs,
     readOnly: raw.readOnly !== false,
     primaryLabel: cleanText(raw.primaryLabel ?? "") || "詳細",
@@ -365,7 +392,7 @@ function normalizeTimelineEntry(raw) {
     return null;
   }
 
-  const messageText = normalizeLongText(raw.messageText ?? "");
+  const messageText = normalizeTimelineMessageText(raw.messageText ?? "");
   const summary =
     normalizeNotificationText(raw.summary ?? "") ||
     formatNotificationBody(messageText, 180) ||
@@ -383,6 +410,7 @@ function normalizeTimelineEntry(raw) {
     title,
     summary,
     messageText,
+    imagePaths: normalizeTimelineImagePaths(raw.imagePaths ?? raw.localImagePaths ?? []),
     createdAtMs,
     readOnly: raw.readOnly !== false,
     primaryLabel: cleanText(raw.primaryLabel ?? "") || "詳細",
@@ -728,6 +756,9 @@ async function scanOnce({ config, runtime, state }) {
   }
 
   if (sessionIndexChanged || knownFilesChanged) {
+    if (knownFilesChanged) {
+      runtime.rolloutThreadCwds = new Map();
+    }
     runtime.rolloutThreadLabels = await buildRolloutThreadLabelIndex(runtime.knownFiles, runtime.sessionIndex);
     dirty = refreshResolvedThreadLabels({ config, runtime, state }) || dirty;
   }
@@ -769,6 +800,27 @@ async function scanOnce({ config, runtime, state }) {
       now,
     });
     dirty = dirty || historyTimelineChanged;
+
+    const timelineImageBackfillChanged = await backfillRecentTimelineEntryImages({
+      config,
+      runtime,
+      state,
+    });
+    dirty = dirty || timelineImageBackfillChanged;
+
+    const persistedTimelineImageBackfillChanged = await backfillPersistedTimelineImagePaths({
+      config,
+      runtime,
+      state,
+    });
+    dirty = dirty || persistedTimelineImageBackfillChanged;
+
+    const interruptedTimelineBackfillChanged = backfillInterruptedTimelineEntries({
+      config,
+      runtime,
+      state,
+    });
+    dirty = dirty || interruptedTimelineBackfillChanged;
   }
 
   dirty = cleanupExpiredPlanRequests({ runtime, state, now }) || dirty;
@@ -1181,6 +1233,242 @@ async function processHistoryTimelineFile({ config, runtime, state, now }) {
   return dirty;
 }
 
+async function backfillRecentTimelineEntryImages({ config, runtime, state }) {
+  const candidates = runtime.recentTimelineEntries.filter(
+    (entry) =>
+      cleanText(entry?.kind || "") === "user_message" &&
+      cleanText(entry?.threadId || "") &&
+      normalizeTimelineImagePaths(entry?.imagePaths ?? []).length === 0
+  );
+  if (candidates.length === 0 || !Array.isArray(runtime.knownFiles) || runtime.knownFiles.length === 0) {
+    return false;
+  }
+
+  const fileCache = new Map();
+  let changed = false;
+  const nextEntries = runtime.recentTimelineEntries.map((entry) => ({ ...entry }));
+
+  for (let index = 0; index < nextEntries.length; index += 1) {
+    const entry = nextEntries[index];
+    if (
+      cleanText(entry?.kind || "") !== "user_message" ||
+      !cleanText(entry?.threadId || "") ||
+      normalizeTimelineImagePaths(entry?.imagePaths ?? []).length > 0
+    ) {
+      continue;
+    }
+
+    const hydrated = await hydrateTimelineEntryImagesFromRollout({
+      config,
+      runtime,
+      entry,
+      fileCache,
+    });
+    if (!hydrated) {
+      continue;
+    }
+
+    nextEntries[index] = hydrated;
+    changed = true;
+  }
+
+  if (!changed) {
+    return false;
+  }
+
+  const normalized = normalizeTimelineEntries(nextEntries, config.maxTimelineEntries);
+  runtime.recentTimelineEntries = normalized;
+  state.recentTimelineEntries = normalized;
+  return true;
+}
+
+async function backfillPersistedTimelineImagePaths({ config, runtime, state }) {
+  let changed = false;
+  const nextEntries = [];
+  for (const entry of runtime.recentTimelineEntries) {
+    const nextImagePaths = await normalizePersistedTimelineImagePaths({
+      config,
+      state,
+      imagePaths: entry?.imagePaths ?? [],
+    });
+    if (JSON.stringify(nextImagePaths) !== JSON.stringify(normalizeTimelineImagePaths(entry?.imagePaths ?? []))) {
+      changed = true;
+      nextEntries.push({
+        ...entry,
+        imagePaths: nextImagePaths,
+      });
+      continue;
+    }
+    nextEntries.push(entry);
+  }
+
+  if (!changed) {
+    return false;
+  }
+
+  const normalized = normalizeTimelineEntries(nextEntries, config.maxTimelineEntries);
+  runtime.recentTimelineEntries = normalized;
+  state.recentTimelineEntries = normalized;
+  return true;
+}
+
+function backfillInterruptedTimelineEntries({ config, runtime, state }) {
+  const locale = normalizeLocale(config.defaultLocale) || DEFAULT_LOCALE;
+  let changed = false;
+  const nextEntries = runtime.recentTimelineEntries.map((entry) => {
+    const nextMessageText = normalizeTimelineMessageText(entry?.messageText ?? "", locale);
+    const nextSummary = normalizeNotificationText(entry?.summary ?? "", locale) || formatNotificationBody(nextMessageText, 180);
+    if (nextMessageText === (entry?.messageText ?? "") && nextSummary === (entry?.summary ?? "")) {
+      return entry;
+    }
+    changed = true;
+    return {
+      ...entry,
+      messageText: nextMessageText,
+      summary: nextSummary,
+    };
+  });
+
+  if (!changed) {
+    return false;
+  }
+
+  runtime.recentTimelineEntries = nextEntries;
+  state.recentTimelineEntries = nextEntries;
+  return true;
+}
+
+async function hydrateTimelineEntryImagesFromRollout({ config, runtime, entry, fileCache }) {
+  const threadId = cleanText(entry?.threadId || "");
+  if (!threadId) {
+    return null;
+  }
+
+  const rolloutFile = findRolloutFileForThread(runtime, threadId);
+  if (!rolloutFile) {
+    return null;
+  }
+
+  let recentMessages = fileCache.get(rolloutFile);
+  if (!recentMessages) {
+    recentMessages = await readRecentRolloutUserMessagesWithImages({
+      filePath: rolloutFile,
+      maxBytes: Math.max(config.maxReadBytes * 4, 1024 * 1024),
+    });
+    fileCache.set(rolloutFile, recentMessages);
+  }
+
+  if (!recentMessages.length) {
+    return null;
+  }
+
+  const entryCreatedAtMs = Number(entry?.createdAtMs) || 0;
+  const entryMessageText = normalizeTimelineMessageText(entry?.messageText ?? "");
+  let bestMatch = null;
+
+  for (const candidate of recentMessages) {
+    const candidateCreatedAtMs = Number(candidate?.createdAtMs) || 0;
+    if (entryCreatedAtMs && candidateCreatedAtMs && Math.abs(candidateCreatedAtMs - entryCreatedAtMs) > 15_000) {
+      continue;
+    }
+    if (entryMessageText && normalizeTimelineMessageText(candidate?.messageText ?? "") !== entryMessageText) {
+      continue;
+    }
+
+    if (!bestMatch) {
+      bestMatch = candidate;
+      continue;
+    }
+
+    const previousDiff = Math.abs((Number(bestMatch.createdAtMs) || 0) - entryCreatedAtMs);
+    const nextDiff = Math.abs(candidateCreatedAtMs - entryCreatedAtMs);
+    if (nextDiff < previousDiff) {
+      bestMatch = candidate;
+    }
+  }
+
+  if (!bestMatch || normalizeTimelineImagePaths(bestMatch.imagePaths).length === 0) {
+    return null;
+  }
+
+  const nextMessageText = normalizeTimelineMessageText(bestMatch.messageText ?? entryMessageText);
+  return normalizeTimelineEntry({
+    ...entry,
+    messageText: nextMessageText,
+    summary: formatNotificationBody(nextMessageText, 180) || cleanText(entry.summary || ""),
+    imagePaths: bestMatch.imagePaths,
+  });
+}
+
+function findRolloutFileForThread(runtime, threadId) {
+  const normalizedThreadId = cleanText(threadId || "");
+  if (!normalizedThreadId) {
+    return "";
+  }
+  return (
+    (Array.isArray(runtime.knownFiles) ? runtime.knownFiles : []).find(
+      (filePath) => extractThreadIdFromRolloutPath(filePath) === normalizedThreadId
+    ) || ""
+  );
+}
+
+async function readRecentRolloutUserMessagesWithImages({ filePath, maxBytes }) {
+  let stat;
+  try {
+    stat = await fs.stat(filePath);
+  } catch {
+    return [];
+  }
+
+  const readLength = Math.max(0, Math.min(Number(maxBytes) || 0, stat.size));
+  const startOffset = Math.max(0, stat.size - readLength);
+  let chunk = "";
+  try {
+    const handle = await fs.open(filePath, "r");
+    const buffer = Buffer.alloc(readLength);
+    try {
+      await handle.read(buffer, 0, readLength, startOffset);
+    } finally {
+      await handle.close();
+    }
+    chunk = buffer.toString("utf8");
+  } catch {
+    return [];
+  }
+
+  const lines = chunk.split("\n");
+  if (startOffset > 0 && lines.length > 0) {
+    lines.shift();
+  }
+
+  const matches = [];
+  for (const rawLine of lines) {
+    if (!rawLine.trim()) {
+      continue;
+    }
+
+    let record;
+    try {
+      record = JSON.parse(rawLine);
+    } catch {
+      continue;
+    }
+
+    const extracted = extractRolloutUserMessage(record);
+    if (!extracted || normalizeTimelineImagePaths(extracted.imagePaths).length === 0) {
+      continue;
+    }
+
+    matches.push({
+      createdAtMs: Date.parse(record.timestamp ?? "") || 0,
+      messageText: extracted.messageText,
+      imagePaths: extracted.imagePaths,
+    });
+  }
+
+  return matches;
+}
+
 async function querySqliteTimelineRows({ logsDbFile, cursorId, minTsSec = 0 }) {
   const conditions = [
     `id > ${Math.max(0, Number(cursorId) || 0)}`,
@@ -1272,14 +1560,156 @@ function buildSqliteTimelineEntry({ row, config, runtime }) {
   });
 }
 
-function buildRolloutUserTimelineEntry({ record, fileState, runtime }) {
+function extractRolloutUserMessage(record) {
   const payload = isPlainObject(record?.payload) ? record.payload : null;
-  if (!payload || payload.type !== "message" || payload.role !== "user") {
+  if (!payload) {
+    return null;
+  }
+
+  if (record?.type === "event_msg" && payload.type === "user_message") {
+    const messageText = normalizeTimelineMessageText(payload.message ?? "");
+    const imagePaths = normalizeTimelineImagePaths(payload.local_images ?? payload.localImagePaths ?? []);
+    if (!messageText && imagePaths.length === 0) {
+      return null;
+    }
+    return {
+      itemId: cleanText(payload.turn_id || record.timestamp || ""),
+      messageText,
+      imagePaths,
+    };
+  }
+
+  if (payload.type !== "message" || payload.role !== "user") {
+    return null;
+  }
+
+  if (rolloutContentHasImages(payload.content)) {
+    // Prefer the richer event_msg.user_message entry when images are attached.
     return null;
   }
 
   const messageText = extractRolloutMessageText(payload.content);
   if (!messageText) {
+    return null;
+  }
+
+  return {
+    itemId: cleanText(payload.id || record.timestamp || ""),
+    messageText,
+    imagePaths: [],
+  };
+}
+
+function extractTimestampPrefixFromImagePath(filePath) {
+  const match = path.basename(cleanText(filePath || "")).match(/^(\d{10,})-/u);
+  return match ? Number(match[1]) || 0 : 0;
+}
+
+async function listReplyUploadFiles(config) {
+  try {
+    const entries = await fs.readdir(config.replyUploadsDir, { withFileTypes: true });
+    return entries
+      .filter((entry) => entry.isFile())
+      .map((entry) => {
+        const filePath = path.join(config.replyUploadsDir, entry.name);
+        return {
+          filePath,
+          extension: path.extname(entry.name).toLowerCase(),
+          ts: extractTimestampPrefixFromImagePath(entry.name),
+        };
+      })
+      .filter((entry) => entry.ts > 0);
+  } catch {
+    return [];
+  }
+}
+
+async function findReplyUploadFallback(config, sourcePath, usedPaths = new Set()) {
+  const targetTs = extractTimestampPrefixFromImagePath(sourcePath);
+  const targetExtension = path.extname(cleanText(sourcePath || "")).toLowerCase();
+  if (!targetTs) {
+    return "";
+  }
+
+  const uploads = await listReplyUploadFiles(config);
+  const candidates = uploads
+    .filter((entry) => !usedPaths.has(entry.filePath))
+    .filter((entry) => !targetExtension || entry.extension === targetExtension)
+    .filter((entry) => Math.abs(entry.ts - targetTs) <= 60_000)
+    .sort((left, right) => Math.abs(left.ts - targetTs) - Math.abs(right.ts - targetTs));
+
+  return candidates[0]?.filePath || "";
+}
+
+async function copyTimelineAttachmentToPersistentDir(config, sourcePath) {
+  const normalizedSourcePath = resolvePath(cleanText(sourcePath || ""));
+  if (!normalizedSourcePath) {
+    return "";
+  }
+
+  await fs.mkdir(config.timelineAttachmentsDir, { recursive: true });
+  const extension = path.extname(normalizedSourcePath) || ".img";
+  const destinationPath = path.join(
+    config.timelineAttachmentsDir,
+    `${Date.now()}-${crypto.randomUUID()}${extension}`
+  );
+  await fs.copyFile(normalizedSourcePath, destinationPath);
+  return destinationPath;
+}
+
+async function normalizePersistedTimelineImagePaths({ config, state, imagePaths = [] }) {
+  const normalizedImagePaths = normalizeTimelineImagePaths(imagePaths);
+  if (normalizedImagePaths.length === 0) {
+    return [];
+  }
+
+  const aliases = isPlainObject(state.timelineImagePathAliases) ? state.timelineImagePathAliases : (state.timelineImagePathAliases = {});
+  const usedFallbacks = new Set();
+  const nextPaths = [];
+
+  for (const rawPath of normalizedImagePaths) {
+    const normalizedPath = cleanText(rawPath || "");
+    if (!normalizedPath) {
+      continue;
+    }
+
+    const aliasedPath = cleanText(aliases[normalizedPath] || "");
+    if (aliasedPath) {
+      try {
+        await fs.access(aliasedPath);
+        nextPaths.push(aliasedPath);
+        continue;
+      } catch {
+        // Fall through and repair below.
+      }
+    }
+
+    let existingSourcePath = normalizedPath;
+    try {
+      await fs.access(existingSourcePath);
+    } catch {
+      existingSourcePath = await findReplyUploadFallback(config, normalizedPath, usedFallbacks);
+      if (!existingSourcePath) {
+        continue;
+      }
+      usedFallbacks.add(existingSourcePath);
+    }
+
+    let persistentPath = existingSourcePath;
+    if (!existingSourcePath.startsWith(`${config.timelineAttachmentsDir}${path.sep}`)) {
+      persistentPath = await copyTimelineAttachmentToPersistentDir(config, existingSourcePath);
+    }
+
+    aliases[normalizedPath] = persistentPath;
+    nextPaths.push(persistentPath);
+  }
+
+  return normalizeTimelineImagePaths(nextPaths);
+}
+
+function buildRolloutUserTimelineEntry({ record, fileState, runtime }) {
+  const extracted = extractRolloutUserMessage(record);
+  if (!extracted) {
     return null;
   }
 
@@ -1289,7 +1719,13 @@ function buildRolloutUserTimelineEntry({ record, fileState, runtime }) {
   }
 
   const createdAtMs = Date.parse(record.timestamp ?? "") || Date.now();
-  const stableId = messageTimelineStableId("user_message", threadId, payload.id || record.timestamp, messageText, createdAtMs);
+  const stableId = messageTimelineStableId(
+    "user_message",
+    threadId,
+    extracted.itemId,
+    extracted.messageText,
+    createdAtMs
+  );
   const threadLabel = getNativeThreadLabel({
     runtime,
     conversationId: threadId,
@@ -1303,8 +1739,9 @@ function buildRolloutUserTimelineEntry({ record, fileState, runtime }) {
     threadId,
     threadLabel,
     title: threadLabel || kindTitle(DEFAULT_LOCALE, "user_message"),
-    summary: formatNotificationBody(messageText, 180) || messageText,
-    messageText,
+    summary: formatNotificationBody(extracted.messageText, 180) || extracted.messageText,
+    messageText: extracted.messageText,
+    imagePaths: extracted.imagePaths,
     createdAtMs,
     readOnly: true,
   });
@@ -1316,7 +1753,7 @@ function buildHistoryUserTimelineEntry({ record, runtime, config }) {
   }
 
   const threadId = cleanText(record.session_id || record.sessionId || "");
-  const messageText = normalizeLongText(record.text ?? "");
+  const messageText = normalizeTimelineMessageText(record.text ?? "");
   if (!threadId || !messageText) {
     return null;
   }
@@ -3303,19 +3740,142 @@ function runCurl(args) {
 }
 
 const IMPLEMENT_PLAN_PROMPT_PREFIX = "PLEASE IMPLEMENT THIS PLAN:";
+const COMPLETION_REPLY_WORKSPACE_STAGE_DIR = ".viveworker-attachments";
+const COMPLETION_REPLY_WORKSPACE_STAGE_TTL_MS = 60 * 60 * 1000;
+const COMPLETION_REPLY_WORKSPACE_STAGE_CLEANUP_DELAY_MS = 10 * 60 * 1000;
 
 function buildImplementPlanPrompt(planContent) {
   return `${IMPLEMENT_PLAN_PROMPT_PREFIX}\n${formatPlanDetailText(planContent)}`;
 }
 
-function buildTextInput(text) {
-  return [
-    {
+function buildTurnInput(text, options = {}) {
+  const items = [];
+  const normalizedText = String(text ?? "");
+  const localImagePaths = Array.isArray(options?.localImagePaths)
+    ? options.localImagePaths
+        .map((value) => cleanText(value || ""))
+        .filter(Boolean)
+    : [];
+
+  if (normalizedText) {
+    items.push({
       type: "text",
-      text: String(text ?? ""),
+      text: normalizedText,
       text_elements: [],
-    },
-  ];
+    });
+  }
+
+  for (const localImagePath of localImagePaths) {
+    items.push({
+      type: "local_image",
+      path: localImagePath,
+    });
+  }
+
+  return items;
+}
+
+function buildComposerStyleLocalImageInput(text, localImagePaths = []) {
+  const items = [];
+  const normalizedText = String(text ?? "");
+
+  if (normalizedText) {
+    items.push({
+      type: "text",
+      text: normalizedText,
+      text_elements: [],
+    });
+  }
+
+  for (const localImagePath of localImagePaths) {
+    const normalizedPath = cleanText(localImagePath || "");
+    if (!normalizedPath) {
+      continue;
+    }
+    items.push({
+      type: "localImage",
+      path: normalizedPath,
+    });
+  }
+
+  return items;
+}
+
+function buildComposerStyleImageInput(text, imageDataUrls = []) {
+  const items = [];
+  const normalizedText = String(text ?? "");
+
+  if (normalizedText) {
+    items.push({
+      type: "text",
+      text: normalizedText,
+      text_elements: [],
+    });
+  }
+
+  for (const imageUrl of imageDataUrls) {
+    const normalizedUrl = cleanText(imageUrl || "");
+    if (!normalizedUrl) {
+      continue;
+    }
+    items.push({
+      type: "image",
+      url: normalizedUrl,
+    });
+  }
+
+  return items;
+}
+
+function buildUserInputPayload(items, finalOutputJsonSchema = null) {
+  return {
+    items: Array.isArray(items) ? items : [],
+    final_output_json_schema: finalOutputJsonSchema ?? null,
+  };
+}
+
+function buildTurnContentItems(text, imageDataUrls = []) {
+  const items = [];
+  const normalizedText = String(text ?? "");
+  if (normalizedText) {
+    items.push({
+      type: "input_text",
+      text: normalizedText,
+    });
+  }
+  for (const imageUrl of imageDataUrls) {
+    if (!imageUrl) {
+      continue;
+    }
+    items.push({
+      type: "input_image",
+      image_url: imageUrl,
+      detail: "original",
+    });
+  }
+  return items;
+}
+
+function buildTurnImageItems(text, imageDataUrls = []) {
+  const items = [];
+  const normalizedText = String(text ?? "");
+  if (normalizedText) {
+    items.push({
+      type: "text",
+      text: normalizedText,
+      text_elements: [],
+    });
+  }
+  for (const imageUrl of imageDataUrls) {
+    if (!imageUrl) {
+      continue;
+    }
+    items.push({
+      type: "image",
+      image_url: imageUrl,
+    });
+  }
+  return items;
 }
 
 function buildRequestedCollaborationMode(threadState, requestedMode = "default") {
@@ -3336,6 +3896,49 @@ function buildRequestedCollaborationMode(threadState, requestedMode = "default")
       developer_instructions: null,
     },
   };
+}
+
+function normalizeIpcErrorMessage(errorValue) {
+  if (typeof errorValue === "string") {
+    return cleanText(errorValue || "") || "ipc-request-failed";
+  }
+  if (errorValue instanceof Error) {
+    return cleanText(errorValue.message || "") || errorValue.name || "ipc-request-failed";
+  }
+  if (Array.isArray(errorValue)) {
+    try {
+      return JSON.stringify(errorValue);
+    } catch {
+      return "ipc-request-failed";
+    }
+  }
+  if (isPlainObject(errorValue)) {
+    const candidateFields = [
+      errorValue.message,
+      errorValue.error,
+      errorValue.details,
+      errorValue.reason,
+    ];
+    const directMessage = candidateFields
+      .map((value) => (typeof value === "string" ? cleanText(value || "") : ""))
+      .find(Boolean);
+    if (directMessage) {
+      return directMessage;
+    }
+    try {
+      return JSON.stringify(errorValue);
+    } catch {
+      return "ipc-request-failed";
+    }
+  }
+  if (errorValue && typeof errorValue === "object") {
+    try {
+      return JSON.stringify(errorValue);
+    } catch {
+      return "ipc-request-failed";
+    }
+  }
+  return cleanText(String(errorValue ?? "")) || "ipc-request-failed";
 }
 
 function buildDefaultCollaborationMode(threadState) {
@@ -3414,6 +4017,18 @@ class NativeIpcClient {
       },
       conversationId,
       ownerClientId
+    );
+  }
+
+  async startTurnDirect(conversationId, turnStartParams, ownerClientId = null) {
+    const targetClientId =
+      ownerClientId ??
+      this.runtime.threadOwnerClientIds.get(conversationId) ??
+      null;
+    return this.sendRequest(
+      "turn/start",
+      buildDirectTurnStartPayload(conversationId, turnStartParams),
+      { targetClientId }
     );
   }
 
@@ -3573,7 +4188,14 @@ class NativeIpcClient {
       clearTimeout(pending.timeout);
 
       if (message.resultType === "error") {
-        pending.reject(new Error(message.error || "ipc-request-failed"));
+        console.log(
+          `[ipc] error method=${cleanText(message.method || "") || "unknown"} requestId=${cleanText(message.requestId || "") || "unknown"} payload=${inspect(message.error, { depth: 6, breakLength: 160 })}`
+        );
+        const error = new Error(normalizeIpcErrorMessage(message.error));
+        if (message.error && typeof message.error === "object") {
+          error.ipcError = message.error;
+        }
+        pending.reject(error);
         return;
       }
 
@@ -3958,6 +4580,64 @@ function getNativeThreadLabel({ runtime, conversationId, cwd }) {
     return truncate(cleanText(path.basename(cwd)), 90) || shortId(normalizedConversationId);
   }
   return shortId(normalizedConversationId) || "Codex task";
+}
+
+async function findRolloutThreadCwd(runtime, conversationId) {
+  const normalizedConversationId = cleanText(conversationId || "");
+  if (!normalizedConversationId) {
+    return "";
+  }
+
+  const cachedCwd = resolvePath(cleanText(runtime.rolloutThreadCwds?.get(normalizedConversationId) || ""));
+  if (cachedCwd) {
+    return cachedCwd;
+  }
+
+  const knownFiles = Array.isArray(runtime.knownFiles) ? runtime.knownFiles : [];
+  if (!knownFiles.length) {
+    return "";
+  }
+
+  const prioritizedFiles = [];
+  const fallbackFiles = [];
+  for (const filePath of knownFiles) {
+    if (extractThreadIdFromRolloutPath(filePath) === normalizedConversationId) {
+      prioritizedFiles.push(filePath);
+    } else {
+      fallbackFiles.push(filePath);
+    }
+  }
+
+  const filesToInspect = prioritizedFiles.length ? [...prioritizedFiles, ...fallbackFiles] : fallbackFiles;
+  for (const filePath of filesToInspect) {
+    const metadata = await extractRolloutThreadMetadata(filePath);
+    if (cleanText(metadata?.threadId || "") !== normalizedConversationId) {
+      continue;
+    }
+    const resolvedCwd = resolvePath(cleanText(metadata?.cwd || ""));
+    if (resolvedCwd) {
+      runtime.rolloutThreadCwds.set(normalizedConversationId, resolvedCwd);
+      return resolvedCwd;
+    }
+  }
+
+  return "";
+}
+
+async function resolveConversationCwd(runtime, conversationId) {
+  const normalizedConversationId = cleanText(conversationId || "");
+  if (!normalizedConversationId) {
+    return "";
+  }
+
+  const threadStateCwd = resolvePath(
+    cleanText(runtime.threadStates.get(normalizedConversationId)?.cwd || "")
+  );
+  if (threadStateCwd) {
+    return threadStateCwd;
+  }
+
+  return await findRolloutThreadCwd(runtime, normalizedConversationId);
 }
 
 function formatNativeApprovalMessage(kind, params, locale = config?.defaultLocale || DEFAULT_LOCALE) {
@@ -5119,6 +5799,28 @@ function buildOperationalTimelineEntries(runtime, state, config, locale) {
   return items.filter(Boolean);
 }
 
+function sanitizeTimelineThreadFilterLabel(value, threadId = "") {
+  const normalized = cleanText(value || "");
+  if (!normalized) {
+    return "";
+  }
+
+  const normalizedThreadId = cleanText(threadId || "");
+  if (normalizedThreadId && (normalized === normalizedThreadId || normalized === shortId(normalizedThreadId))) {
+    return "";
+  }
+
+  if (/^[0-9a-f]{8}(?:-[0-9a-f]{4}){0,4}$/iu.test(normalized)) {
+    return "";
+  }
+
+  if (looksLikeGeneratedThreadTitle(normalized)) {
+    return "";
+  }
+
+  return normalized;
+}
+
 function buildTimelineThreads(entries, config) {
   const byThread = new Map();
   for (const entry of entries) {
@@ -5126,11 +5828,14 @@ function buildTimelineThreads(entries, config) {
     if (!threadId) {
       continue;
     }
+    const preferredLabel =
+      sanitizeTimelineThreadFilterLabel(entry.threadLabel || "", threadId) ||
+      t(DEFAULT_LOCALE, "server.fallback.codexTask");
     const existing = byThread.get(threadId);
     if (!existing) {
       byThread.set(threadId, {
         id: threadId,
-        label: cleanText(entry.threadLabel || entry.title || "") || t(DEFAULT_LOCALE, "server.fallback.codexTask"),
+        label: preferredLabel,
         latestAtMs: Number(entry.createdAtMs) || 0,
         preview: cleanText(entry.summary || entry.title || ""),
         entryCount: 1,
@@ -5140,7 +5845,7 @@ function buildTimelineThreads(entries, config) {
     existing.entryCount += 1;
     if (Number(entry.createdAtMs) > Number(existing.latestAtMs)) {
       existing.latestAtMs = Number(entry.createdAtMs) || existing.latestAtMs;
-      existing.label = cleanText(entry.threadLabel || entry.title || "") || existing.label;
+      existing.label = preferredLabel || existing.label;
       existing.preview = cleanText(entry.summary || entry.title || "") || existing.preview;
     }
   }
@@ -5166,6 +5871,7 @@ function buildTimelineResponse(runtime, state, config, locale) {
     threadId: entry.threadId,
     threadLabel: entry.threadLabel,
     summary: entry.summary,
+    imageUrls: buildTimelineEntryImageUrls(entry),
     createdAtMs: entry.createdAtMs,
   }));
 
@@ -5223,6 +5929,49 @@ function buildPreviousApprovalContext(runtime, approval) {
 
   return {
     kind: previousEntry.kind,
+    createdAtMs: Number(previousEntry.createdAtMs) || 0,
+    messageHtml: renderMessageHtml(sourceText, "<p></p>"),
+  };
+}
+
+function buildInterruptedTimelineContext(runtime, entry, locale) {
+  if (!runtime || !isTurnAbortedDisplayMessage(entry?.messageText)) {
+    return null;
+  }
+
+  const threadId = cleanText(entry?.threadId || "");
+  const interruptedCreatedAtMs = Number(entry?.createdAtMs) || 0;
+  if (!threadId || !interruptedCreatedAtMs) {
+    return null;
+  }
+
+  const previousEntry = runtime.recentTimelineEntries
+    .filter((candidate) => {
+      if (!timelineMessageKinds.has(cleanText(candidate?.kind || ""))) {
+        return false;
+      }
+      if (cleanText(candidate?.threadId || "") !== threadId) {
+        return false;
+      }
+      if (Number(candidate?.createdAtMs) <= 0 || Number(candidate?.createdAtMs) >= interruptedCreatedAtMs) {
+        return false;
+      }
+      return !isTurnAbortedDisplayMessage(candidate?.messageText);
+    })
+    .sort((left, right) => Number(right?.createdAtMs ?? 0) - Number(left?.createdAtMs ?? 0))[0];
+
+  if (!previousEntry) {
+    return null;
+  }
+
+  const sourceText = normalizeLongText(previousEntry.messageText || previousEntry.summary || "");
+  if (!sourceText) {
+    return null;
+  }
+
+  return {
+    kind: previousEntry.kind,
+    label: t(locale, "detail.interruptedTask"),
     createdAtMs: Number(previousEntry.createdAtMs) || 0,
     messageHtml: renderMessageHtml(sourceText, "<p></p>"),
   };
@@ -5371,19 +6120,32 @@ function buildHistoryDetail(item, locale, runtime = null) {
     threadLabel: item.threadLabel || "",
     createdAtMs: Number(item.createdAtMs) || 0,
     messageHtml: renderMessageHtml(item.messageText, `<p>${escapeHtml(t(locale, "detail.detailUnavailable"))}</p>`),
+    interruptNotice: interruptedDetailNotice(item.messageText, locale),
     readOnly: true,
     reply: replyEnabled
       ? {
           enabled: true,
           supportsPlanMode: true,
-          supportsImages: false,
+          supportsImages: true,
         }
       : null,
     actions: [],
   };
 }
 
-function buildTimelineMessageDetail(entry, locale) {
+function buildTimelineEntryImageUrls(entry) {
+  const imagePaths = normalizeTimelineImagePaths(entry?.imagePaths ?? []);
+  if (imagePaths.length === 0) {
+    return [];
+  }
+  const token = cleanText(entry?.token || "");
+  if (!token) {
+    return [];
+  }
+  return imagePaths.map((_, index) => `/api/timeline/${encodeURIComponent(token)}/images/${index}`);
+}
+
+function buildTimelineMessageDetail(entry, locale, runtime = null) {
   return {
     kind: entry.kind,
     token: entry.token,
@@ -5392,6 +6154,9 @@ function buildTimelineMessageDetail(entry, locale) {
     threadLabel: entry.threadLabel || "",
     createdAtMs: Number(entry.createdAtMs) || 0,
     messageHtml: renderMessageHtml(entry.messageText, `<p>${escapeHtml(t(locale, "detail.detailUnavailable"))}</p>`),
+    imageUrls: buildTimelineEntryImageUrls(entry),
+    previousContext: buildInterruptedTimelineContext(runtime, entry, locale),
+    interruptNotice: interruptedDetailNotice(entry.messageText, locale),
     readOnly: true,
     actions: [],
   };
@@ -5484,8 +6249,224 @@ function normalizeCompletionReplyLocalImagePaths(paths) {
     .filter(Boolean);
 }
 
+function guessImageMimeTypeFromPath(filePath) {
+  const extension = path.extname(cleanText(filePath || "")).toLowerCase();
+  const mimeTypes = {
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".png": "image/png",
+    ".webp": "image/webp",
+    ".gif": "image/gif",
+    ".heic": "image/heic",
+    ".heif": "image/heif",
+  };
+  return mimeTypes[extension] || "application/octet-stream";
+}
+
+async function buildCompletionReplyImageDataUrls(localImagePaths) {
+  const urls = [];
+  for (const filePath of localImagePaths) {
+    const buffer = await fs.readFile(filePath);
+    const mimeType = guessImageMimeTypeFromPath(filePath);
+    urls.push(`data:${mimeType};base64,${buffer.toString("base64")}`);
+  }
+  return urls;
+}
+
+function scheduleBestEffortFileCleanup(paths, delayMs = COMPLETION_REPLY_WORKSPACE_STAGE_CLEANUP_DELAY_MS) {
+  if (!Array.isArray(paths) || paths.length === 0) {
+    return;
+  }
+
+  const timer = setTimeout(async () => {
+    await Promise.all(
+      paths.map(async (filePath) => {
+        try {
+          await fs.rm(filePath, { force: true });
+        } catch {
+          // Ignore best-effort cleanup errors.
+        }
+      })
+    );
+  }, delayMs);
+  timer.unref?.();
+}
+
+function buildDirectTurnStartPayload(conversationId, turnStartParams = {}) {
+  return {
+    threadId: cleanText(conversationId || ""),
+    input: Array.isArray(turnStartParams.input) ? turnStartParams.input : [],
+    cwd: cleanText(turnStartParams.cwd || "") || null,
+    approvalPolicy: turnStartParams.approvalPolicy ?? null,
+    approvalsReviewer: cleanText(turnStartParams.approvalsReviewer || "") || "user",
+    sandboxPolicy: turnStartParams.sandboxPolicy ?? null,
+    model: turnStartParams.model ?? null,
+    serviceTier: turnStartParams.serviceTier ?? null,
+    effort: turnStartParams.effort ?? null,
+    summary: cleanText(turnStartParams.summary || "") || "none",
+    personality: turnStartParams.personality ?? null,
+    outputSchema: turnStartParams.outputSchema ?? null,
+    collaborationMode: isPlainObject(turnStartParams.collaborationMode)
+      ? turnStartParams.collaborationMode
+      : null,
+    attachments: Array.isArray(turnStartParams.attachments) ? turnStartParams.attachments : [],
+  };
+}
+
+async function cleanupExpiredWorkspaceReplyImages(stageDir) {
+  try {
+    const entries = await fs.readdir(stageDir, { withFileTypes: true });
+    const cutoffMs = Date.now() - COMPLETION_REPLY_WORKSPACE_STAGE_TTL_MS;
+    await Promise.all(
+      entries.map(async (entry) => {
+        if (!entry.isFile()) {
+          return;
+        }
+        const filePath = path.join(stageDir, entry.name);
+        try {
+          const stat = await fs.stat(filePath);
+          if (Number(stat.mtimeMs) < cutoffMs) {
+            await fs.rm(filePath, { force: true });
+          }
+        } catch {
+          // Ignore best-effort cleanup errors.
+        }
+      })
+    );
+  } catch {
+    // Ignore missing stage dir.
+  }
+}
+
+async function stageCompletionReplyImagesForThreadCwd(localImagePaths, cwd) {
+  const normalizedCwd = resolvePath(cleanText(cwd || ""));
+  if (!normalizedCwd || !Array.isArray(localImagePaths) || localImagePaths.length === 0) {
+    return [];
+  }
+
+  const stageDir = path.join(normalizedCwd, COMPLETION_REPLY_WORKSPACE_STAGE_DIR);
+  await cleanupExpiredWorkspaceReplyImages(stageDir);
+  await fs.mkdir(stageDir, { recursive: true });
+
+  const stagedPaths = [];
+  for (const sourcePath of localImagePaths) {
+    const extension = path.extname(cleanText(sourcePath || "")) || ".img";
+    const stagedPath = path.join(stageDir, `${Date.now()}-${crypto.randomUUID()}${extension}`);
+    await fs.copyFile(sourcePath, stagedPath);
+    stagedPaths.push(stagedPath);
+  }
+  return stagedPaths;
+}
+
+async function buildCompletionReplyTurnCandidates(
+  messageText,
+  localImagePaths,
+  collaborationMode,
+  cwd = null,
+  workspaceLocalImagePaths = []
+) {
+  const baseCandidate = {
+    attachments: [],
+    cwd: cleanText(cwd || "") || null,
+    approvalPolicy: null,
+    sandboxPolicy: null,
+    model: null,
+    serviceTier: null,
+    effort: null,
+    summary: "none",
+    personality: null,
+    outputSchema: null,
+    collaborationMode,
+  };
+
+  if (!localImagePaths.length) {
+    return [
+      {
+        name: "text-only",
+        transport: "thread-follower",
+        turnStartParams: {
+          ...baseCandidate,
+          input: buildTurnInput(messageText),
+          localImagePaths: [],
+          local_image_paths: [],
+          remoteImageUrls: [],
+          remote_image_urls: [],
+        },
+      },
+    ];
+  }
+
+  const imageDataUrls = await buildCompletionReplyImageDataUrls(localImagePaths);
+  const workspaceImagePaths = normalizeCompletionReplyLocalImagePaths(workspaceLocalImagePaths);
+  const candidates = [];
+
+  if (workspaceImagePaths.length) {
+    candidates.push({
+      // Match the Desktop composer path as closely as possible:
+      // text + localImage(path) passed through the normal thread-follower route.
+      name: "workspace-local-image-composer-input",
+      transport: "thread-follower",
+      turnStartParams: {
+        ...baseCandidate,
+        input: buildComposerStyleLocalImageInput(messageText, workspaceImagePaths),
+        localImagePaths: [],
+        local_image_paths: [],
+        remoteImageUrls: [],
+        remote_image_urls: [],
+      },
+    });
+  }
+
+  candidates.push(
+    {
+      // This mirrors the desktop composer input items before submission:
+      // text + image(url=data:image/...).
+      name: "image-data-url-composer-input",
+      transport: "thread-follower",
+      turnStartParams: {
+        ...baseCandidate,
+        input: buildComposerStyleImageInput(messageText, imageDataUrls),
+        localImagePaths: [],
+        local_image_paths: [],
+        remoteImageUrls: [],
+        remote_image_urls: [],
+      },
+    },
+    {
+      name: "local-image-composer-input",
+      transport: "thread-follower",
+      turnStartParams: {
+        ...baseCandidate,
+        input: buildComposerStyleLocalImageInput(messageText, localImagePaths),
+        localImagePaths: [],
+        local_image_paths: [],
+        remoteImageUrls: [],
+        remote_image_urls: [],
+      },
+    },
+    {
+      // This currently reaches Codex, but the image is dropped before the final
+      // UserInput core submission. Keep it last as a diagnostic fallback.
+      name: "remote-image-urls-data-url",
+      transport: "thread-follower",
+      turnStartParams: {
+        ...baseCandidate,
+        input: buildTurnInput(messageText),
+        localImagePaths: [],
+        local_image_paths: [],
+        remoteImageUrls: imageDataUrls,
+        remote_image_urls: imageDataUrls,
+      },
+    }
+  );
+
+  return candidates;
+}
+
 async function handleCompletionReply({
+  config,
   runtime,
+  state,
   completionItem,
   text,
   planMode = false,
@@ -5520,34 +6501,97 @@ async function handleCompletionReply({
   }
 
   const threadState = runtime.threadStates.get(conversationId) ?? null;
+  const resolvedCwd = await resolveConversationCwd(runtime, conversationId);
+  const stagedWorkspaceImagePaths = await stageCompletionReplyImagesForThreadCwd(
+    normalizedLocalImagePaths,
+    resolvedCwd
+  );
+  const timelineImageAliases = [];
+  if (normalizedLocalImagePaths.length > 0) {
+    const persistentTimelineImagePaths = await normalizePersistedTimelineImagePaths({
+      config,
+      state,
+      imagePaths: normalizedLocalImagePaths,
+    });
+    for (let index = 0; index < persistentTimelineImagePaths.length; index += 1) {
+      const persistentPath = cleanText(persistentTimelineImagePaths[index] || "");
+      if (!persistentPath) {
+        continue;
+      }
+      const uploadPath = cleanText(normalizedLocalImagePaths[index] || "");
+      const stagedPath = cleanText(stagedWorkspaceImagePaths[index] || "");
+      if (uploadPath) {
+        timelineImageAliases.push([uploadPath, persistentPath]);
+      }
+      if (stagedPath) {
+        timelineImageAliases.push([stagedPath, persistentPath]);
+      }
+    }
+  }
   const collaborationMode = buildRequestedCollaborationMode(
     threadState,
     planMode ? "plan" : "default"
   );
-  const turnStartParams = {
-    input: buildTextInput(messageText),
-    attachments: [],
-    localImagePaths: normalizedLocalImagePaths,
-    local_image_paths: normalizedLocalImagePaths,
-    remoteImageUrls: [],
-    remote_image_urls: [],
-    cwd: null,
-    approvalPolicy: null,
-    sandboxPolicy: null,
-    model: null,
-    serviceTier: null,
-    effort: null,
-    summary: "none",
-    personality: null,
-    outputSchema: null,
+  const turnCandidates = await buildCompletionReplyTurnCandidates(
+    messageText,
+    normalizedLocalImagePaths,
     collaborationMode,
-  };
-
-  await runtime.ipcClient.startTurn(
-    conversationId,
-    turnStartParams,
-    runtime.threadOwnerClientIds.get(conversationId) ?? null
+    resolvedCwd,
+    stagedWorkspaceImagePaths
   );
+  let lastError = null;
+  const ownerClientId = runtime.threadOwnerClientIds.get(conversationId) ?? null;
+
+  for (const candidate of turnCandidates) {
+    try {
+      console.log(
+        `[completion-reply] try candidate=${candidate.name} transport=${cleanText(candidate.transport || "thread-follower")} owner=${cleanText(ownerClientId || "") || "none"} images=${normalizedLocalImagePaths.length} workspaceImages=${stagedWorkspaceImagePaths.length} cwd=${cleanText(resolvedCwd || "") || "none"}`
+      );
+      if (candidate.transport === "direct-turn-start" && ownerClientId) {
+        await runtime.ipcClient.startTurnDirect(
+          conversationId,
+          candidate.turnStartParams,
+          ownerClientId
+        );
+      } else {
+        await runtime.ipcClient.startTurn(
+          conversationId,
+          candidate.turnStartParams,
+          ownerClientId
+        );
+      }
+      console.log(
+        `[completion-reply] success candidate=${candidate.name} transport=${cleanText(candidate.transport || "thread-follower")}`
+      );
+      if (timelineImageAliases.length > 0) {
+        const aliases = isPlainObject(state.timelineImagePathAliases)
+          ? state.timelineImagePathAliases
+          : (state.timelineImagePathAliases = {});
+        for (const [sourcePath, persistentPath] of timelineImageAliases) {
+          aliases[sourcePath] = persistentPath;
+        }
+        await saveState(config.stateFile, state);
+      }
+      scheduleBestEffortFileCleanup(stagedWorkspaceImagePaths);
+      return;
+    } catch (error) {
+      lastError = error;
+      console.log(
+        `[completion-reply] failed candidate=${candidate.name} transport=${cleanText(candidate.transport || "thread-follower")} error=${normalizeIpcErrorMessage(error)} raw=${inspect(error?.ipcError ?? error, { depth: 6, breakLength: 160 })}`
+      );
+    }
+  }
+
+  await Promise.all(
+    stagedWorkspaceImagePaths.map(async (filePath) => {
+      try {
+        await fs.rm(filePath, { force: true });
+      } catch {
+        // Ignore best-effort cleanup errors.
+      }
+    })
+  );
+  throw lastError || new Error("completion-reply-image-send-failed");
 }
 
 async function handlePlanDecision({ config, runtime, state, planRequest, decision }) {
@@ -5565,7 +6609,7 @@ async function handlePlanDecision({ config, runtime, state, planRequest, decisio
           planRequest.threadState
       );
       const turnStartParams = {
-        input: buildTextInput(buildImplementPlanPrompt(planRequest.rawPlanContent)),
+        input: buildTurnInput(buildImplementPlanPrompt(planRequest.rawPlanContent)),
         attachments: [],
         cwd: null,
         approvalPolicy: null,
@@ -5648,7 +6692,7 @@ async function handleNativeApprovalDecision({ config, runtime, state, approval, 
 function buildApiItemDetail({ config, runtime, state, kind, token, locale }) {
   if (timelineMessageKinds.has(kind)) {
     const entry = timelineEntryByToken(runtime, token, kind);
-    return entry ? buildTimelineMessageDetail(entry, locale) : null;
+    return entry ? buildTimelineMessageDetail(entry, locale, runtime) : null;
   }
   if (kind === "approval") {
     const approval = runtime.nativeApprovalsByToken.get(token);
@@ -5677,6 +6721,16 @@ function buildApiItemDetail({ config, runtime, state, kind, token, locale }) {
 
   const historyItem = historyItemByToken(runtime, kind, token);
   return historyItem ? buildHistoryDetail(historyItem, locale, runtime) : null;
+}
+
+function resolveTimelineEntryImagePath(runtime, token, index) {
+  const entry = timelineEntryByToken(runtime, token);
+  if (!entry) {
+    return "";
+  }
+  const imagePaths = normalizeTimelineImagePaths(entry.imagePaths ?? []);
+  const resolvedIndex = Math.max(0, Number(index) || 0);
+  return cleanText(imagePaths[resolvedIndex] || "");
 }
 
 function resolveWebAsset(urlPath) {
@@ -5711,6 +6765,17 @@ function contentTypeForFile(filePath) {
       return "image/svg+xml";
     case ".png":
       return "image/png";
+    case ".jpg":
+    case ".jpeg":
+      return "image/jpeg";
+    case ".webp":
+      return "image/webp";
+    case ".gif":
+      return "image/gif";
+    case ".heic":
+      return "image/heic";
+    case ".heif":
+      return "image/heif";
     default:
       return "application/octet-stream";
   }
@@ -6096,7 +7161,10 @@ function createNativeApprovalServer({ config, runtime, state }) {
             await saveState(config.stateFile, state);
             return writeJson(res, 410, { error: "push-subscription-expired" });
           }
-          return writeJson(res, 500, { error: error.message });
+          return writeJson(res, 500, {
+            error: error.message,
+            ipcError: error.ipcError ?? null,
+          });
         }
       }
 
@@ -6155,6 +7223,34 @@ function createNativeApprovalServer({ config, runtime, state }) {
         return writeJson(res, 200, buildTimelineResponse(runtime, state, config, locale));
       }
 
+      const apiTimelineImageMatch = url.pathname.match(/^\/api\/timeline\/([^/]+)\/images\/(\d+)$/u);
+      if (apiTimelineImageMatch && req.method === "GET") {
+        const session = requireApiSession(req, res, config, state);
+        if (!session) {
+          return;
+        }
+        const token = decodeURIComponent(apiTimelineImageMatch[1]);
+        const index = Number(apiTimelineImageMatch[2]) || 0;
+        const filePath = resolveTimelineEntryImagePath(runtime, token, index);
+        if (!filePath) {
+          res.statusCode = 404;
+          res.end("not-found");
+          return;
+        }
+        try {
+          const body = await fs.readFile(filePath);
+          res.statusCode = 200;
+          res.setHeader("Content-Type", contentTypeForFile(filePath));
+          res.setHeader("Cache-Control", "private, max-age=300");
+          res.end(body);
+          return;
+        } catch {
+          res.statusCode = 404;
+          res.end("not-found");
+          return;
+        }
+      }
+
       const apiItemMatch = url.pathname.match(/^\/api\/items\/([^/]+)\/([^/]+)$/u);
       if (apiItemMatch && req.method === "GET") {
         const session = requireApiSession(req, res, config, state);
@@ -6190,7 +7286,9 @@ function createNativeApprovalServer({ config, runtime, state }) {
             ? await stageCompletionReplyImages(config, req)
             : await parseJsonBody(req);
           await handleCompletionReply({
+            config,
             runtime,
+            state,
             completionItem,
             text: payload?.text ?? "",
             planMode: payload?.planMode === true,
@@ -6210,8 +7308,7 @@ function createNativeApprovalServer({ config, runtime, state }) {
             error.message === "completion-reply-image-limit" ||
             error.message === "completion-reply-image-invalid-type" ||
             error.message === "completion-reply-image-too-large" ||
-            error.message === "completion-reply-image-invalid-upload" ||
-            error.message === "completion-reply-image-disabled"
+            error.message === "completion-reply-image-invalid-upload"
           ) {
             return writeJson(res, 400, { error: error.message });
           }
@@ -6934,10 +8031,6 @@ async function stageCompletionReplyImages(config, req) {
   const files = formData
     .getAll("image")
     .filter((value) => typeof File !== "undefined" && value instanceof File);
-
-  if (files.length > 0) {
-    throw new Error("completion-reply-image-disabled");
-  }
 
   if (files.length > MAX_COMPLETION_REPLY_IMAGE_COUNT) {
     throw new Error("completion-reply-image-limit");
@@ -7932,6 +9025,9 @@ function buildConfig(cli) {
     codexLogsDbFile: resolvePath(process.env.CODEX_LOGS_DB_FILE || ""),
     stateFile,
     replyUploadsDir: resolvePath(process.env.REPLY_UPLOADS_DIR || path.join(path.dirname(stateFile), "uploads")),
+    timelineAttachmentsDir: resolvePath(
+      process.env.TIMELINE_ATTACHMENTS_DIR || path.join(path.dirname(stateFile), "timeline-attachments")
+    ),
     pollIntervalMs: numberEnv("POLL_INTERVAL_MS", 2500),
     replaySeconds: numberEnv("REPLAY_SECONDS", 300),
     sessionIndexRefreshMs: numberEnv("SESSION_INDEX_REFRESH_MS", 30000),
@@ -8171,6 +9267,7 @@ async function loadState(stateFile) {
       pendingUserInputRequests: parsed.pendingUserInputRequests ?? {},
       recentHistoryItems: parsed.recentHistoryItems ?? [],
       recentTimelineEntries: parsed.recentTimelineEntries ?? [],
+      timelineImagePathAliases: parsed.timelineImagePathAliases ?? {},
       sqliteCompletionCursorId: Number(parsed.sqliteCompletionCursorId) || 0,
       sqliteCompletionSourceFile: cleanText(parsed.sqliteCompletionSourceFile ?? ""),
       sqliteMessageCursorId: Number(parsed.sqliteMessageCursorId) || 0,
@@ -8195,6 +9292,7 @@ async function loadState(stateFile) {
       pendingUserInputRequests: {},
       recentHistoryItems: [],
       recentTimelineEntries: [],
+      timelineImagePathAliases: {},
       sqliteCompletionCursorId: 0,
       sqliteCompletionSourceFile: "",
       sqliteMessageCursorId: 0,
@@ -8281,6 +9379,10 @@ function sanitizeResolvedThreadLabel(value, conversationId) {
     return "";
   }
 
+  if (looksLikeGeneratedThreadTitle(normalized)) {
+    return "";
+  }
+
   return normalized;
 }
 
@@ -8318,12 +9420,30 @@ function extractRolloutMessageText(content) {
     content
       .map((entry) =>
         isPlainObject(entry) && (entry.type === "input_text" || entry.type === "output_text")
-          ? String(entry.text ?? "")
+          ? normalizeTimelineMessageText(entry.text ?? "")
           : ""
       )
       .filter(Boolean)
       .join("\n")
   );
+}
+
+function rolloutContentHasImages(content) {
+  if (!Array.isArray(content)) {
+    return false;
+  }
+  return content.some((entry) => {
+    if (!isPlainObject(entry)) {
+      return false;
+    }
+    if (entry.type === "input_image" || entry.type === "image" || entry.type === "localImage") {
+      return true;
+    }
+    if (entry.type !== "input_text" && entry.type !== "output_text") {
+      return false;
+    }
+    return isInlineImagePlaceholderText(entry.text ?? "");
+  });
 }
 
 function deriveRolloutThreadTitleCandidate(text) {
@@ -8706,8 +9826,50 @@ function normalizeLongText(value) {
     .trim();
 }
 
-function normalizeNotificationText(value) {
-  return normalizeLongText(stripNotificationMarkup(value))
+function replaceTurnAbortedMarkup(value, locale = DEFAULT_LOCALE) {
+  const raw = String(value || "");
+  if (!/<turn_aborted>/iu.test(raw)) {
+    return raw;
+  }
+  return raw.replace(/<turn_aborted>[\s\S]*?<\/turn_aborted>/giu, t(locale, "server.message.turnAborted"));
+}
+
+function isTurnAbortedDisplayMessage(value) {
+  const normalized = normalizeLongText(String(value || ""));
+  const englishMessage = normalizeLongText(t(DEFAULT_LOCALE, "server.message.turnAborted"));
+  const japaneseMessage = normalizeLongText(t("ja", "server.message.turnAborted"));
+  return /<turn_aborted>/iu.test(String(value || "")) || normalized === englishMessage || normalized === japaneseMessage;
+}
+
+function interruptedDetailNotice(value, locale = DEFAULT_LOCALE) {
+  return isTurnAbortedDisplayMessage(value) ? t(locale, "detail.turnAbortedNotice") : "";
+}
+
+function stripInlineImagePlaceholderMarkup(value) {
+  return String(value || "")
+    .replace(/<image\b[^>]*>/giu, "")
+    .replace(/<\/image>/giu, "");
+}
+
+function isInlineImagePlaceholderText(value) {
+  return cleanText(stripInlineImagePlaceholderMarkup(value)) === "" && /<\/?image\b/iu.test(String(value || ""));
+}
+
+function normalizeTimelineMessageText(value, locale = DEFAULT_LOCALE) {
+  return normalizeLongText(replaceTurnAbortedMarkup(stripInlineImagePlaceholderMarkup(value), locale));
+}
+
+function normalizeTimelineImagePaths(value) {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+  return value
+    .map((entry) => cleanText(entry || ""))
+    .filter(Boolean);
+}
+
+function normalizeNotificationText(value, locale = DEFAULT_LOCALE) {
+  return normalizeLongText(replaceTurnAbortedMarkup(stripNotificationMarkup(value), locale))
     .replace(/\n{2,}/gu, "\n")
     .trim();
 }
@@ -8783,6 +9945,8 @@ function stripNotificationMarkup(value) {
   return String(value || "")
     .replace(/^\s*<\/?proposed_plan>\s*$/gimu, "")
     .replace(/<\/?proposed_plan>/giu, "")
+    .replace(/<image\b[^>]*>/giu, "")
+    .replace(/<\/image>/giu, "")
     .replace(/!\[([^\]]*)\]\(([^)]+)\)/gu, "$1")
     .replace(/\[([^\]]+)\]\(([^)]+)\)/gu, "$1")
     .replace(/^\s{0,3}#{1,6}\s+/gmu, "")
@@ -8982,6 +10146,7 @@ async function main() {
     if (
       migratedPairedDevicesStateChanged ||
       restoredPendingPlanStateChanged ||
+      restoredTimelineImagePathsStateChanged ||
       restoredPendingUserInputStateChanged ||
       refreshResolvedThreadLabels({ config, runtime, state })
     ) {

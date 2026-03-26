@@ -27,6 +27,7 @@ viveworker.env
 .tmp-viveworker-state.json
 passkey/
 npm_recovery_codes.txt
+.viveworker-attachments/
 
 # Local launchd output
 launchd/*.plist

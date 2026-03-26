@@ -1,4 +1,4 @@
-const CACHE_NAME = "viveworker-v5";
+const CACHE_NAME = "viveworker-v6";
 const APP_ASSETS = ["/app.css", "/app.js", "/i18n.js"];
 const APP_ROUTES = new Set(["/", "/app", "/app/"]);
 const CACHED_PATHS = new Set(APP_ASSETS);

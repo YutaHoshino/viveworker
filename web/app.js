@@ -7,6 +7,7 @@ const INITIAL_DETECTED_LOCALE = detectBrowserLocale();
 const TIMELINE_MESSAGE_KINDS = new Set(["user_message", "assistant_commentary", "assistant_final"]);
 const TIMELINE_OPERATIONAL_KINDS = new Set(["approval", "plan", "plan_ready", "choice", "completion"]);
 const THREAD_FILTER_INTERACTION_DEFER_MS = 8000;
+const MAX_COMPLETION_REPLY_IMAGE_COUNT = 4;
 
 const state = {
   session: null,
@@ -40,6 +41,7 @@ const state = {
   pushError: "",
   deviceNotice: "",
   deviceError: "",
+  imageViewer: null,
   serviceWorkerRegistration: null,
   installGuideOpen: false,
   logoutConfirmOpen: false,
@@ -622,6 +624,7 @@ async function renderShell() {
         ${desktop ? renderDesktopWorkspace(detail) : renderMobileWorkspace(detail)}
       </main>
       ${desktop || state.detailOpen || isSettingsSubpageOpen() ? "" : renderBottomTabs()}
+      ${renderImageViewerModal()}
       ${renderInstallGuideModal()}
       ${renderLogoutConfirmModal()}
     </div>
@@ -773,12 +776,7 @@ function normalizeReplyMode(value) {
   return normalizeClientText(value).toLowerCase() === "plan" ? "plan" : "default";
 }
 
-const COMPLETION_REPLY_IMAGE_SUPPORT = false;
-
 function normalizeCompletionReplyAttachment(value) {
-  if (!COMPLETION_REPLY_IMAGE_SUPPORT) {
-    return null;
-  }
   if (!value || typeof value !== "object") {
     return null;
   }
@@ -800,9 +798,6 @@ function normalizeCompletionReplyAttachment(value) {
 }
 
 function createCompletionReplyAttachment(file) {
-  if (!COMPLETION_REPLY_IMAGE_SUPPORT) {
-    return null;
-  }
   if (!(typeof File !== "undefined" && file instanceof File)) {
     return null;
   }
@@ -836,7 +831,7 @@ function getCompletionReplyDraft(token) {
     return {
       text: "",
       sentText: "",
-      attachment: null,
+      attachments: [],
       mode: "default",
       notice: "",
       error: "",
@@ -851,7 +846,7 @@ function getCompletionReplyDraft(token) {
   return {
     text: String(draft.text ?? ""),
     sentText: normalizeClientText(draft.sentText ?? ""),
-    attachment: normalizeCompletionReplyAttachment(draft.attachment),
+    attachments: normalizeCompletionReplyAttachments(draft.attachments ?? draft.attachment),
     mode: normalizeReplyMode(draft.mode),
     notice: normalizeClientText(draft.notice),
     error: normalizeClientText(draft.error),
@@ -879,26 +874,44 @@ function normalizeCompletionReplyWarning(value) {
   };
 }
 
+function normalizeCompletionReplyAttachments(values) {
+  const rawValues = Array.isArray(values)
+    ? values
+    : values
+      ? [values]
+      : [];
+  return rawValues
+    .map((value) => normalizeCompletionReplyAttachment(value))
+    .filter(Boolean);
+}
+
 function setCompletionReplyDraft(token, partialDraft) {
   if (!token) {
     return;
   }
   const previousStoredDraft = state.completionReplyDrafts?.[token] || {};
-  const previousAttachment = normalizeCompletionReplyAttachment(previousStoredDraft.attachment);
+  const previousAttachments = normalizeCompletionReplyAttachments(
+    previousStoredDraft.attachments ?? previousStoredDraft.attachment
+  );
   const nextDraft = {
     ...getCompletionReplyDraft(token),
     ...(partialDraft || {}),
   };
-  const nextAttachment = Object.prototype.hasOwnProperty.call(partialDraft || {}, "attachment")
-    ? normalizeCompletionReplyAttachment(partialDraft?.attachment)
-    : normalizeCompletionReplyAttachment(nextDraft.attachment);
-  if (previousAttachment?.previewUrl && previousAttachment.previewUrl !== nextAttachment?.previewUrl) {
-    releaseCompletionReplyAttachment(previousAttachment);
+  const nextAttachments = Object.prototype.hasOwnProperty.call(partialDraft || {}, "attachments")
+    ? normalizeCompletionReplyAttachments(partialDraft?.attachments)
+    : Object.prototype.hasOwnProperty.call(partialDraft || {}, "attachment")
+      ? normalizeCompletionReplyAttachments(partialDraft?.attachment)
+      : normalizeCompletionReplyAttachments(nextDraft.attachments);
+  const nextPreviewUrls = new Set(nextAttachments.map((attachment) => attachment.previewUrl).filter(Boolean));
+  for (const previousAttachment of previousAttachments) {
+    if (previousAttachment?.previewUrl && !nextPreviewUrls.has(previousAttachment.previewUrl)) {
+      releaseCompletionReplyAttachment(previousAttachment);
+    }
   }
   state.completionReplyDrafts[token] = {
     text: String(nextDraft.text ?? ""),
     sentText: normalizeClientText(nextDraft.sentText ?? ""),
-    attachment: nextAttachment,
+    attachments: nextAttachments,
     mode: normalizeReplyMode(nextDraft.mode),
     notice: normalizeClientText(nextDraft.notice),
     error: normalizeClientText(nextDraft.error),
@@ -913,7 +926,11 @@ function clearCompletionReplyDraft(token) {
   if (!token || !state.completionReplyDrafts?.[token]) {
     return;
   }
-  releaseCompletionReplyAttachment(state.completionReplyDrafts[token]?.attachment);
+  for (const attachment of normalizeCompletionReplyAttachments(
+    state.completionReplyDrafts[token]?.attachments ?? state.completionReplyDrafts[token]?.attachment
+  )) {
+    releaseCompletionReplyAttachment(attachment);
+  }
   delete state.completionReplyDrafts[token];
 }
 
@@ -1497,6 +1514,7 @@ function renderTimelineEntry(entry, { desktop }) {
   const kindClassName = escapeHtml(kindInfo.tone || "neutral");
   const kindNameClass = escapeHtml(String(item.kind || "item").replace(/_/gu, "-"));
   const isMessageLike = TIMELINE_MESSAGE_KINDS.has(item.kind) || item.kind === "completion";
+  const imageUrls = Array.isArray(item.imageUrls) ? item.imageUrls.filter(Boolean) : [];
   const primaryText = isMessageLike
     ? item.summary || fallbackSummaryForKind(item.kind, entry.status)
     : item.title || L("common.untitledItem");
@@ -1526,9 +1544,36 @@ function renderTimelineEntry(entry, { desktop }) {
       <div class="timeline-entry__body">
         <p class="timeline-entry__title">${escapeHtml(primaryText)}</p>
         ${secondaryText ? `<p class="timeline-entry__summary">${escapeHtml(secondaryText)}</p>` : ""}
+        ${renderTimelineEntryImageStrip(imageUrls)}
       </div>
       ${statusLabel ? `<div class="timeline-entry__footer"><span class="timeline-entry__status">${escapeHtml(statusLabel)}</span></div>` : ""}
     </button>
+  `;
+}
+
+function renderTimelineEntryImageStrip(imageUrls) {
+  if (!Array.isArray(imageUrls) || imageUrls.length === 0) {
+    return "";
+  }
+
+  return `
+    <div class="timeline-entry__images" aria-hidden="true">
+      ${imageUrls
+        .slice(0, 4)
+        .map(
+          (imageUrl, index) => `
+            <span class="timeline-entry__image-frame">
+              <img
+                class="timeline-entry__image"
+                src="${escapeHtml(imageUrl)}"
+                alt="${escapeHtml(L("detail.imageAlt", { index: index + 1 }))}"
+                loading="lazy"
+              >
+            </span>
+          `
+        )
+        .join("")}
+    </div>
   `;
 }
 
@@ -1544,23 +1589,82 @@ function timelineEntryThreadLabel(item, isMessage) {
   return title.includes(threadLabel) ? "" : threadLabel;
 }
 
+function sanitizeThreadLabelForDisplay(label = "", threadId = "") {
+  const normalizedLabel = normalizeClientText(label || "");
+  if (!normalizedLabel) {
+    return "";
+  }
+
+  const normalizedThreadId = normalizeClientText(threadId || "");
+  if (normalizedThreadId && (normalizedLabel === normalizedThreadId || normalizedLabel === normalizedThreadId.slice(0, 8))) {
+    return "";
+  }
+
+  if (/^[0-9a-f]{8}(?:-[0-9a-f]{4}){0,4}$/i.test(normalizedLabel)) {
+    return "";
+  }
+
+  if (looksLikeGeneratedThreadTitle(normalizedLabel)) {
+    return "";
+  }
+
+  return normalizedLabel;
+}
+
+function looksLikeGeneratedThreadTitle(label = "") {
+  const normalizedLabel = normalizeClientText(label || "");
+  if (!normalizedLabel.includes("|")) {
+    return false;
+  }
+  const prefix = normalizeClientText(normalizedLabel.split("|", 1)[0] || "");
+  if (!prefix) {
+    return false;
+  }
+  const titleKeys = [
+    "server.title.userMessage",
+    "server.title.assistantCommentary",
+    "server.title.assistantFinal",
+    "server.title.approval",
+    "server.title.plan",
+    "server.title.planReady",
+    "server.title.choice",
+    "server.title.choiceReadOnly",
+    "server.title.complete",
+  ];
+  return SUPPORTED_LOCALES.some((locale) => titleKeys.some((key) => t(locale, key) === prefix));
+}
+
 function resolvedThreadLabel(threadId, explicitLabel = "") {
-  const normalizedLabel = normalizeClientText(explicitLabel || "");
+  const normalizedThreadId = normalizeClientText(threadId || "");
+  const normalizedLabel = sanitizeThreadLabelForDisplay(explicitLabel || "", normalizedThreadId);
   if (normalizedLabel) {
     return normalizedLabel;
   }
-  const normalizedThreadId = normalizeClientText(threadId || "");
   if (!normalizedThreadId) {
     return "";
   }
   const timelineThreads = Array.isArray(state.timeline?.threads) ? state.timeline.threads : [];
   const matchingThread = timelineThreads.find((thread) => thread.id === normalizedThreadId);
-  const fallbackLabel = normalizeClientText(matchingThread?.label || "");
+  const fallbackLabel = sanitizeThreadLabelForDisplay(matchingThread?.label || "", normalizedThreadId);
   return fallbackLabel || "";
 }
 
+function compactDropdownThreadLabel(label) {
+  const normalized = normalizeClientText(label || "");
+  if (!normalized) {
+    return "";
+  }
+
+  const glyphs = Array.from(normalized);
+  if (glyphs.length <= 28) {
+    return normalized;
+  }
+
+  return `${glyphs.slice(0, 28).join("")}...`;
+}
+
 function dropdownThreadLabel(threadId, explicitLabel = "") {
-  return resolvedThreadLabel(threadId, explicitLabel) || L("timeline.unknownThread");
+  return compactDropdownThreadLabel(resolvedThreadLabel(threadId, explicitLabel)) || L("timeline.unknownThread");
 }
 
 function formatTimelineTimestamp(value) {
@@ -2198,9 +2302,11 @@ function renderStandardDetailDesktop(detail) {
       <h2 class="detail-title detail-title--desktop">${escapeHtml(detailDisplayTitle(detail))}</h2>
       ${detail.readOnly ? "" : renderDetailLead(detail, kindInfo)}
       ${renderPreviousContextCard(detail)}
+      ${renderInterruptedDetailNotice(detail)}
       <section class="detail-card detail-card--body ${spaciousBodyDetail ? "detail-card--message-body" : ""}">
         <div class="detail-body ${spaciousBodyDetail ? "detail-body--message " : ""}markdown">${detail.messageHtml || ""}</div>
       </section>
+      ${renderDetailImageGallery(detail)}
       ${renderCompletionReplyComposer(detail)}
       ${detail.readOnly ? "" : renderActionButtons(detail.actions || [])}
     </div>
@@ -2216,10 +2322,12 @@ function renderStandardDetailMobile(detail) {
         <div class="mobile-detail-scroll mobile-detail-scroll--detail">
           ${renderDetailMetaRow(detail, kindInfo, { mobile: true })}
           ${renderPreviousContextCard(detail, { mobile: true })}
+          ${renderInterruptedDetailNotice(detail, { mobile: true })}
           <section class="detail-card detail-card--body detail-card--mobile ${spaciousBodyDetail ? "detail-card--message-body" : ""}">
             ${detail.readOnly ? "" : renderDetailLead(detail, kindInfo, { mobile: true })}
             <div class="detail-body ${spaciousBodyDetail ? "detail-body--message " : ""}markdown">${detail.messageHtml || ""}</div>
           </section>
+          ${renderDetailImageGallery(detail, { mobile: true })}
           ${renderCompletionReplyComposer(detail, { mobile: true })}
         </div>
         ${detail.readOnly ? "" : renderActionButtons(detail.actions || [], { mobileSticky: true })}
@@ -2255,9 +2363,24 @@ function renderDetailLead(detail, kindInfo, options = {}) {
   `;
 }
 
+function renderInterruptedDetailNotice(detail, options = {}) {
+  const message = normalizeClientText(detail?.interruptNotice || "");
+  if (!message) {
+    return "";
+  }
+  return `
+    <section class="detail-card detail-card--interrupt ${options.mobile ? "detail-card--mobile" : ""}">
+      <p class="detail-interrupt-copy">
+        <span class="detail-interrupt-copy__icon" aria-hidden="true">${renderIcon("pending")}</span>
+        <span>${escapeHtml(message)}</span>
+      </p>
+    </section>
+  `;
+}
+
 function renderPreviousContextCard(detail, options = {}) {
   const context = detail?.previousContext;
-  if (!context?.messageHtml || detail.kind !== "approval") {
+  if (!context?.messageHtml) {
     return "";
   }
 
@@ -2268,12 +2391,46 @@ function renderPreviousContextCard(detail, options = {}) {
       <div class="detail-context-card__header">
         <div class="detail-context-card__eyebrow">
           <span class="detail-context-card__icon" aria-hidden="true">${renderIcon(contextKind.icon)}</span>
-          <span>${escapeHtml(L("detail.previousMessage"))}</span>
+          <span>${escapeHtml(context.label || L("detail.previousMessage"))}</span>
         </div>
         ${timestampLabel ? `<span class="detail-context-card__time">${escapeHtml(timestampLabel)}</span>` : ""}
       </div>
       <p class="detail-context-card__kind">${escapeHtml(contextKind.label)}</p>
       <div class="detail-body detail-body--context markdown">${context.messageHtml}</div>
+    </section>
+  `;
+}
+
+function renderDetailImageGallery(detail, options = {}) {
+  const imageUrls = Array.isArray(detail?.imageUrls) ? detail.imageUrls.filter(Boolean) : [];
+  if (imageUrls.length === 0) {
+    return "";
+  }
+
+  return `
+    <section class="detail-card detail-card--images ${options.mobile ? "detail-card--mobile" : ""}">
+      <div class="detail-image-grid">
+        ${imageUrls
+          .map((imageUrl, index) => {
+            const altText = L("detail.imageAlt", { index: index + 1 });
+            return `
+              <button
+                class="detail-image-link"
+                type="button"
+                data-open-image-viewer="${escapeHtml(imageUrl)}"
+                data-image-alt="${escapeHtml(altText)}"
+              >
+                <img
+                  class="detail-image"
+                  src="${escapeHtml(imageUrl)}"
+                  alt="${escapeHtml(altText)}"
+                  loading="lazy"
+                >
+              </button>
+            `;
+          })
+          .join("")}
+      </div>
     </section>
   `;
 }
@@ -2294,8 +2451,7 @@ function renderCompletionReplyComposer(detail, options = {}) {
   const warningTimestamp = draft.warning?.createdAtMs ? formatTimelineTimestamp(draft.warning.createdAtMs) : "";
   const showCollapsedState =
     draft.collapsedAfterSend && Boolean(draft.notice) && !draft.error && !draft.warning && !draft.sending;
-  const attachmentName = draft.attachment?.name ? escapeHtml(draft.attachment.name) : "";
-  const attachmentPreviewUrl = draft.attachment?.previewUrl ? escapeHtml(draft.attachment.previewUrl) : "";
+  const attachments = Array.isArray(draft.attachments) ? draft.attachments : [];
 
   return `
     <section class="detail-card detail-card--reply ${options.mobile ? "detail-card--mobile" : ""}">
@@ -2352,86 +2508,93 @@ function renderCompletionReplyComposer(detail, options = {}) {
               <form class="reply-composer__form" data-completion-reply-form data-token="${escapeHtml(detail.token)}">
                 <label class="field reply-field">
                   <span class="field-label">${escapeHtml(L("reply.fieldLabel"))}</span>
-                  <textarea
-                    class="reply-field__input"
-                    name="text"
-                    rows="4"
-                    placeholder="${escapeHtml(L("reply.placeholder"))}"
-                    data-completion-reply-textarea
-                    data-reply-token="${escapeHtml(detail.token)}"
-                  >${escapeHtml(draft.text)}</textarea>
+                  <div class="reply-field__shell">
+                    <textarea
+                      class="reply-field__input"
+                      name="text"
+                      rows="4"
+                      placeholder="${escapeHtml(L("reply.placeholder"))}"
+                      data-completion-reply-textarea
+                      data-reply-token="${escapeHtml(detail.token)}"
+                    >${escapeHtml(draft.text)}</textarea>
+                    <div class="reply-field__toolbar">
+                      ${
+                        detail.reply?.supportsImages
+                          ? `
+                            <label class="reply-attachment-trigger" aria-label="${escapeHtml(L(attachments.length ? "reply.imageAddMore" : "reply.imageAdd"))}">
+                              <input
+                                class="reply-attachment-trigger__input"
+                                type="file"
+                                accept="image/*"
+                                multiple
+                                data-reply-image-input
+                                data-reply-token="${escapeHtml(detail.token)}"
+                              >
+                              <span class="reply-attachment-trigger__icon" aria-hidden="true">${renderIcon("clip")}</span>
+                              ${
+                                attachments.length
+                                  ? `<span class="reply-attachment-trigger__count">${escapeHtml(String(attachments.length))}</span>`
+                                  : ""
+                              }
+                            </label>
+                          `
+                          : ""
+                      }
+                      ${
+                        detail.reply?.supportsPlanMode
+                          ? `
+                            <label class="reply-mode-toggle" data-reply-mode-switch>
+                              <span class="reply-mode-toggle__label">${escapeHtml(L("reply.mode.planLabel"))}</span>
+                              <input
+                                class="reply-mode-toggle__input"
+                                type="checkbox"
+                                ${planMode ? "checked" : ""}
+                                data-reply-mode-toggle
+                                data-reply-token="${escapeHtml(detail.token)}"
+                              >
+                              <span class="reply-mode-toggle__track" aria-hidden="true">
+                                <span class="reply-mode-toggle__thumb"></span>
+                              </span>
+                            </label>
+                          `
+                          : ""
+                      }
+                    </div>
+                  </div>
                 </label>
                 ${
                   detail.reply?.supportsImages
                     ? `
-                      <div class="reply-attachment-field">
-                        <div class="reply-attachment-field__header">
-                          <span class="field-label">${escapeHtml(L("reply.imageLabel"))}</span>
-                          ${
-                            draft.attachment
-                              ? `
-                                <button
-                                  class="secondary secondary--compact"
-                                  type="button"
-                                  data-reply-image-remove
-                                  data-reply-token="${escapeHtml(detail.token)}"
-                                >
-                                  ${escapeHtml(L("reply.imageRemove"))}
-                                </button>
-                              `
-                              : ""
-                          }
-                        </div>
-                        <label class="reply-attachment-picker">
-                          <input
-                            class="reply-attachment-picker__input"
-                            type="file"
-                            accept="image/*"
-                            data-reply-image-input
-                            data-reply-token="${escapeHtml(detail.token)}"
-                          >
-                          <span class="reply-attachment-picker__label">${escapeHtml(L(draft.attachment ? "reply.imageReplace" : "reply.imageAdd"))}</span>
-                          <span class="reply-attachment-picker__hint">${escapeHtml(L("reply.imageHint"))}</span>
-                        </label>
-                        ${
-                          draft.attachment
-                            ? `
-                              <div class="reply-image-preview">
-                                <img class="reply-image-preview__image" src="${attachmentPreviewUrl}" alt="${attachmentName}">
-                                <div class="reply-image-preview__copy">
-                                  <p class="reply-image-preview__name">${attachmentName}</p>
-                                  <p class="reply-image-preview__meta">${escapeHtml(L("reply.imageAttached"))}</p>
-                                </div>
-                              </div>
-                            `
-                            : ""
-                        }
-                      </div>
-                    `
-                    : ""
-                }
-                ${
-                  detail.reply?.supportsPlanMode
-                    ? `
-                      <label class="reply-mode-switch" data-reply-mode-switch>
-                        <input
-                          class="reply-mode-switch__input"
-                          type="checkbox"
-                          ${planMode ? "checked" : ""}
-                          data-reply-mode-toggle
-                          data-reply-token="${escapeHtml(detail.token)}"
-                        >
-                        <span class="reply-mode-switch__track" aria-hidden="true">
-                          <span class="reply-mode-switch__thumb"></span>
-                        </span>
-                        <span class="reply-mode-switch__copy">
-                          <span class="reply-mode-switch__title">
-                            <span>${escapeHtml(L("reply.mode.planLabel"))}</span>
-                            <span class="reply-mode-switch__state">${escapeHtml(L(planMode ? "reply.mode.on" : "reply.mode.off"))}</span>
-                          </span>
-                          <span class="reply-mode-switch__hint">${escapeHtml(L(planMode ? "reply.mode.planHint" : "reply.mode.defaultHint"))}</span>
-                        </span>
-                      </label>
+                      ${
+                        attachments.length
+                          ? `
+                            <div class="reply-image-preview-list">
+                              ${attachments
+                                .map(
+                                  (attachment, index) => `
+                                    <div class="reply-image-preview">
+                                      <img class="reply-image-preview__image" src="${escapeHtml(attachment.previewUrl || "")}" alt="${escapeHtml(attachment.name || "")}">
+                                      <div class="reply-image-preview__copy">
+                                        <p class="reply-image-preview__name">${escapeHtml(attachment.name || "")}</p>
+                                        <p class="reply-image-preview__meta">${escapeHtml(L("reply.imageAttached"))}</p>
+                                      </div>
+                                      <button
+                                        class="secondary secondary--compact"
+                                        type="button"
+                                        data-reply-image-remove
+                                        data-reply-token="${escapeHtml(detail.token)}"
+                                        data-reply-image-index="${index}"
+                                      >
+                                        ${escapeHtml(L("reply.imageRemove"))}
+                                      </button>
+                                    </div>
+                                  `
+                                )
+                                .join("")}
+                            </div>
+                          `
+                          : ""
+                      }
                     `
                     : ""
                 }
@@ -2753,6 +2916,26 @@ function renderInstallGuideModal() {
   `;
 }
 
+function renderImageViewerModal() {
+  const imageViewer = state.imageViewer;
+  if (!imageViewer?.url) {
+    return "";
+  }
+
+  return `
+    <div class="modal-backdrop modal-backdrop--image-viewer" data-close-image-viewer>
+      <section class="image-viewer" role="dialog" aria-modal="true" aria-label="${escapeHtml(imageViewer.alt || L("common.detail"))}">
+        <div class="image-viewer__chrome">
+          <button class="secondary image-viewer__close" type="button" data-close-image-viewer>${escapeHtml(L("common.back"))}</button>
+        </div>
+        <div class="image-viewer__body">
+          <img class="image-viewer__image" src="${escapeHtml(imageViewer.url)}" alt="${escapeHtml(imageViewer.alt || "")}">
+        </div>
+      </section>
+    </div>
+  `;
+}
+
 function renderLogoutConfirmModal() {
   if (!state.logoutConfirmOpen || !state.session?.authenticated) {
     return "";
@@ -2912,6 +3095,18 @@ function bindShellInteractions() {
     });
   }
 
+  for (const button of document.querySelectorAll("[data-open-image-viewer]")) {
+    button.addEventListener("click", async (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      state.imageViewer = {
+        url: button.dataset.openImageViewer || "",
+        alt: button.dataset.imageAlt || "",
+      };
+      await renderShell();
+    });
+  }
+
   for (const button of document.querySelectorAll("[data-back-to-list]")) {
     button.addEventListener("click", async () => {
       clearChoiceLocalDraftForItem(state.currentItem);
@@ -2979,25 +3174,44 @@ function bindShellInteractions() {
   for (const input of document.querySelectorAll("[data-reply-image-input][data-reply-token]")) {
     input.addEventListener("change", async () => {
       const token = input.dataset.replyToken || "";
-      const [file] = Array.from(input.files || []);
-      const nextAttachment = createCompletionReplyAttachment(file);
-      if (!nextAttachment && file) {
+      const files = Array.from(input.files || []);
+      const nextAttachments = files.map((file) => createCompletionReplyAttachment(file)).filter(Boolean);
+      if (files.length > 0 && nextAttachments.length !== files.length) {
         setCompletionReplyDraft(token, {
           error: L("error.completionReplyImageInvalidType"),
           notice: "",
           warning: null,
           confirmOverride: false,
         });
+        input.value = "";
+        await renderShell();
+        return;
+      }
+      const existingAttachments = getCompletionReplyDraft(token).attachments || [];
+      const mergedAttachments = [...existingAttachments, ...nextAttachments].slice(0, MAX_COMPLETION_REPLY_IMAGE_COUNT);
+      if (existingAttachments.length + nextAttachments.length > MAX_COMPLETION_REPLY_IMAGE_COUNT) {
+        for (const attachment of nextAttachments.slice(Math.max(0, MAX_COMPLETION_REPLY_IMAGE_COUNT - existingAttachments.length))) {
+          releaseCompletionReplyAttachment(attachment);
+        }
+        setCompletionReplyDraft(token, {
+          error: L("error.completionReplyImageLimit", { count: MAX_COMPLETION_REPLY_IMAGE_COUNT }),
+          notice: "",
+          warning: null,
+          confirmOverride: false,
+          attachments: mergedAttachments,
+        });
+        input.value = "";
         await renderShell();
         return;
       }
       setCompletionReplyDraft(token, {
-        attachment: nextAttachment,
+        attachments: mergedAttachments,
         notice: "",
         error: "",
         warning: null,
         confirmOverride: false,
       });
+      input.value = "";
       await renderShell();
     });
   }
@@ -3005,8 +3219,13 @@ function bindShellInteractions() {
   for (const button of document.querySelectorAll("[data-reply-image-remove][data-reply-token]")) {
     button.addEventListener("click", async () => {
       const token = button.dataset.replyToken || "";
+      const index = Number(button.dataset.replyImageIndex ?? "-1");
+      const existingAttachments = getCompletionReplyDraft(token).attachments || [];
       setCompletionReplyDraft(token, {
-        attachment: null,
+        attachments:
+          index >= 0
+            ? existingAttachments.filter((_, attachmentIndex) => attachmentIndex !== index)
+            : [],
         notice: "",
         error: "",
         warning: null,
@@ -3189,14 +3408,16 @@ function bindShellInteractions() {
         requestBody.set("text", text);
         requestBody.set("planMode", draft.mode === "plan" ? "true" : "false");
         requestBody.set("force", draft.confirmOverride === true ? "true" : "false");
-        if (COMPLETION_REPLY_IMAGE_SUPPORT && draft.attachment?.file) {
-          requestBody.append("image", draft.attachment.file, draft.attachment.name || draft.attachment.file.name);
+        for (const attachment of draft.attachments || []) {
+          if (attachment?.file) {
+            requestBody.append("image", attachment.file, attachment.name || attachment.file.name);
+          }
         }
         await apiPost(`/api/items/completion/${encodeURIComponent(token)}/reply`, requestBody);
         setCompletionReplyDraft(token, {
           text: "",
           sentText: text,
-          attachment: null,
+          attachments: [],
           mode: draft.mode,
           sending: false,
           error: "",
@@ -3211,7 +3432,7 @@ function bindShellInteractions() {
           setCompletionReplyDraft(token, {
             text,
             sentText: "",
-            attachment: draft.attachment,
+            attachments: draft.attachments,
             mode: draft.mode,
             sending: false,
             notice: "",
@@ -3226,7 +3447,7 @@ function bindShellInteractions() {
         setCompletionReplyDraft(token, {
           text,
           sentText: "",
-          attachment: draft.attachment,
+          attachments: draft.attachments,
           mode: draft.mode,
           sending: false,
           notice: "",
@@ -3245,6 +3466,16 @@ function bindShellInteractions() {
 }
 
 function bindSharedUi(renderFn) {
+  for (const button of document.querySelectorAll("[data-close-image-viewer]")) {
+    button.addEventListener("click", async (event) => {
+      if (button.classList.contains("modal-backdrop") && event.target.closest(".image-viewer")) {
+        return;
+      }
+      state.imageViewer = null;
+      await renderFn();
+    });
+  }
+
   for (const button of document.querySelectorAll("[data-install-guide-open]")) {
     button.addEventListener("click", async () => {
       state.installGuideOpen = true;
@@ -3811,6 +4042,8 @@ function renderIcon(name) {
       return `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.85" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3.5c3.8 0 7 3.8 7 8.5s-3.2 8.5-7 8.5-7-3.8-7-8.5 3.2-8.5 7-8.5Z"/><path d="M5.8 9h12.4"/><path d="M5.8 15h12.4"/><path d="M12 3.8c1.9 2 3 4.9 3 8.2s-1.1 6.2-3 8.2c-1.9-2-3-4.9-3-8.2s1.1-6.2 3-8.2Z"/></svg>`;
     case "link":
       return `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M10.4 13.6 8.3 15.7a3 3 0 0 1-4.2-4.2l2.8-2.8a3 3 0 0 1 4.2 0"/><path d="m13.6 10.4 2.1-2.1a3 3 0 1 1 4.2 4.2l-2.8 2.8a3 3 0 0 1-4.2 0"/><path d="m9.5 14.5 5-5"/></svg>`;
+    case "clip":
+      return `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="m9.5 12.5 5.9-5.9a3 3 0 1 1 4.2 4.2l-7.7 7.7a5 5 0 1 1-7.1-7.1l8.1-8.1"/></svg>`;
     case "check":
       return `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="m6.8 12.5 3.2 3.2 7.2-7.4"/></svg>`;
     case "back":
@@ -3999,7 +4232,6 @@ function localizeApiError(value) {
     "completion-reply-image-too-large": "error.completionReplyImageTooLarge",
     "completion-reply-image-limit": "error.completionReplyImageLimit",
     "completion-reply-image-invalid-upload": "error.completionReplyImageInvalidUpload",
-    "completion-reply-image-disabled": "error.completionReplyImageDisabled",
     "codex-ipc-not-connected": "error.codexIpcNotConnected",
     "approval-not-found": "error.approvalNotFound",
     "approval-already-handled": "error.approvalAlreadyHandled",
