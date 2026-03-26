@@ -16,15 +16,17 @@ const state = {
   inbox: null,
   timeline: null,
   devices: [],
-  currentTab: "pending",
+  currentTab: "inbox",
   currentItem: null,
   currentDetail: null,
   currentDetailLoading: false,
   detailLoadingItem: null,
   detailOpen: false,
+  inboxSubtab: "pending",
   timelineThreadFilter: "all",
   timelineKindFilter: "all",
   timelineKindFilterOpen: false,
+  diffThreadFilter: "all",
   completedThreadFilter: "all",
   settingsSubpage: "",
   settingsScrollState: null,
@@ -36,6 +38,7 @@ const state = {
   listScrollState: null,
   pendingListScrollRestore: false,
   threadFilterInteractionUntilMs: 0,
+  diffThreadExpandedFiles: {},
   choiceLocalDrafts: {},
   completionReplyDrafts: {},
   pairError: "",
@@ -114,6 +117,9 @@ async function boot() {
   if (parsedInitialItem) {
     state.currentItem = parsedInitialItem;
     state.currentTab = tabForItemKind(parsedInitialItem.kind, state.currentTab);
+    if (state.currentTab === "inbox") {
+      state.inboxSubtab = inboxSubtabForItemKind(parsedInitialItem.kind);
+    }
     state.detailOpen = true;
     if (isFastPathItemRef(parsedInitialItem)) {
       state.launchItemIntent = {
@@ -320,7 +326,9 @@ async function getClientPushState() {
 
 async function refreshInbox() {
   state.inbox = await apiGet("/api/inbox");
+  syncDiffThreadFilter();
   syncCompletedThreadFilter();
+  syncInboxSubtab();
 }
 
 async function refreshTimeline() {
@@ -391,6 +399,7 @@ function allInboxEntries() {
   }
   return [
     ...state.inbox.pending.map((item) => ({ item, status: "pending" })),
+    ...(Array.isArray(state.inbox.diff) ? state.inbox.diff.map((item) => ({ item, status: "diff" })) : []),
     ...state.inbox.completed.map((item) => ({ item, status: "completed" })),
   ];
 }
@@ -412,20 +421,30 @@ function listEntriesForTab(tab) {
       return [];
     }
   }
-  if (tab === "pending") {
-    return state.inbox.pending.map((item) => ({ item, status: "pending" }));
+  if (tab === "inbox") {
+    return listInboxEntries();
   }
   if (tab === "timeline") {
     return filteredTimelineEntries().map((item) => ({ item, status: "timeline" }));
   }
-  if (tab === "completed") {
-    return filteredCompletedEntries().map((item) => ({ item, status: "completed" }));
+  if (tab === "diff") {
+    return filteredDiffEntries().map((item) => ({ item, status: "diff" }));
   }
   return [];
 }
 
 function listEntriesForCurrentTab() {
   return listEntriesForTab(state.currentTab);
+}
+
+function listInboxEntries() {
+  if (!state.inbox) {
+    return [];
+  }
+  if (state.inboxSubtab === "completed") {
+    return filteredCompletedEntries().map((item) => ({ item, status: "completed" }));
+  }
+  return state.inbox.pending.map((item) => ({ item, status: "pending" }));
 }
 
 function filteredTimelineEntries() {
@@ -454,6 +473,14 @@ function filteredCompletedEntries() {
   return entries.filter((entry) => entry.threadId === state.completedThreadFilter);
 }
 
+function filteredDiffEntries() {
+  const entries = Array.isArray(state.inbox?.diff) ? state.inbox.diff : [];
+  if (!entries.length) {
+    return [];
+  }
+  return entries.slice();
+}
+
 function syncTimelineThreadFilter() {
   const threads = Array.isArray(state.timeline?.threads) ? state.timeline.threads : [];
   if (!state.timelineThreadFilter || state.timelineThreadFilter === "all") {
@@ -476,6 +503,7 @@ function timelineKindFilterOptions() {
   return [
     { id: "all", label: L("timeline.kindFilter.all"), icon: "filter" },
     { id: "messages", label: L("timeline.kindFilter.messages"), icon: "timeline" },
+    { id: "files", label: L("timeline.kindFilter.files"), icon: "file-event" },
     { id: "approvals", label: L("timeline.kindFilter.approvals"), icon: "approval" },
     { id: "plans", label: L("timeline.kindFilter.plans"), icon: "plan" },
     { id: "choices", label: L("timeline.kindFilter.choices"), icon: "choice" },
@@ -495,6 +523,8 @@ function timelineEntryMatchesKindFilter(entry, filterId) {
   switch (filterId) {
     case "messages":
       return TIMELINE_MESSAGE_KINDS.has(kind);
+    case "files":
+      return kind === "file_event";
     case "approvals":
       return kind === "approval";
     case "plans":
@@ -533,6 +563,42 @@ function completedThreads() {
   return [...byThread.values()].sort((left, right) => right.latestAtMs - left.latestAtMs);
 }
 
+function diffThreads() {
+  const items = Array.isArray(state.inbox?.diff) ? state.inbox.diff : [];
+  if (!items.length) {
+    return [];
+  }
+  const byThread = new Map();
+  for (const item of items) {
+    const threadId = normalizeClientText(item.threadId || "");
+    if (!threadId) {
+      continue;
+    }
+    const latestAtMs = Number(item.createdAtMs || 0);
+    const label = resolvedThreadLabel(threadId, item.threadLabel || "");
+    const previous = byThread.get(threadId);
+    if (!previous || latestAtMs >= previous.latestAtMs) {
+      byThread.set(threadId, {
+        id: threadId,
+        label,
+        latestAtMs,
+      });
+    }
+  }
+  return [...byThread.values()].sort((left, right) => right.latestAtMs - left.latestAtMs);
+}
+
+function syncDiffThreadFilter() {
+  const threads = diffThreads();
+  if (!state.diffThreadFilter || state.diffThreadFilter === "all") {
+    state.diffThreadFilter = "all";
+    return;
+  }
+  if (!threads.some((thread) => thread.id === state.diffThreadFilter)) {
+    state.diffThreadFilter = "all";
+  }
+}
+
 function syncCompletedThreadFilter() {
   const threads = completedThreads();
   if (!state.completedThreadFilter || state.completedThreadFilter === "all") {
@@ -542,6 +608,14 @@ function syncCompletedThreadFilter() {
   if (!threads.some((thread) => thread.id === state.completedThreadFilter)) {
     state.completedThreadFilter = "all";
   }
+}
+
+function syncInboxSubtab() {
+  if (state.inboxSubtab === "completed") {
+    state.inboxSubtab = "completed";
+    return;
+  }
+  state.inboxSubtab = "pending";
 }
 
 function renderPair() {
@@ -766,7 +840,7 @@ function shouldDeferRenderForActiveInteraction() {
   }
   if (
     activeElement instanceof HTMLSelectElement &&
-    activeElement.matches("[data-timeline-thread-select], [data-completed-thread-select]")
+    activeElement.matches("[data-timeline-thread-select], [data-diff-thread-select], [data-completed-thread-select]")
   ) {
     return true;
   }
@@ -1329,11 +1403,16 @@ function renderMobileWorkspace(detail) {
 }
 
 function renderListPanel({ tab, entries, desktop }) {
+  if (tab === "inbox") {
+    return renderInboxPanel({ entries, desktop });
+  }
   if (tab === "timeline") {
     return renderTimelinePanel({ entries, desktop });
   }
+  if (tab === "diff") {
+    return renderDiffPanel({ entries, desktop });
+  }
   const meta = tabMeta(tab);
-  const threadFilterHtml = tab === "completed" ? renderCompletedThreadDropdown() : "";
   if (!desktop) {
     return `
       <div class="screen-shell screen-shell--mobile">
@@ -1341,7 +1420,6 @@ function renderListPanel({ tab, entries, desktop }) {
           <p class="screen-copy">${escapeHtml(meta.description)}</p>
           <span class="count-chip">${entries.length}</span>
         </div>
-        ${threadFilterHtml}
         ${
           entries.length
             ? `<div class="card-list">
@@ -1363,7 +1441,6 @@ function renderListPanel({ tab, entries, desktop }) {
         <span class="count-chip">${entries.length}</span>
       </div>
       <p class="screen-copy">${escapeHtml(meta.description)}</p>
-      ${threadFilterHtml}
       ${
         entries.length
           ? `<div class="card-list ${desktop ? "card-list--desktop" : ""}">
@@ -1371,6 +1448,96 @@ function renderListPanel({ tab, entries, desktop }) {
             </div>`
           : renderEmptyList(tab)
       }
+    </div>
+  `;
+}
+
+function renderInboxPanel({ entries, desktop }) {
+  const meta = tabMeta("inbox");
+  const subtabControls = renderInboxSubtabs();
+  const threadFilterHtml = state.inboxSubtab === "completed" ? renderCompletedThreadDropdown() : "";
+  const bodyHtml = entries.length
+    ? `<div class="card-list ${desktop ? "card-list--desktop" : ""}">
+        ${entries.map((entry) => renderItemCard(entry, "inbox", desktop)).join("")}
+      </div>`
+    : renderInboxEmptyState();
+
+  if (!desktop) {
+    return `
+      <div class="screen-shell screen-shell--mobile">
+        <div class="screen-header screen-header--mobile">
+          <p class="screen-copy">${escapeHtml(meta.description)}</p>
+          <span class="count-chip">${entries.length}</span>
+        </div>
+        ${subtabControls}
+        ${threadFilterHtml}
+        ${bodyHtml}
+      </div>
+    `;
+  }
+
+  return `
+    <div class="screen-shell">
+      <div class="screen-header">
+        <div>
+          <p class="screen-eyebrow">${escapeHtml(meta.eyebrow)}</p>
+          <h2 class="screen-title">${escapeHtml(meta.title)}</h2>
+        </div>
+        <span class="count-chip">${entries.length}</span>
+      </div>
+      <p class="screen-copy">${escapeHtml(meta.description)}</p>
+      ${subtabControls}
+      ${threadFilterHtml}
+      ${bodyHtml}
+    </div>
+  `;
+}
+
+function renderInboxSubtabs() {
+  const pendingCount = pendingInboxCount();
+  return `
+    <div class="inbox-subtabs" role="tablist" aria-label="${escapeHtml(tabMeta("inbox").title)}">
+      ${inboxSubtabOptions()
+        .map(
+          (option) => {
+            const showPendingBadge = option.id === "pending" && pendingCount > 0;
+            const badgeHtml = showPendingBadge
+              ? `<span class="inbox-subtabs__badge" aria-hidden="true">${pendingCount}</span>`
+              : "";
+            const ariaLabel = showPendingBadge ? `${option.label} (${pendingCount})` : option.label;
+            return `
+            <button
+              type="button"
+              class="inbox-subtabs__button ${state.inboxSubtab === option.id ? "is-active" : ""}"
+              data-inbox-subtab="${escapeHtml(option.id)}"
+              role="tab"
+              aria-selected="${state.inboxSubtab === option.id ? "true" : "false"}"
+              aria-label="${escapeHtml(ariaLabel)}"
+            >
+              <span class="inbox-subtabs__button-label">${escapeHtml(option.label)}</span>
+              ${badgeHtml}
+            </button>
+          `
+          }
+        )
+        .join("")}
+    </div>
+  `;
+}
+
+function inboxSubtabOptions() {
+  return [
+    { id: "pending", label: L("inbox.subtab.pending") },
+    { id: "completed", label: L("inbox.subtab.completed") },
+  ];
+}
+
+function renderInboxEmptyState() {
+  const isCompletedView = state.inboxSubtab === "completed";
+  return `
+    <div class="empty-state">
+      <p class="empty-state__title">${escapeHtml(L(isCompletedView ? "inbox.subtab.completed" : "inbox.subtab.pending"))}</p>
+      <p class="muted">${escapeHtml(L(isCompletedView ? "empty.completed" : "empty.pending"))}</p>
     </div>
   `;
 }
@@ -1458,6 +1625,7 @@ function renderCompletedCompletionCard(entry, sourceTab) {
       data-open-item-kind="${escapeHtml(item.kind)}"
       data-open-item-token="${escapeHtml(item.token)}"
       data-source-tab="${escapeHtml(sourceTab)}"
+      data-source-subtab="completed"
     >
       <div class="item-card__header">
         <div class="item-card__meta">
@@ -1513,6 +1681,40 @@ function renderTimelinePanel({ entries, desktop }) {
   `;
 }
 
+function renderDiffPanel({ entries, desktop }) {
+  const meta = tabMeta("diff");
+  const listClassName = desktop ? "diff-list diff-list--desktop" : "diff-list";
+  const bodyHtml = entries.length
+    ? `<div class="${listClassName}">${entries.map((entry) => renderDiffEntry(entry)).join("")}</div>`
+    : renderEmptyList("diff");
+
+  if (!desktop) {
+    return `
+      <div class="screen-shell screen-shell--mobile diff-shell diff-shell--mobile">
+        <div class="screen-header screen-header--mobile">
+          <p class="screen-copy">${escapeHtml(meta.description)}</p>
+          <span class="count-chip">${entries.length}</span>
+        </div>
+        ${bodyHtml}
+      </div>
+    `;
+  }
+
+  return `
+    <div class="screen-shell diff-shell">
+      <div class="screen-header">
+        <div>
+          <p class="screen-eyebrow">${escapeHtml(meta.eyebrow)}</p>
+          <h2 class="screen-title">${escapeHtml(meta.title)}</h2>
+        </div>
+        <span class="count-chip">${entries.length}</span>
+      </div>
+      <p class="screen-copy">${escapeHtml(meta.description)}</p>
+      ${bodyHtml}
+    </div>
+  `;
+}
+
 function renderTimelineThreadDropdown() {
   const threads = Array.isArray(state.timeline?.threads) ? state.timeline.threads : [];
   return renderThreadDropdown({
@@ -1533,6 +1735,15 @@ function renderCompletedThreadDropdown() {
     dataAttribute: "data-completed-thread-select",
     selectedThreadId: state.completedThreadFilter,
     threads: completedThreads(),
+  });
+}
+
+function renderDiffThreadDropdown() {
+  return renderThreadDropdown({
+    inputId: "diff-thread-select",
+    dataAttribute: "data-diff-thread-select",
+    selectedThreadId: state.diffThreadFilter,
+    threads: diffThreads(),
   });
 }
 
@@ -1623,15 +1834,16 @@ function renderTimelineEntry(entry, { desktop }) {
   const kindClassName = escapeHtml(kindInfo.tone || "neutral");
   const kindNameClass = escapeHtml(String(item.kind || "item").replace(/_/gu, "-"));
   const isMessageLike = TIMELINE_MESSAGE_KINDS.has(item.kind) || item.kind === "completion";
+  const isFileEvent = item.kind === "file_event";
   const imageUrls = Array.isArray(item.imageUrls) ? item.imageUrls.filter(Boolean) : [];
   const fileRefs = normalizeClientFileRefs(item.fileRefs);
-  const primaryText = isMessageLike
-    ? item.summary || fallbackSummaryForKind(item.kind, entry.status)
-    : item.title || L("common.untitledItem");
-  const secondaryText = isMessageLike ? "" : item.summary || fallbackSummaryForKind(item.kind, entry.status);
+  const primaryText = timelineEntryPrimaryText(item, entry.status, { isMessageLike, isFileEvent });
+  const secondaryText = timelineEntrySecondaryText(item, entry.status, primaryText, { isMessageLike, isFileEvent });
   const threadLabel = timelineEntryThreadLabel(item, isMessageLike);
   const timestampLabel = formatTimelineTimestamp(item.createdAtMs);
   const statusLabel = timelineEntryStatusLabel(item, isMessageLike);
+  const fileEventFileSummary = isFileEvent ? timelineFileEventFileSummary(item) : "";
+  const fileEventDiffStatsHtml = isFileEvent ? renderDiffEntryStatsHtml(item) : "";
 
   return `
     <button
@@ -1654,16 +1866,53 @@ function renderTimelineEntry(entry, { desktop }) {
       <div class="timeline-entry__body">
         <p class="timeline-entry__title">${escapeHtml(primaryText)}</p>
         ${secondaryText ? `<p class="timeline-entry__summary">${escapeHtml(secondaryText)}</p>` : ""}
+        ${
+          isFileEvent && fileEventFileSummary
+            ? `<p class="timeline-entry__file-summary" title="${escapeHtml(
+                normalizeClientFileRefs(item.fileRefs).join("\n")
+              )}">${escapeHtml(fileEventFileSummary)}</p>`
+            : ""
+        }
+        ${isFileEvent && fileEventDiffStatsHtml ? `<div class="timeline-entry__file-diff-stats diff-entry__stats">${fileEventDiffStatsHtml}</div>` : ""}
         ${renderTimelineEntryImageStrip(imageUrls)}
-        ${renderTimelineEntryFileStrip(fileRefs)}
+        ${isFileEvent ? "" : renderTimelineEntryFileStrip(fileRefs)}
       </div>
       ${statusLabel ? `<div class="timeline-entry__footer"><span class="timeline-entry__status">${escapeHtml(statusLabel)}</span></div>` : ""}
     </button>
   `;
 }
 
+function renderDiffEntry(entry) {
+  const item = entry.item;
+  const threadLabel = diffThreadCardTitle(item);
+  const fileChipsHtml = renderDiffEntryFileChips(item);
+  const fallbackSummary = fileChipsHtml ? "" : diffThreadSummaryLabel(item);
+  const statsHtml = renderDiffEntryStatsHtml(item);
+  const latestChangeSummary = diffThreadLatestChangeSummary(item);
+
+  return `
+    <button
+      class="diff-entry diff-entry--thread"
+      data-open-item-kind="${escapeHtml(item.kind)}"
+      data-open-item-token="${escapeHtml(item.token)}"
+      data-source-tab="diff"
+    >
+      <div class="diff-entry__header">
+        <p class="timeline-entry__thread diff-entry__thread">${escapeHtml(threadLabel)}</p>
+        <span class="diff-entry__chevron" aria-hidden="true">${renderIcon("chevron-right")}</span>
+      </div>
+      <div class="diff-entry__body">
+        ${fileChipsHtml ? `<div class="diff-entry__files">${fileChipsHtml}</div>` : ""}
+        ${fallbackSummary ? `<p class="diff-entry__title">${escapeHtml(fallbackSummary)}</p>` : ""}
+        ${statsHtml ? `<div class="diff-entry__stats">${statsHtml}</div>` : ""}
+        ${latestChangeSummary ? `<p class="diff-entry__summary">${escapeHtml(latestChangeSummary)}</p>` : ""}
+      </div>
+    </button>
+  `;
+}
+
 function timelineEntryStatusLabel(item, isMessageLike) {
-  if (isMessageLike) {
+  if (isMessageLike || item?.kind === "file_event") {
     return "";
   }
 
@@ -1741,14 +1990,291 @@ function renderTimelineEntryFileStrip(fileRefs) {
 
 function timelineEntryThreadLabel(item, isMessage) {
   const threadLabel = resolvedThreadLabel(item.threadId || "", item.threadLabel || "");
-  if (!threadLabel) {
+  return threadLabel || "";
+}
+
+function timelineEntryPrimaryText(item, status, { isMessageLike = false, isFileEvent = false } = {}) {
+  if (isMessageLike) {
+    return item.summary || fallbackSummaryForKind(item.kind, status);
+  }
+
+  if (isFileEvent) {
+    return fileEventTimelineCountLabel(item) || fallbackSummaryForKind(item.kind, status);
+  }
+
+  return timelineDisplayTitleWithoutThread(item, { allowFallbackSummary: true }) || L("common.untitledItem");
+}
+
+function timelineEntrySecondaryText(item, status, primaryText, { isMessageLike = false, isFileEvent = false } = {}) {
+  if (isMessageLike) {
     return "";
   }
-  if (isMessage) {
-    return threadLabel;
+
+  const summaryText = normalizeClientText(item.summary || fallbackSummaryForKind(item.kind, status));
+  if (!summaryText || summaryText === normalizeClientText(primaryText || "")) {
+    return "";
   }
-  const title = normalizeClientText(item.title || "");
-  return title.includes(threadLabel) ? "" : threadLabel;
+
+  if (isFileEvent) {
+    return "";
+  }
+
+  const compactTitle = timelineDisplayTitleWithoutThread(item, { allowFallbackSummary: false });
+  return compactTitle ? summaryText : "";
+}
+
+function timelineDisplayTitleWithoutThread(item, { allowFallbackSummary = false } = {}) {
+  const rawTitle = normalizeClientText(item?.title || "");
+  const threadLabel = resolvedThreadLabel(item?.threadId || "", item?.threadLabel || "");
+  if (!rawTitle) {
+    return allowFallbackSummary ? normalizeClientText(item?.summary || "") : "";
+  }
+
+  let displayTitle = rawTitle;
+  const removablePrefixes = timelineGeneratedTitlePrefixes();
+  const hadGeneratedPrefix = removablePrefixes.some((prefix) => {
+    const normalizedPrefix = normalizeClientText(prefix || "");
+    return normalizedPrefix && rawTitle.startsWith(`${normalizedPrefix} | `);
+  });
+
+  for (const prefix of removablePrefixes) {
+    const normalizedPrefix = normalizeClientText(prefix || "");
+    if (normalizedPrefix && displayTitle.startsWith(`${normalizedPrefix} | `)) {
+      displayTitle = normalizeClientText(displayTitle.slice(normalizedPrefix.length + 3));
+      break;
+    }
+  }
+
+  if (hadGeneratedPrefix) {
+    if (!displayTitle || (threadLabel && displayTitle === threadLabel)) {
+      return allowFallbackSummary ? normalizeClientText(item?.summary || "") : "";
+    }
+  }
+
+  if (threadLabel && displayTitle === threadLabel) {
+    return allowFallbackSummary ? normalizeClientText(item?.summary || "") : "";
+  }
+
+  return displayTitle || (allowFallbackSummary ? normalizeClientText(item?.summary || "") : "");
+}
+
+function timelineGeneratedTitlePrefixes() {
+  return [
+    kindMeta("approval").label,
+    kindMeta("plan").label,
+    kindMeta("choice").label,
+    kindMeta("completion").label,
+    kindMeta("user_message").label,
+    kindMeta("assistant_commentary").label,
+    kindMeta("assistant_final").label,
+    L("common.fileEvent"),
+    "Approval",
+    "Plan",
+    "Choice",
+    "Completed",
+    "User message",
+    "Commentary",
+    "Final answer",
+    "Files",
+    "承認",
+    "プラン",
+    "選択",
+    "完了",
+    "メッセージ",
+    "途中経過",
+    "最終回答",
+    "ファイル",
+  ];
+}
+
+function fileEventDisplayLabel(fileEventType) {
+  switch (normalizeClientText(fileEventType || "")) {
+    case "read":
+      return L("fileEvent.read");
+    case "write":
+      return L("fileEvent.write");
+    case "create":
+      return L("fileEvent.create");
+    default:
+      return "";
+  }
+}
+
+function fileEventTimelineCountLabel(item) {
+  const fileEventType = normalizeClientText(item?.fileEventType || "");
+  const count = normalizeClientFileRefs(item?.fileRefs).length;
+  if (count <= 0) {
+    return fileEventDisplayLabel(fileEventType) || L("common.fileEvent");
+  }
+  switch (fileEventType) {
+    case "read":
+      return L("fileEvent.timeline.read", { count });
+    case "write":
+      return L("fileEvent.timeline.write", { count });
+    case "create":
+      return L("fileEvent.timeline.create", { count });
+    default:
+      return L("common.fileEvent");
+  }
+}
+
+function diffThreadSummaryLabel(item) {
+  const count = Math.max(0, Number(item?.changedFileCount) || 0);
+  if (count <= 0) {
+    return L("common.diff");
+  }
+  return L("diff.threadSummary", { count });
+}
+
+function diffThreadCardTitle(item) {
+  return resolvedThreadLabel(item?.threadId || "", item?.threadLabel || "") || L("timeline.unknownThread");
+}
+
+function diffThreadCardSummary(item) {
+  const parts = [];
+  const filesLabel = diffThreadFilesSummary(item);
+  if (filesLabel) {
+    parts.push(filesLabel);
+  } else {
+    const summaryLabel = diffThreadSummaryLabel(item);
+    if (summaryLabel && summaryLabel !== L("common.diff")) {
+      parts.push(summaryLabel);
+    }
+  }
+  const statsLabel = diffEntryStatsLabel(item);
+  if (statsLabel) {
+    parts.push(statsLabel);
+  }
+  return parts.join(" • ");
+}
+
+function diffThreadFilesSummary(item) {
+  const labels = normalizeClientFileRefs(item?.fileRefs)
+    .map((fileRef) => fileRefLabel(fileRef))
+    .filter(Boolean);
+  if (labels.length === 0) {
+    return "";
+  }
+  const visibleLabels = labels.slice(0, 3);
+  const hiddenCount = labels.length - visibleLabels.length;
+  if (hiddenCount > 0) {
+    visibleLabels.push(`+${hiddenCount}`);
+  }
+  return visibleLabels.join(", ");
+}
+
+function diffThreadLatestChangeSummary(item) {
+  const prefix = L("diff.latestChange");
+  const timestampLabel = formatDiffCardTimestamp(item?.latestChangedAtMs || item?.createdAtMs);
+  if (timestampLabel) {
+    return `${prefix}: ${timestampLabel}`;
+  }
+  if (Number(item?.latestChangedAtMs) > 0 || Number(item?.createdAtMs) > 0) {
+    return L("diff.latestChangeFallback");
+  }
+  return "";
+}
+
+function renderDiffEntryFileChips(item) {
+  const fileRefs = normalizeClientFileRefs(item?.fileRefs);
+  if (fileRefs.length === 0) {
+    return "";
+  }
+  const visibleRefs = fileRefs.slice(0, 4);
+  const hiddenCount = fileRefs.length - visibleRefs.length;
+  const chips = visibleRefs.map(
+    (fileRef) => `
+      <span class="file-ref-chip" title="${escapeHtml(fileRef)}">
+        <span class="file-ref-chip__icon" aria-hidden="true">${renderIcon("item")}</span>
+        <span class="file-ref-chip__label">${escapeHtml(fileRefLabel(fileRef))}</span>
+      </span>
+    `
+  );
+  if (hiddenCount > 0) {
+    chips.push(`
+      <span class="file-ref-chip file-ref-chip--count">
+        <span class="file-ref-chip__label">+${hiddenCount}</span>
+      </span>
+    `);
+  }
+  return chips.join("");
+}
+
+function renderDiffEntryStatsHtml(item) {
+  const addedLines = Math.max(0, Number(item?.diffAddedLines ?? item?.addedLines) || 0);
+  const removedLines = Math.max(0, Number(item?.diffRemovedLines ?? item?.removedLines) || 0);
+  if (!addedLines && !removedLines) {
+    return "";
+  }
+  const parts = [];
+  if (addedLines) {
+    parts.push(`<span class="diff-entry__stat diff-entry__stat--added">+${escapeHtml(String(addedLines))}</span>`);
+  }
+  if (removedLines) {
+    parts.push(`<span class="diff-entry__stat diff-entry__stat--removed">-${escapeHtml(String(removedLines))}</span>`);
+  }
+  return parts.join('<span class="diff-entry__stats-separator">/</span>');
+}
+
+function formatDiffCardTimestamp(value) {
+  const timestamp = Number(value) || 0;
+  if (!timestamp) {
+    return "";
+  }
+  try {
+    return new Intl.DateTimeFormat(state.locale || DEFAULT_LOCALE, {
+      month: "numeric",
+      day: "numeric",
+      hour: "numeric",
+      minute: "2-digit",
+    }).format(new Date(timestamp));
+  } catch {
+    return new Date(timestamp).toLocaleString();
+  }
+}
+
+function diffThreadFileExpansionKey(token, fileRef) {
+  return `${normalizeClientText(token || "")}:${normalizeClientText(fileRef || "")}`;
+}
+
+function isDiffThreadFileExpanded(token, fileRef) {
+  const key = diffThreadFileExpansionKey(token, fileRef);
+  return state.diffThreadExpandedFiles?.[key] === true;
+}
+
+function toggleDiffThreadFileExpanded(token, fileRef) {
+  const key = diffThreadFileExpansionKey(token, fileRef);
+  if (!key || key === ":") {
+    return;
+  }
+  state.diffThreadExpandedFiles = {
+    ...(state.diffThreadExpandedFiles || {}),
+    [key]: !isDiffThreadFileExpanded(token, fileRef),
+  };
+}
+
+function timelineFileEventFileSummary(item) {
+  const labels = normalizeClientFileRefs(item?.fileRefs)
+    .map((fileRef) => fileRefLabel(fileRef))
+    .filter(Boolean);
+  if (labels.length === 0) {
+    return "";
+  }
+  const visibleLabels = labels.slice(0, 3);
+  const hiddenCount = labels.length - visibleLabels.length;
+  if (hiddenCount > 0) {
+    visibleLabels.push(`+${hiddenCount}`);
+  }
+  return visibleLabels.join(", ");
+}
+
+function diffEntryStatsLabel(item) {
+  const addedLines = Math.max(0, Number(item?.diffAddedLines ?? item?.addedLines) || 0);
+  const removedLines = Math.max(0, Number(item?.diffRemovedLines ?? item?.removedLines) || 0);
+  if (!addedLines && !removedLines) {
+    return "";
+  }
+  return `+${addedLines} / -${removedLines}`;
 }
 
 function sanitizeThreadLabelForDisplay(label = "", threadId = "") {
@@ -2458,6 +2984,7 @@ function renderDetailContent(detail, { mobile }) {
 function renderStandardDetailDesktop(detail) {
   const kindInfo = kindMeta(detail.kind);
   const spaciousBodyDetail = TIMELINE_MESSAGE_KINDS.has(detail.kind) || detail.kind === "completion";
+  const plainIntro = renderDetailPlainIntro(detail);
   return `
     <div class="detail-shell">
       ${renderDetailMetaRow(detail, kindInfo)}
@@ -2465,10 +2992,18 @@ function renderStandardDetailDesktop(detail) {
       ${detail.readOnly ? "" : renderDetailLead(detail, kindInfo)}
       ${renderPreviousContextCard(detail)}
       ${renderInterruptedDetailNotice(detail)}
-      <section class="detail-card detail-card--body ${spaciousBodyDetail ? "detail-card--message-body" : ""}">
-        <div class="detail-body ${spaciousBodyDetail ? "detail-body--message " : ""}markdown">${detail.messageHtml || ""}</div>
-      </section>
+      ${
+        plainIntro
+          ? plainIntro
+          : `
+            <section class="detail-card detail-card--body ${spaciousBodyDetail ? "detail-card--message-body" : ""}">
+              <div class="detail-body ${spaciousBodyDetail ? "detail-body--message " : ""}markdown">${detail.messageHtml || ""}</div>
+            </section>
+          `
+      }
       ${renderDetailImageGallery(detail)}
+      ${renderDetailDiffPanel(detail)}
+      ${renderDetailDiffThreadGroups(detail)}
       ${renderDetailFileRefs(detail)}
       ${renderCompletionReplyComposer(detail)}
       ${detail.readOnly ? "" : renderActionButtons(detail.actions || [])}
@@ -2479,6 +3014,7 @@ function renderStandardDetailDesktop(detail) {
 function renderStandardDetailMobile(detail) {
   const kindInfo = kindMeta(detail.kind);
   const spaciousBodyDetail = TIMELINE_MESSAGE_KINDS.has(detail.kind) || detail.kind === "completion";
+  const plainIntro = renderDetailPlainIntro(detail, { mobile: true });
   return `
     <div class="mobile-detail-screen">
       <div class="detail-shell detail-shell--mobile">
@@ -2486,16 +3022,38 @@ function renderStandardDetailMobile(detail) {
           ${renderDetailMetaRow(detail, kindInfo, { mobile: true })}
           ${renderPreviousContextCard(detail, { mobile: true })}
           ${renderInterruptedDetailNotice(detail, { mobile: true })}
-          <section class="detail-card detail-card--body detail-card--mobile ${spaciousBodyDetail ? "detail-card--message-body" : ""}">
-            ${detail.readOnly ? "" : renderDetailLead(detail, kindInfo, { mobile: true })}
-            <div class="detail-body ${spaciousBodyDetail ? "detail-body--message " : ""}markdown">${detail.messageHtml || ""}</div>
-          </section>
+          ${
+            plainIntro
+              ? plainIntro
+              : `
+                <section class="detail-card detail-card--body detail-card--mobile ${spaciousBodyDetail ? "detail-card--message-body" : ""}">
+                  ${detail.readOnly ? "" : renderDetailLead(detail, kindInfo, { mobile: true })}
+                  <div class="detail-body ${spaciousBodyDetail ? "detail-body--message " : ""}markdown">${detail.messageHtml || ""}</div>
+                </section>
+              `
+          }
           ${renderDetailImageGallery(detail, { mobile: true })}
+          ${renderDetailDiffPanel(detail, { mobile: true })}
+          ${renderDetailDiffThreadGroups(detail, { mobile: true })}
           ${renderDetailFileRefs(detail, { mobile: true })}
           ${renderCompletionReplyComposer(detail, { mobile: true })}
         </div>
         ${detail.readOnly ? "" : renderActionButtons(detail.actions || [], { mobileSticky: true })}
       </div>
+    </div>
+  `;
+}
+
+function renderDetailPlainIntro(detail, options = {}) {
+  if (!["diff_thread", "file_event"].includes(detail?.kind || "")) {
+    return "";
+  }
+  if (!detail?.messageHtml) {
+    return "";
+  }
+  return `
+    <div class="detail-page-copy ${options.mobile ? "detail-page-copy--mobile" : ""} markdown">
+      ${detail.messageHtml}
     </div>
   `;
 }
@@ -2625,6 +3183,157 @@ function renderDetailFileRefs(detail, options = {}) {
       </div>
     </section>
   `;
+}
+
+function renderDetailDiffPanel(detail, options = {}) {
+  const detailKind = normalizeClientText(detail?.kind || "");
+  if (!["file_event", "approval"].includes(detailKind)) {
+    return "";
+  }
+
+  const fileEventType = normalizeClientText(detail?.fileEventType || "");
+  if (detailKind === "file_event" && !["write", "create"].includes(fileEventType)) {
+    return "";
+  }
+  if (
+    detailKind === "approval" &&
+    !String(detail?.diffText || "").trim() &&
+    !detail?.diffAvailable &&
+    normalizeClientFileRefs(detail?.fileRefs).length === 0
+  ) {
+    return "";
+  }
+
+  const diffText = String(detail?.diffText || "").replace(/\r\n/g, "\n").trim();
+  const statsHtml = renderDiffEntryStatsHtml(detail);
+
+  return `
+    <section class="detail-card detail-card--diff ${options.mobile ? "detail-card--mobile" : ""}">
+      <div class="detail-diff-card__header">
+        <div class="detail-diff-card__title-wrap">
+          <span class="detail-diff-card__icon" aria-hidden="true">${renderIcon("diff")}</span>
+          <span>${escapeHtml(L("detail.diffTitle"))}</span>
+        </div>
+        ${statsHtml ? `<span class="detail-diff-card__stats diff-entry__stats">${statsHtml}</span>` : ""}
+      </div>
+      ${
+        diffText
+          ? `<div class="detail-diff-viewer">${renderDiffLines(diffText)}</div>`
+          : `<p class="detail-diff-card__notice">${escapeHtml(L("detail.diffUnavailable"))}</p>`
+      }
+    </section>
+  `;
+}
+
+function renderDetailDiffThreadGroups(detail, options = {}) {
+  if (detail?.kind !== "diff_thread") {
+    return "";
+  }
+
+  const files = Array.isArray(detail?.files) ? detail.files.filter(Boolean) : [];
+  if (files.length === 0) {
+    return "";
+  }
+
+  return files
+    .map((fileGroup) => renderDetailDiffThreadFileGroup(detail, fileGroup, options))
+    .join("");
+}
+
+function renderDetailDiffThreadFileGroup(detail, fileGroup, options = {}) {
+  const fileRef = normalizeClientText(fileGroup?.fileRef || "");
+  const fileLabel = normalizeClientText(fileGroup?.fileLabel || "") || fileRefLabel(fileRef) || L("common.unavailable");
+  const statsHtml = renderDiffEntryStatsHtml(fileGroup);
+  const sections = Array.isArray(fileGroup?.sections) ? fileGroup.sections.filter(Boolean) : [];
+  const expanded = isDiffThreadFileExpanded(detail?.token, fileRef);
+
+  return `
+    <section class="detail-card detail-card--diff-thread ${options.mobile ? "detail-card--mobile" : ""}">
+      <button
+        type="button"
+        class="detail-diff-thread__header ${expanded ? "is-open" : ""}"
+        data-diff-thread-file-toggle
+        data-diff-thread-token="${escapeHtml(detail?.token || "")}"
+        data-diff-thread-file="${escapeHtml(fileRef)}"
+      >
+        <div class="detail-diff-thread__title-wrap">
+          <span class="detail-diff-thread__icon" aria-hidden="true">${renderIcon("item")}</span>
+          <div class="detail-diff-thread__title-text">
+            <span class="detail-diff-thread__label">${escapeHtml(fileLabel)}</span>
+            ${fileRef ? `<span class="detail-diff-thread__path">${escapeHtml(fileRef)}</span>` : ""}
+          </div>
+        </div>
+        <div class="detail-diff-thread__header-right">
+          ${statsHtml ? `<span class="detail-diff-thread__stats diff-entry__stats">${statsHtml}</span>` : ""}
+          <span class="detail-diff-thread__chevron" aria-hidden="true">${renderIcon("chevron-right")}</span>
+        </div>
+      </button>
+      ${
+        expanded
+          ? `
+            <div class="detail-diff-thread__sections">
+              ${sections.map((section) => renderDetailDiffThreadSection(section)).join("")}
+            </div>
+          `
+          : ""
+      }
+    </section>
+  `;
+}
+
+function renderDetailDiffThreadSection(section) {
+  const sectionLabel = fileEventDisplayLabel(section?.fileEventType || "") || L("common.diff");
+  const timestampLabel = section?.createdAtMs ? formatTimelineTimestamp(section.createdAtMs) : "";
+  const statsHtml = renderDiffEntryStatsHtml(section);
+  const diffText = String(section?.diffText || "").replace(/\r\n/g, "\n").trim();
+
+  return `
+    <div class="detail-diff-thread__section">
+      <div class="detail-diff-thread__section-meta">
+        <span class="detail-diff-thread__section-label">${escapeHtml(sectionLabel)}</span>
+        <div class="detail-diff-thread__section-right">
+          ${statsHtml ? `<span class="detail-diff-thread__section-stats diff-entry__stats">${statsHtml}</span>` : ""}
+          ${timestampLabel ? `<span class="detail-diff-thread__section-time">${escapeHtml(timestampLabel)}</span>` : ""}
+        </div>
+      </div>
+      ${
+        diffText
+          ? `<div class="detail-diff-viewer">${renderDiffLines(diffText)}</div>`
+          : `<p class="detail-diff-card__notice">${escapeHtml(L("detail.diffUnavailable"))}</p>`
+      }
+    </div>
+  `;
+}
+
+function renderDiffLines(diffText) {
+  return String(diffText || "")
+    .replace(/\r\n/g, "\n")
+    .split("\n")
+    .map((line) => {
+      const className = diffLineClassName(line);
+      return `<div class="detail-diff-line ${className}">${escapeHtml(line || " ")}</div>`;
+    })
+    .join("");
+}
+
+function diffLineClassName(line) {
+  const text = String(line || "");
+  if (text.startsWith("diff --git") || text.startsWith("index ") || text.startsWith("new file mode")) {
+    return "detail-diff-line--meta";
+  }
+  if (text.startsWith("@@")) {
+    return "detail-diff-line--hunk";
+  }
+  if (text.startsWith("+++ ") || text.startsWith("--- ")) {
+    return "detail-diff-line--file";
+  }
+  if (text.startsWith("+")) {
+    return "detail-diff-line--add";
+  }
+  if (text.startsWith("-")) {
+    return "detail-diff-line--remove";
+  }
+  return "detail-diff-line--context";
 }
 
 function renderCompletionReplyComposer(detail, options = {}) {
@@ -3177,14 +3886,19 @@ function renderBottomTabs() {
 }
 
 function renderTabButtons({ buttonClass, withIcons }) {
+  const pendingCount = pendingInboxCount();
   return tabs()
     .map(
-      (tab) => `
-        <button class="${buttonClass} ${state.currentTab === tab.id ? "is-active" : ""}" data-tab="${escapeHtml(tab.id)}">
-          ${withIcons ? `<span class="tab-icon" aria-hidden="true">${renderIcon(tab.icon)}</span>` : ""}
+      (tab) => {
+        const showAttentionDot = withIcons && buttonClass === "bottom-nav__button" && tab.id === "inbox" && pendingCount > 0;
+        const ariaLabel = showAttentionDot ? `${tab.label} (${pendingCount})` : tab.label;
+        return `
+        <button class="${buttonClass} ${state.currentTab === tab.id ? "is-active" : ""}" data-tab="${escapeHtml(tab.id)}" aria-label="${escapeHtml(ariaLabel)}">
+          ${withIcons ? `<span class="tab-icon-wrap"><span class="tab-icon" aria-hidden="true">${renderIcon(tab.icon)}</span>${showAttentionDot ? `<span class="bottom-nav__attention-dot" aria-hidden="true"></span>` : ""}</span>` : ""}
           <span class="tab-label">${escapeHtml(tab.label)}</span>
         </button>
       `
+      }
     )
     .join("");
 }
@@ -3297,12 +4011,28 @@ function bindShellInteractions() {
     });
   }
 
+  for (const button of document.querySelectorAll("[data-inbox-subtab]")) {
+    button.addEventListener("click", async () => {
+      const nextSubtab = button.dataset.inboxSubtab === "completed" ? "completed" : "pending";
+      if (nextSubtab === state.inboxSubtab) {
+        return;
+      }
+      state.inboxSubtab = nextSubtab;
+      if (isDesktopLayout()) {
+        alignCurrentItemToVisibleEntries();
+        syncCurrentItemUrl(state.currentItem);
+      }
+      await renderShell();
+    });
+  }
+
   for (const button of document.querySelectorAll("[data-open-item-kind][data-open-item-token]")) {
     button.addEventListener("click", async () => {
       openItem({
         kind: button.dataset.openItemKind,
         token: button.dataset.openItemToken,
         sourceTab: button.dataset.sourceTab,
+        sourceSubtab: button.dataset.sourceSubtab,
       });
       await renderShell();
     });
@@ -3316,6 +4046,15 @@ function bindShellInteractions() {
         url: button.dataset.openImageViewer || "",
         alt: button.dataset.imageAlt || "",
       };
+      await renderShell();
+    });
+  }
+
+  for (const button of document.querySelectorAll("[data-diff-thread-file-toggle]")) {
+    button.addEventListener("click", async (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      toggleDiffThreadFileExpanded(button.dataset.diffThreadToken || "", button.dataset.diffThreadFile || "");
       await renderShell();
     });
   }
@@ -3780,10 +4519,13 @@ async function switchTab(tab) {
   await renderShell();
 }
 
-function openItem({ kind, token, sourceTab }) {
+function openItem({ kind, token, sourceTab, sourceSubtab }) {
   const previousItem = state.currentItem ? { ...state.currentItem } : null;
   clearPinnedDetailState();
   const nextTab = sourceTab || tabForItemKind(kind, state.currentTab);
+  if (nextTab === "inbox") {
+    state.inboxSubtab = inboxSubtabForItemKind(kind, sourceSubtab);
+  }
   state.timelineKindFilterOpen = false;
   if (previousItem && (previousItem.kind !== kind || previousItem.token !== token)) {
     clearChoiceLocalDraftForItem(previousItem);
@@ -3856,14 +4598,14 @@ function isSettingsSubpageOpen() {
 
 function tabMeta(tab) {
   switch (tab) {
-    case "pending":
+    case "inbox":
       return {
-        id: "pending",
-        title: L("tab.pending.title"),
-        label: L("tab.pending.label"),
+        id: "inbox",
+        title: L("tab.inbox.title"),
+        label: L("tab.inbox.label"),
         icon: "pending",
-        eyebrow: L("tab.pending.eyebrow"),
-        description: L("tab.pending.description"),
+        eyebrow: L("tab.inbox.eyebrow"),
+        description: L("tab.inbox.description"),
       };
     case "timeline":
       return {
@@ -3874,14 +4616,14 @@ function tabMeta(tab) {
         eyebrow: L("tab.timeline.eyebrow"),
         description: L("tab.timeline.description"),
       };
-    case "completed":
+    case "diff":
       return {
-        id: "completed",
-        title: L("tab.completed.title"),
-        label: L("tab.completed.label"),
-        icon: "completed",
-        eyebrow: L("tab.completed.eyebrow"),
-        description: L("tab.completed.description"),
+        id: "diff",
+        title: L("tab.code.title"),
+        label: L("tab.code.label"),
+        icon: "file-event",
+        eyebrow: L("tab.code.eyebrow"),
+        description: L("tab.code.description"),
       };
     case "settings":
       return {
@@ -3899,26 +4641,43 @@ function tabMeta(tab) {
 
 function tabs() {
   return [
-    tabMeta("pending"),
+    tabMeta("inbox"),
     tabMeta("timeline"),
-    tabMeta("completed"),
+    tabMeta("diff"),
     tabMeta("settings"),
   ];
 }
 
+function pendingInboxCount() {
+  return Array.isArray(state.inbox?.pending) ? state.inbox.pending.length : 0;
+}
+
 function tabForItemKind(kind, fallback) {
+  if (kind === "diff_thread") {
+    return "diff";
+  }
+  if (kind === "file_event") {
+    return "timeline";
+  }
   if (TIMELINE_MESSAGE_KINDS.has(kind)) {
     return "timeline";
   }
   if (kind === "completion") {
-    return "completed";
+    return "inbox";
   }
   if (fallback === "timeline") {
     return "timeline";
   }
   return kind === "approval" || kind === "plan" || kind === "choice"
-    ? "pending"
-    : fallback || "pending";
+    ? "inbox"
+    : fallback || "inbox";
+}
+
+function inboxSubtabForItemKind(kind, sourceSubtab = "") {
+  if (normalizeClientText(sourceSubtab || "") === "completed") {
+    return "completed";
+  }
+  return kind === "completion" ? "completed" : "pending";
 }
 
 function kindMeta(kind) {
@@ -3938,6 +4697,10 @@ function kindMeta(kind) {
       return { label: L("common.choice"), tone: "choice", icon: "choice" };
     case "completion":
       return { label: L("common.completion"), tone: "completion", icon: "completion-item" };
+    case "diff_thread":
+      return { label: L("common.diff"), tone: "neutral", icon: "diff" };
+    case "file_event":
+      return { label: L("common.fileEvent"), tone: "neutral", icon: "file-event" };
     default:
       return { label: L("common.item"), tone: "neutral", icon: "item" };
   }
@@ -3951,6 +4714,12 @@ function renderTypePillContent(kindInfo) {
 }
 
 function itemIntentText(kind, status = "pending") {
+  if (kind === "diff_thread") {
+    return L("intent.diffThread");
+  }
+  if (kind === "file_event") {
+    return L("intent.fileEvent");
+  }
   if (kind === "user_message") {
     return L("intent.userMessage");
   }
@@ -3978,6 +4747,12 @@ function itemIntentText(kind, status = "pending") {
 }
 
 function detailIntentText(detail) {
+  if (detail.kind === "diff_thread") {
+    return itemIntentText(detail.kind, "diff");
+  }
+  if (detail.kind === "file_event") {
+    return itemIntentText(detail.kind, "timeline");
+  }
   if (TIMELINE_MESSAGE_KINDS.has(detail.kind)) {
     return itemIntentText(detail.kind, "timeline");
   }
@@ -4031,6 +4806,10 @@ function fallbackSummaryForKind(kind, status) {
     return L("summary.completed");
   }
   switch (kind) {
+    case "diff_thread":
+      return L("summary.diffThread");
+    case "file_event":
+      return L("summary.fileEvent");
     case "user_message":
       return L("summary.userMessage");
     case "assistant_commentary":
@@ -4233,6 +5012,10 @@ function renderIcon(name) {
       return `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="8"/><path d="m8.7 12.1 2 2.1 4.7-4.9"/></svg>`;
     case "item":
       return `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><rect x="5" y="4.5" width="14" height="15" rx="2.5"/><path d="M8.5 9h7"/><path d="M8.5 12h7"/><path d="M8.5 15h4.5"/></svg>`;
+    case "file-event":
+      return `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M8 3.8h5.9l4.3 4.3v10a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2v-12.3a2 2 0 0 1 2-2Z"/><path d="M13.9 3.8v4.3h4.3"/><path d="M9.2 13.1h5.6"/><path d="M9.2 16.2h4"/></svg>`;
+    case "diff":
+      return `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M7.5 5.5v13"/><path d="M4.8 8.2 7.5 5.5 10.2 8.2"/><path d="M16.5 18.5v-13"/><path d="m13.8 15.8 2.7 2.7 2.7-2.7"/><path d="M11.8 7.5h1.2"/><path d="M11 12h2.8"/><path d="M11.8 16.5h1.2"/></svg>`;
     case "pending":
       return `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v5"/><path d="M12 16v5"/><path d="M4.8 6.8l3.5 3.5"/><path d="M15.7 15.7l3.5 3.5"/><path d="M3 12h5"/><path d="M16 12h5"/><path d="M4.8 17.2l3.5-3.5"/><path d="M15.7 8.3l3.5-3.5"/></svg>`;
     case "timeline":

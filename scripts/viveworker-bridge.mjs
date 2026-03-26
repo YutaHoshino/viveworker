@@ -26,7 +26,7 @@ const sessionCookieName = "viveworker_session";
 const deviceCookieName = "viveworker_device";
 const historyKinds = new Set(["completion", "plan_ready", "approval", "plan", "choice", "info"]);
 const timelineMessageKinds = new Set(["user_message", "assistant_commentary", "assistant_final"]);
-const timelineKinds = new Set([...timelineMessageKinds, "approval", "plan", "choice", "completion", "plan_ready"]);
+const timelineKinds = new Set([...timelineMessageKinds, "approval", "plan", "choice", "completion", "plan_ready", "file_event"]);
 const SQLITE_COMPLETION_BATCH_SIZE = 200;
 const DEFAULT_DEVICE_TRUST_TTL_MS = 30 * 24 * 60 * 60 * 1000;
 const MAX_PAIRED_DEVICES = 200;
@@ -75,6 +75,7 @@ const runtime = {
   planDetailsByToken: new Map(),
   recentHistoryItems: [],
   recentTimelineEntries: [],
+  recentCodeEvents: [],
   pairingAttemptsByRemoteAddress: new Map(),
   ipcClient: null,
   stopping: false,
@@ -85,6 +86,7 @@ const restoredPendingPlanStateChanged = restorePendingPlanRequests({ config, run
 const restoredPendingUserInputStateChanged = restorePendingUserInputRequests({ config, runtime, state });
 runtime.recentHistoryItems = normalizeHistoryItems(state.recentHistoryItems ?? [], config.maxHistoryItems);
 runtime.recentTimelineEntries = normalizeTimelineEntries(state.recentTimelineEntries ?? [], config.maxTimelineEntries);
+const migratedRecentCodeEventsStateChanged = migrateRecentCodeEventsState({ config, runtime, state });
 const restoredTimelineImagePathsStateChanged = await backfillPersistedTimelineImagePaths({ config, runtime, state });
 runtime.historyFileState.offset = Number(state.historyFileOffset) || 0;
 runtime.historyFileState.sourceFile = cleanText(state.historyFileSourceFile ?? "");
@@ -214,6 +216,10 @@ function kindTitle(locale, kind) {
       return t(locale, "server.title.choice");
     case "completion":
       return t(locale, "server.title.complete");
+    case "file_event":
+      return t(locale, "common.fileEvent");
+    case "diff_thread":
+      return t(locale, "common.diff");
     default:
       return t(locale, "common.item");
   }
@@ -272,6 +278,37 @@ function normalizeTimelineOutcome(value) {
   return ["pending", "approved", "rejected", "implemented", "dismissed", "submitted"].includes(normalized)
     ? normalized
     : "";
+}
+
+function normalizeTimelineFileEventType(value) {
+  const normalized = cleanText(value || "").toLowerCase();
+  return ["read", "write", "create"].includes(normalized) ? normalized : "";
+}
+
+function fileEventTitle(locale, fileEventType) {
+  switch (normalizeTimelineFileEventType(fileEventType)) {
+    case "read":
+      return t(locale, "fileEvent.read");
+    case "write":
+      return t(locale, "fileEvent.write");
+    case "create":
+      return t(locale, "fileEvent.create");
+    default:
+      return t(locale, "common.fileEvent");
+  }
+}
+
+function fileEventDetailCopy(locale, fileEventType) {
+  switch (normalizeTimelineFileEventType(fileEventType)) {
+    case "read":
+      return t(locale, "detail.fileEvent.read");
+    case "write":
+      return t(locale, "detail.fileEvent.write");
+    case "create":
+      return t(locale, "detail.fileEvent.create");
+    default:
+      return t(locale, "detail.detailUnavailable");
+  }
 }
 
 function inferTimelineOutcome(kind, summary = "", messageText = "") {
@@ -448,6 +485,617 @@ function extractTimelineFileRefs(messageText = "") {
   return normalizeTimelineFileRefs(refs);
 }
 
+function tokenizeShellWords(commandText) {
+  const source = String(commandText || "");
+  if (!source) {
+    return [];
+  }
+
+  const tokens = [];
+  let current = "";
+  let quote = "";
+  let escaping = false;
+
+  for (const character of source) {
+    if (escaping) {
+      current += character;
+      escaping = false;
+      continue;
+    }
+
+    if (character === "\\") {
+      escaping = true;
+      continue;
+    }
+
+    if (quote) {
+      if (character === quote) {
+        quote = "";
+      } else {
+        current += character;
+      }
+      continue;
+    }
+
+    if (character === "'" || character === "\"") {
+      quote = character;
+      continue;
+    }
+
+    if (/\s/u.test(character)) {
+      if (current) {
+        tokens.push(current);
+        current = "";
+      }
+      continue;
+    }
+
+    current += character;
+  }
+
+  if (current) {
+    tokens.push(current);
+  }
+  return tokens;
+}
+
+function unwrapShellCommand(commandText) {
+  const normalized = String(commandText || "").trim();
+  if (!normalized) {
+    return "";
+  }
+
+  const shellMatch = normalized.match(/^\/bin\/(?:zsh|bash|sh)\s+-lc\s+(['"])([\s\S]*)\1$/u);
+  if (!shellMatch) {
+    return normalized;
+  }
+
+  return shellMatch[2]
+    .replace(/\\(["'\\])/gu, "$1")
+    .trim();
+}
+
+function extractCommandLineFromFunctionOutput(outputText) {
+  const match = String(outputText || "").match(/^Command:\s+(.+)$/mu);
+  return unwrapShellCommand(match?.[1] || "");
+}
+
+function extractReadFileRefsFromCommand(commandText) {
+  const normalizedCommand = unwrapShellCommand(commandText);
+  const tokens = tokenizeShellWords(normalizedCommand);
+  if (tokens.length === 0) {
+    return [];
+  }
+
+  const command = cleanText(tokens[0]);
+  if (!command || ["ls", "find"].includes(command)) {
+    return [];
+  }
+  if (command === "git" && cleanText(tokens[1] || "") === "status") {
+    return [];
+  }
+  if (command === "rg" && tokens.includes("--files")) {
+    return [];
+  }
+
+  if (command === "cat" || command === "nl") {
+    return normalizeTimelineFileRefs(tokens.slice(1).filter((token) => !String(token || "").startsWith("-")));
+  }
+
+  if (command === "sed") {
+    if (!tokens.includes("-n")) {
+      return [];
+    }
+    return normalizeTimelineFileRefs(tokens.slice(1).filter((token) => !String(token || "").startsWith("-")));
+  }
+
+  if (command === "rg") {
+    if (!tokens.includes("-n")) {
+      return [];
+    }
+
+    let seenPattern = false;
+    const fileArgs = [];
+    for (const token of tokens.slice(1)) {
+      if (!seenPattern) {
+        if (token === "--") {
+          seenPattern = true;
+          continue;
+        }
+        if (String(token || "").startsWith("-")) {
+          continue;
+        }
+        seenPattern = true;
+        continue;
+      }
+      fileArgs.push(token);
+    }
+
+    return normalizeTimelineFileRefs(fileArgs);
+  }
+
+  return [];
+}
+
+function extractUpdatedFileRefsByType(outputText) {
+  const parsed = safeJsonParse(outputText);
+  const sourceText = typeof parsed?.output === "string" ? parsed.output : String(outputText || "");
+  if (!/^Success\. Updated the following files:/mu.test(sourceText)) {
+    return { create: [], write: [] };
+  }
+
+  const createRefs = [];
+  const writeRefs = [];
+  for (const line of sourceText.split("\n")) {
+    const match = line.match(/^([AMD])\s+(.+)$/u);
+    if (!match) {
+      continue;
+    }
+    const fileRef = cleanTimelineFileRef(match[2]);
+    if (!fileRef) {
+      continue;
+    }
+    if (match[1] === "A") {
+      createRefs.push(fileRef);
+    } else if (match[1] === "M") {
+      writeRefs.push(fileRef);
+    }
+  }
+
+  return {
+    create: normalizeTimelineFileRefs(createRefs),
+    write: normalizeTimelineFileRefs(writeRefs),
+  };
+}
+
+function normalizeTimelineDiffSource(value) {
+  const normalized = cleanText(value || "");
+  return normalized === "apply_patch" || normalized === "git" || normalized === "approval_request" ? normalized : "";
+}
+
+function normalizeTimelineDiffText(value) {
+  return String(value || "")
+    .replace(/\r\n/gu, "\n")
+    .trim();
+}
+
+function diffLineCounts(diffText) {
+  let addedLines = 0;
+  let removedLines = 0;
+  for (const line of String(diffText || "").split("\n")) {
+    if (!line || line.startsWith("+++ ") || line.startsWith("--- ")) {
+      continue;
+    }
+    if (line.startsWith("+")) {
+      addedLines += 1;
+      continue;
+    }
+    if (line.startsWith("-")) {
+      removedLines += 1;
+    }
+  }
+  return { addedLines, removedLines };
+}
+
+function rememberApplyPatchInput(fileState, payload, createdAtMs = Date.now()) {
+  const callId = cleanText(payload?.call_id ?? payload?.callId ?? "");
+  if (!callId || cleanText(payload?.name ?? "") !== "apply_patch") {
+    return;
+  }
+  const inputText = normalizeTimelineDiffText(payload?.input ?? "");
+  if (!inputText) {
+    return;
+  }
+  if (!(fileState.applyPatchInputsByCallId instanceof Map)) {
+    fileState.applyPatchInputsByCallId = new Map();
+  }
+  fileState.applyPatchInputsByCallId.set(callId, {
+    inputText,
+    cwd: cleanText(fileState.cwd || ""),
+    createdAtMs: Number(createdAtMs) || Date.now(),
+  });
+  while (fileState.applyPatchInputsByCallId.size > 64) {
+    const oldestKey = fileState.applyPatchInputsByCallId.keys().next().value;
+    if (!oldestKey) {
+      break;
+    }
+    fileState.applyPatchInputsByCallId.delete(oldestKey);
+  }
+}
+
+async function findStoredApplyPatchInput({ fileState, callId, rolloutFilePath }) {
+  const normalizedCallId = cleanText(callId || "");
+  if (!normalizedCallId) {
+    return null;
+  }
+
+  const inMemory =
+    fileState?.applyPatchInputsByCallId instanceof Map
+      ? fileState.applyPatchInputsByCallId.get(normalizedCallId)
+      : null;
+  if (inMemory?.inputText) {
+    return inMemory;
+  }
+
+  const normalizedRolloutFilePath = cleanText(rolloutFilePath || "");
+  if (!normalizedRolloutFilePath) {
+    return null;
+  }
+
+  let content = "";
+  try {
+    content = await fs.readFile(normalizedRolloutFilePath, "utf8");
+  } catch {
+    return null;
+  }
+
+  const lines = content.split("\n");
+  for (let index = lines.length - 1; index >= 0; index -= 1) {
+    const rawLine = lines[index];
+    if (!rawLine.trim()) {
+      continue;
+    }
+    let record;
+    try {
+      record = JSON.parse(rawLine);
+    } catch {
+      continue;
+    }
+    if (cleanText(record?.type || "") !== "response_item") {
+      continue;
+    }
+    const payload = isPlainObject(record?.payload) ? record.payload : null;
+    if (!payload) {
+      continue;
+    }
+    if (
+      cleanText(payload?.type || "") !== "custom_tool_call" ||
+      cleanText(payload?.call_id ?? payload?.callId ?? "") !== normalizedCallId ||
+      cleanText(payload?.name || "") !== "apply_patch"
+    ) {
+      continue;
+    }
+
+    const inputText = normalizeTimelineDiffText(payload?.input ?? "");
+    if (!inputText) {
+      return null;
+    }
+
+    const restored = {
+      inputText,
+      cwd: cleanText(fileState?.cwd || ""),
+      createdAtMs: Date.parse(record?.timestamp ?? "") || Date.now(),
+    };
+    if (!(fileState?.applyPatchInputsByCallId instanceof Map)) {
+      fileState.applyPatchInputsByCallId = new Map();
+    }
+    fileState.applyPatchInputsByCallId.set(normalizedCallId, restored);
+    return restored;
+  }
+
+  return null;
+}
+
+function diffPathForSide(fileRef, side) {
+  const normalizedFileRef = cleanText(fileRef || "");
+  if (!normalizedFileRef) {
+    return side === "a" ? "a/unknown" : "b/unknown";
+  }
+  if (normalizedFileRef === "/dev/null") {
+    return normalizedFileRef;
+  }
+  if (normalizedFileRef.startsWith("/")) {
+    return `${side}${normalizedFileRef}`;
+  }
+  return `${side}/${normalizedFileRef}`;
+}
+
+function parseApplyPatchSections(patchText) {
+  const sections = [];
+  const lines = String(patchText || "").replace(/\r\n/gu, "\n").split("\n");
+  let current = null;
+
+  function pushCurrent() {
+    if (!current?.fileRef) {
+      current = null;
+      return;
+    }
+    sections.push({
+      kind: current.kind,
+      fileRef: current.fileRef,
+      bodyLines: [...current.bodyLines],
+    });
+    current = null;
+  }
+
+  for (const line of lines) {
+    const addMatch = line.match(/^\*\*\* Add File:\s+(.+)$/u);
+    if (addMatch) {
+      pushCurrent();
+      current = {
+        kind: "create",
+        fileRef: cleanTimelineFileRef(addMatch[1]),
+        bodyLines: [],
+      };
+      continue;
+    }
+
+    const updateMatch = line.match(/^\*\*\* Update File:\s+(.+)$/u);
+    if (updateMatch) {
+      pushCurrent();
+      current = {
+        kind: "write",
+        fileRef: cleanTimelineFileRef(updateMatch[1]),
+        bodyLines: [],
+      };
+      continue;
+    }
+
+    const deleteMatch = line.match(/^\*\*\* Delete File:\s+(.+)$/u);
+    if (deleteMatch) {
+      pushCurrent();
+      current = {
+        kind: "delete",
+        fileRef: cleanTimelineFileRef(deleteMatch[1]),
+        bodyLines: [],
+      };
+      continue;
+    }
+
+    if (!current) {
+      continue;
+    }
+
+    const moveMatch = line.match(/^\*\*\* Move to:\s+(.+)$/u);
+    if (moveMatch) {
+      const movedFileRef = cleanTimelineFileRef(moveMatch[1]);
+      if (movedFileRef) {
+        current.fileRef = movedFileRef;
+      }
+      continue;
+    }
+
+    if (line === "*** End Patch") {
+      pushCurrent();
+      break;
+    }
+
+    if (line === "*** End of File") {
+      continue;
+    }
+
+    current.bodyLines.push(line);
+  }
+
+  pushCurrent();
+  return sections;
+}
+
+function buildUnifiedDiffFromApplyPatchSection(section) {
+  if (!section?.fileRef) {
+    return "";
+  }
+
+  const bodyLines = Array.isArray(section.bodyLines) ? section.bodyLines : [];
+  const fileRef = section.fileRef;
+  const diffLines = [`diff --git ${diffPathForSide(fileRef, "a")} ${diffPathForSide(fileRef, "b")}`];
+
+  if (section.kind === "create") {
+    const addedCount = bodyLines.filter((line) => line.startsWith("+")).length;
+    diffLines.push("new file mode 100644");
+    diffLines.push("--- /dev/null");
+    diffLines.push(`+++ ${diffPathForSide(fileRef, "b")}`);
+    diffLines.push(`@@ -0,0 +1,${Math.max(addedCount, 1)} @@`);
+    diffLines.push(...bodyLines);
+    return normalizeTimelineDiffText(diffLines.join("\n"));
+  }
+
+  if (section.kind === "write") {
+    diffLines.push(`--- ${diffPathForSide(fileRef, "a")}`);
+    diffLines.push(`+++ ${diffPathForSide(fileRef, "b")}`);
+    diffLines.push(...bodyLines);
+    return normalizeTimelineDiffText(diffLines.join("\n"));
+  }
+
+  return "";
+}
+
+function buildApplyPatchDiffForFileRefs(patchText, fileRefs, fileEventType) {
+  const normalizedRefs = normalizeTimelineFileRefs(fileRefs);
+  if (!normalizedRefs.length) {
+    return "";
+  }
+
+  const sections = parseApplyPatchSections(patchText).filter((section) => {
+    if (!section?.fileRef || section.kind !== fileEventType) {
+      return false;
+    }
+    return normalizedRefs.some((fileRef) => timelineFileRefsMatch(fileRef, section.fileRef));
+  });
+
+  if (sections.length === 0) {
+    return "";
+  }
+
+  return normalizeTimelineDiffText(
+    sections
+      .map((section) => buildUnifiedDiffFromApplyPatchSection(section))
+      .filter(Boolean)
+      .join("\n\n")
+  );
+}
+
+function timelineFileRefsMatch(left, right) {
+  const normalizedLeft = cleanTimelineFileRef(left);
+  const normalizedRight = cleanTimelineFileRef(right);
+  if (!normalizedLeft || !normalizedRight) {
+    return false;
+  }
+  if (normalizedLeft === normalizedRight) {
+    return true;
+  }
+  return normalizedLeft.endsWith(`/${normalizedRight}`) || normalizedRight.endsWith(`/${normalizedLeft}`);
+}
+
+async function captureGitDiffText({ cwd, fileRefs }) {
+  const normalizedCwd = cleanText(cwd || "");
+  const normalizedFileRefs = normalizeTimelineFileRefs(fileRefs)
+    .map((fileRef) => gitPathspecForFileRef(normalizedCwd, fileRef))
+    .filter(Boolean);
+  if (!normalizedCwd || normalizedFileRefs.length === 0) {
+    return "";
+  }
+
+  return new Promise((resolve) => {
+    const child = spawn("git", ["diff", "--no-ext-diff", "--no-color", "--", ...normalizedFileRefs], {
+      cwd: normalizedCwd,
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+
+    let stdout = "";
+    child.stdout.on("data", (chunk) => {
+      stdout += chunk.toString("utf8");
+    });
+    child.on("error", () => {
+      resolve("");
+    });
+    child.on("close", (code) => {
+      if (code !== 0) {
+        resolve("");
+        return;
+      }
+      resolve(normalizeTimelineDiffText(stdout));
+    });
+  });
+}
+
+function gitPathspecForFileRef(cwd, fileRef) {
+  const normalizedCwd = resolvePath(cleanText(cwd || ""));
+  const normalizedFileRef = cleanText(fileRef || "");
+  if (!normalizedCwd || !normalizedFileRef) {
+    return "";
+  }
+  if (!path.isAbsolute(normalizedFileRef)) {
+    return normalizedFileRef;
+  }
+
+  const resolvedFileRef = resolvePath(normalizedFileRef);
+  const relativePath = path.relative(normalizedCwd, resolvedFileRef);
+  if (!relativePath || relativePath.startsWith("..")) {
+    return "";
+  }
+  return relativePath;
+}
+
+async function buildFileEventDiff({ fileState, callId, fileRefs, fileEventType, rolloutFilePath = "" }) {
+  const normalizedFileEventType = normalizeTimelineFileEventType(fileEventType);
+  if (!["write", "create"].includes(normalizedFileEventType)) {
+    return {
+      diffText: "",
+      diffSource: "",
+      diffAvailable: false,
+      diffAddedLines: 0,
+      diffRemovedLines: 0,
+    };
+  }
+
+  const storedPatch = await findStoredApplyPatchInput({
+    fileState,
+    callId,
+    rolloutFilePath,
+  });
+  let diffText = buildApplyPatchDiffForFileRefs(storedPatch?.inputText || "", fileRefs, normalizedFileEventType);
+  let diffSource = diffText ? "apply_patch" : "";
+
+  if (!diffText) {
+    diffText = await captureGitDiffText({
+      cwd: cleanText(storedPatch?.cwd || fileState?.cwd || ""),
+      fileRefs,
+    });
+    diffSource = diffText ? "git" : "";
+  }
+
+  const counts = diffLineCounts(diffText);
+  return {
+    diffText,
+    diffSource,
+    diffAvailable: Boolean(diffText),
+    diffAddedLines: counts.addedLines,
+    diffRemovedLines: counts.removedLines,
+  };
+}
+
+function normalizeUnifiedDiffSectionFileRef(value) {
+  const normalized = cleanText(value || "");
+  if (!normalized || normalized === "/dev/null") {
+    return "";
+  }
+  if (normalized.startsWith("a/") || normalized.startsWith("b/")) {
+    return cleanTimelineFileRef(normalized.slice(2));
+  }
+  return cleanTimelineFileRef(normalized);
+}
+
+function extractUnifiedDiffSectionFileRef(sectionText) {
+  const lines = String(sectionText || "").replace(/\r\n/gu, "\n").split("\n");
+  const preferredPrefixes = ["+++ ", "--- "];
+  for (const prefix of preferredPrefixes) {
+    for (const line of lines) {
+      if (!line.startsWith(prefix)) {
+        continue;
+      }
+      const fileRef = normalizeUnifiedDiffSectionFileRef(line.slice(prefix.length));
+      if (fileRef) {
+        return fileRef;
+      }
+    }
+  }
+  return "";
+}
+
+function splitUnifiedDiffTextByFile(diffText) {
+  const normalizedDiffText = normalizeTimelineDiffText(diffText);
+  if (!normalizedDiffText) {
+    return [];
+  }
+
+  const lines = normalizedDiffText.split("\n");
+  const sections = [];
+  let currentLines = [];
+
+  function pushCurrent() {
+    if (currentLines.length === 0) {
+      return;
+    }
+    const sectionText = normalizeTimelineDiffText(currentLines.join("\n"));
+    if (!sectionText) {
+      currentLines = [];
+      return;
+    }
+    sections.push({
+      fileRef: extractUnifiedDiffSectionFileRef(sectionText),
+      diffText: sectionText,
+    });
+    currentLines = [];
+  }
+
+  for (const line of lines) {
+    if (line.startsWith("diff --git ")) {
+      pushCurrent();
+      currentLines = [line];
+      continue;
+    }
+    if (currentLines.length === 0) {
+      currentLines = [line];
+      continue;
+    }
+    currentLines.push(line);
+  }
+
+  pushCurrent();
+  return sections.filter((section) => section.diffText);
+}
+
 function handleSignal() {
   runtime.stopping = true;
 }
@@ -546,6 +1194,35 @@ function normalizeTimelineEntries(rawItems, maxItems) {
   return deduped;
 }
 
+function isCodeEventEntry(raw) {
+  if (!isPlainObject(raw)) {
+    return false;
+  }
+  if (cleanText(raw.kind || "") !== "file_event") {
+    return false;
+  }
+  const fileEventType = normalizeTimelineFileEventType(raw.fileEventType ?? "");
+  return fileEventType === "write" || fileEventType === "create";
+}
+
+function normalizeCodeEvents(rawItems, maxItems) {
+  const candidates = Array.isArray(rawItems) ? rawItems.filter((item) => isCodeEventEntry(item)) : [];
+  return normalizeTimelineEntries(candidates, maxItems);
+}
+
+function migrateRecentCodeEventsState({ config, runtime, state }) {
+  const nextItems = normalizeCodeEvents(
+    Array.isArray(state.recentCodeEvents) && state.recentCodeEvents.length > 0
+      ? state.recentCodeEvents
+      : state.recentTimelineEntries ?? runtime.recentTimelineEntries,
+    config.maxCodeEvents
+  );
+  const previousItems = Array.isArray(state.recentCodeEvents) ? normalizeCodeEvents(state.recentCodeEvents, config.maxCodeEvents) : [];
+  runtime.recentCodeEvents = nextItems;
+  state.recentCodeEvents = nextItems;
+  return JSON.stringify(nextItems) !== JSON.stringify(previousItems);
+}
+
 function timelineKindSortPriority(kind) {
   switch (cleanText(kind || "")) {
     case "completion":
@@ -555,6 +1232,8 @@ function timelineKindSortPriority(kind) {
     case "plan_ready":
     case "choice":
       return 60;
+    case "file_event":
+      return 45;
     case "assistant_final":
       return 50;
     case "assistant_commentary":
@@ -579,13 +1258,21 @@ function normalizeTimelineEntry(raw) {
   }
 
   const messageText = normalizeTimelineMessageText(raw.messageText ?? "");
+  const fileEventType = normalizeTimelineFileEventType(raw.fileEventType ?? "");
+  const diffText = normalizeTimelineDiffText(raw.diffText ?? "");
+  const diffSource = normalizeTimelineDiffSource(raw.diffSource ?? "");
+  const diffCounts = diffLineCounts(diffText);
   const summary =
     normalizeNotificationText(raw.summary ?? "") ||
     formatNotificationBody(messageText, 180) ||
-    cleanText(raw.title ?? "") ||
+    (kind === "file_event" ? "" : cleanText(raw.title ?? "")) ||
     "";
   const threadLabel = cleanText(raw.threadLabel ?? "");
-  const title = cleanText(raw.title ?? "") || threadLabel || kindTitle(DEFAULT_LOCALE, kind);
+  const title =
+    cleanText(raw.title ?? "") ||
+    (kind === "file_event" ? fileEventTitle(DEFAULT_LOCALE, fileEventType) : "") ||
+    threadLabel ||
+    kindTitle(DEFAULT_LOCALE, kind);
   const outcome = normalizeTimelineOutcome(raw.outcome ?? "") || inferTimelineOutcome(kind, summary, messageText);
 
   return {
@@ -597,8 +1284,16 @@ function normalizeTimelineEntry(raw) {
     title,
     summary,
     messageText,
+    fileEventType,
     imagePaths: normalizeTimelineImagePaths(raw.imagePaths ?? raw.localImagePaths ?? []),
     fileRefs: normalizeTimelineFileRefs(raw.fileRefs ?? extractTimelineFileRefs(messageText)),
+    diffText,
+    diffSource,
+    diffAvailable: raw.diffAvailable === true || Boolean(diffText),
+    diffAddedLines:
+      Math.max(0, Number(raw.diffAddedLines)) || diffCounts.addedLines,
+    diffRemovedLines:
+      Math.max(0, Number(raw.diffRemovedLines)) || diffCounts.removedLines,
     outcome,
     createdAtMs,
     readOnly: raw.readOnly !== false,
@@ -618,10 +1313,122 @@ function recordTimelineEntry({ config, runtime, state, entry }) {
     config.maxTimelineEntries
   );
   const changed =
-    JSON.stringify(nextItems.map((item) => [item.stableId, item.title, item.createdAtMs])) !==
-    JSON.stringify(runtime.recentTimelineEntries.map((item) => [item.stableId, item.title, item.createdAtMs]));
+    JSON.stringify(
+      nextItems.map((item) => [
+        item.stableId,
+        item.title,
+        item.createdAtMs,
+        item.diffAvailable,
+        item.diffSource,
+        item.diffAddedLines,
+        item.diffRemovedLines,
+        item.diffText,
+      ])
+    ) !==
+    JSON.stringify(
+      runtime.recentTimelineEntries.map((item) => [
+        item.stableId,
+        item.title,
+        item.createdAtMs,
+        item.diffAvailable,
+        item.diffSource,
+        item.diffAddedLines,
+        item.diffRemovedLines,
+        item.diffText,
+      ])
+    );
   runtime.recentTimelineEntries = nextItems;
   state.recentTimelineEntries = nextItems;
+  return changed;
+}
+
+function recordCodeEvent({ config, runtime, state, entry }) {
+  if (!isCodeEventEntry(entry)) {
+    return false;
+  }
+  const normalized = normalizeTimelineEntry(entry);
+  if (!normalized) {
+    return false;
+  }
+
+  const nextItems = normalizeCodeEvents(
+    [normalized, ...runtime.recentCodeEvents.filter((item) => item.stableId !== normalized.stableId)],
+    config.maxCodeEvents
+  );
+  const changed =
+    JSON.stringify(
+      nextItems.map((item) => [
+        item.stableId,
+        item.title,
+        item.createdAtMs,
+        item.diffAvailable,
+        item.diffSource,
+        item.diffAddedLines,
+        item.diffRemovedLines,
+        item.diffText,
+      ])
+    ) !==
+    JSON.stringify(
+      runtime.recentCodeEvents.map((item) => [
+        item.stableId,
+        item.title,
+        item.createdAtMs,
+        item.diffAvailable,
+        item.diffSource,
+        item.diffAddedLines,
+        item.diffRemovedLines,
+        item.diffText,
+      ])
+    );
+  runtime.recentCodeEvents = nextItems;
+  state.recentCodeEvents = nextItems;
+  return changed;
+}
+
+function syncRecentCodeEventsFromTimeline({ config, runtime, state }) {
+  const timelineCodeEvents = normalizeCodeEvents(runtime.recentTimelineEntries, config.maxCodeEvents);
+  if (timelineCodeEvents.length === 0 && runtime.recentCodeEvents.length === 0) {
+    return false;
+  }
+
+  const nextItems = normalizeCodeEvents(
+    [
+      ...timelineCodeEvents,
+      ...runtime.recentCodeEvents.filter(
+        (entry) => !timelineCodeEvents.some((timelineEntry) => timelineEntry.stableId === entry.stableId)
+      ),
+    ],
+    config.maxCodeEvents
+  );
+  const changed =
+    JSON.stringify(
+      nextItems.map((item) => [
+        item.stableId,
+        item.title,
+        item.createdAtMs,
+        item.threadLabel,
+        item.diffAvailable,
+        item.diffSource,
+        item.diffAddedLines,
+        item.diffRemovedLines,
+        item.diffText,
+      ])
+    ) !==
+    JSON.stringify(
+      runtime.recentCodeEvents.map((item) => [
+        item.stableId,
+        item.title,
+        item.createdAtMs,
+        item.threadLabel,
+        item.diffAvailable,
+        item.diffSource,
+        item.diffAddedLines,
+        item.diffRemovedLines,
+        item.diffText,
+      ])
+    );
+  runtime.recentCodeEvents = nextItems;
+  state.recentCodeEvents = nextItems;
   return changed;
 }
 
@@ -1026,12 +1833,26 @@ async function scanOnce({ config, runtime, state }) {
     });
     dirty = dirty || persistedTimelineImageBackfillChanged;
 
+    const timelineDiffBackfillChanged = await backfillRecentTimelineEntryDiffs({
+      config,
+      runtime,
+      state,
+    });
+    dirty = dirty || timelineDiffBackfillChanged;
+
     const interruptedTimelineBackfillChanged = backfillInterruptedTimelineEntries({
       config,
       runtime,
       state,
     });
     dirty = dirty || interruptedTimelineBackfillChanged;
+
+    const codeEventsSyncChanged = syncRecentCodeEventsFromTimeline({
+      config,
+      runtime,
+      state,
+    });
+    dirty = dirty || codeEventsSyncChanged;
   }
 
   dirty = cleanupExpiredPlanRequests({ runtime, state, now }) || dirty;
@@ -1062,6 +1883,7 @@ async function processRolloutFile({ filePath, config, runtime, state, now }) {
       remainder: "",
       threadId: extractThreadIdFromRolloutPath(filePath),
       cwd: null,
+      applyPatchInputsByCallId: new Map(),
       startupCutoffMs:
         typeof restoredOffset === "number" ? 0 : now - config.replaySeconds * 1000,
       skipPartialLine:
@@ -1141,6 +1963,30 @@ async function processRolloutFile({ filePath, config, runtime, state, now }) {
             entry: timelineEntry,
           }) || dirty;
       }
+
+      const fileTimelineEntries = await buildRolloutFileTimelineEntries({
+        config,
+        record,
+        fileState,
+        runtime,
+        rolloutFilePath: filePath,
+      });
+      for (const fileTimelineEntry of fileTimelineEntries) {
+        dirty =
+          recordTimelineEntry({
+            config,
+            runtime,
+            state,
+            entry: fileTimelineEntry,
+          }) || dirty;
+        dirty =
+          recordCodeEvent({
+            config,
+            runtime,
+            state,
+            entry: fileTimelineEntry,
+          }) || dirty;
+      }
     }
 
     const event = buildRolloutEvent({
@@ -1171,6 +2017,11 @@ async function processRolloutFile({ filePath, config, runtime, state, now }) {
 
   fileState.startupCutoffMs = 0;
   return dirty;
+}
+
+function fileEventCallIdFromStableId(stableId) {
+  const match = cleanText(stableId || "").match(/^file_event:(?:read|write|create):[^:]+:(call_[^:]+)$/u);
+  return match ? cleanText(match[1]) : "";
 }
 
 async function processSqliteCompletionLog({ config, runtime, state, now }) {
@@ -1511,6 +2362,72 @@ async function backfillPersistedTimelineImagePaths({ config, runtime, state }) {
       continue;
     }
     nextEntries.push(entry);
+  }
+
+  if (!changed) {
+    return false;
+  }
+
+  const normalized = normalizeTimelineEntries(nextEntries, config.maxTimelineEntries);
+  runtime.recentTimelineEntries = normalized;
+  state.recentTimelineEntries = normalized;
+  return true;
+}
+
+async function backfillRecentTimelineEntryDiffs({ config, runtime, state }) {
+  const nextEntries = runtime.recentTimelineEntries.map((entry) => ({ ...entry }));
+  let changed = false;
+
+  for (let index = 0; index < nextEntries.length; index += 1) {
+    const entry = nextEntries[index];
+    if (
+      cleanText(entry?.kind || "") !== "file_event" ||
+      !["write", "create"].includes(normalizeTimelineFileEventType(entry?.fileEventType || "")) ||
+      entry?.diffAvailable === true
+    ) {
+      continue;
+    }
+
+    const callId = fileEventCallIdFromStableId(entry?.stableId || "");
+    const rolloutFilePath = findRolloutFileForThread(runtime, entry?.threadId || "");
+    if (!callId || !rolloutFilePath) {
+      continue;
+    }
+
+    let fileState = runtime.fileStates.get(rolloutFilePath);
+    if (!fileState) {
+      fileState = {
+        offset: 0,
+        remainder: "",
+        threadId: cleanText(entry?.threadId || ""),
+        cwd: await findRolloutThreadCwd(runtime, entry?.threadId || ""),
+        applyPatchInputsByCallId: new Map(),
+        startupCutoffMs: 0,
+        skipPartialLine: false,
+      };
+      runtime.fileStates.set(rolloutFilePath, fileState);
+    }
+
+    const nextDiff = await buildFileEventDiff({
+      fileState,
+      callId,
+      fileRefs: entry?.fileRefs ?? [],
+      fileEventType: entry?.fileEventType ?? "",
+      rolloutFilePath,
+    });
+    if (!nextDiff.diffAvailable) {
+      continue;
+    }
+
+    nextEntries[index] = normalizeTimelineEntry({
+      ...entry,
+      diffText: nextDiff.diffText,
+      diffSource: nextDiff.diffSource,
+      diffAvailable: nextDiff.diffAvailable,
+      diffAddedLines: nextDiff.diffAddedLines,
+      diffRemovedLines: nextDiff.diffRemovedLines,
+    });
+    changed = true;
   }
 
   if (!changed) {
@@ -1956,6 +2873,128 @@ function buildRolloutUserTimelineEntry({ record, fileState, runtime }) {
     createdAtMs,
     readOnly: true,
   });
+}
+
+async function buildRolloutFileTimelineEntries({ config, record, fileState, runtime, rolloutFilePath = "" }) {
+  if (!isPlainObject(record) || cleanText(record.type) !== "response_item") {
+    return [];
+  }
+
+  const payload = isPlainObject(record.payload) ? record.payload : null;
+  const payloadType = cleanText(payload?.type || "");
+  const threadId = cleanText(fileState.threadId || "");
+  if (!payload || !threadId) {
+    return [];
+  }
+
+  const createdAtMs = Date.parse(record.timestamp ?? "") || Date.now();
+  const callId = cleanText(payload.call_id || record.timestamp || "");
+  const threadLabel = getNativeThreadLabel({
+    runtime,
+    conversationId: threadId,
+    cwd: fileState.cwd || "",
+  });
+
+  if (payloadType === "custom_tool_call") {
+    rememberApplyPatchInput(fileState, payload, createdAtMs);
+    return [];
+  }
+
+  if (payloadType === "function_call_output") {
+    const commandText = extractCommandLineFromFunctionOutput(payload.output ?? "");
+    const fileRefs = extractReadFileRefsFromCommand(commandText);
+    if (fileRefs.length === 0) {
+      return [];
+    }
+    return [
+      normalizeTimelineEntry({
+        stableId: `file_event:read:${threadId}:${callId || historyToken(`${threadId}:${createdAtMs}:${fileRefs.join("|")}`)}`,
+        token: historyToken(`file_event:read:${threadId}:${callId || createdAtMs}`),
+        kind: "file_event",
+        fileEventType: "read",
+        threadId,
+        threadLabel,
+        title: fileEventTitle(DEFAULT_LOCALE, "read"),
+        summary: "",
+        fileRefs,
+        createdAtMs,
+        readOnly: true,
+      }),
+    ].filter(Boolean);
+  }
+
+  if (payloadType === "custom_tool_call_output") {
+    const updates = extractUpdatedFileRefsByType(payload.output ?? "");
+    const entries = [];
+    const createDiff = await buildFileEventDiff({
+      fileState,
+      callId,
+      fileRefs: updates.create,
+      fileEventType: "create",
+      rolloutFilePath,
+    });
+    const writeDiff = await buildFileEventDiff({
+      fileState,
+      callId,
+      fileRefs: updates.write,
+      fileEventType: "write",
+      rolloutFilePath,
+    });
+
+    if (updates.create.length > 0) {
+      entries.push(
+        normalizeTimelineEntry({
+          stableId: `file_event:create:${threadId}:${callId || historyToken(`${threadId}:${createdAtMs}:${updates.create.join("|")}`)}`,
+          token: historyToken(`file_event:create:${threadId}:${callId || createdAtMs}`),
+          kind: "file_event",
+          fileEventType: "create",
+          threadId,
+          threadLabel,
+          title: fileEventTitle(DEFAULT_LOCALE, "create"),
+          summary: "",
+          fileRefs: updates.create,
+          diffText: createDiff.diffText,
+          diffSource: createDiff.diffSource,
+          diffAvailable: createDiff.diffAvailable,
+          diffAddedLines: createDiff.diffAddedLines,
+          diffRemovedLines: createDiff.diffRemovedLines,
+          createdAtMs,
+          readOnly: true,
+        })
+      );
+    }
+
+    if (updates.write.length > 0) {
+      entries.push(
+        normalizeTimelineEntry({
+          stableId: `file_event:write:${threadId}:${callId || historyToken(`${threadId}:${createdAtMs}:${updates.write.join("|")}`)}`,
+          token: historyToken(`file_event:write:${threadId}:${callId || createdAtMs}`),
+          kind: "file_event",
+          fileEventType: "write",
+          threadId,
+          threadLabel,
+          title: fileEventTitle(DEFAULT_LOCALE, "write"),
+          summary: "",
+          fileRefs: updates.write,
+          diffText: writeDiff.diffText,
+          diffSource: writeDiff.diffSource,
+          diffAvailable: writeDiff.diffAvailable,
+          diffAddedLines: writeDiff.diffAddedLines,
+          diffRemovedLines: writeDiff.diffRemovedLines,
+          createdAtMs,
+          readOnly: true,
+        })
+      );
+    }
+
+    if (callId && fileState.applyPatchInputsByCallId instanceof Map) {
+      fileState.applyPatchInputsByCallId.delete(callId);
+    }
+
+    return entries.filter(Boolean);
+  }
+
+  return [];
 }
 
 function buildHistoryUserTimelineEntry({ record, runtime, config }) {
@@ -2753,7 +3792,11 @@ function createNativeApproval({ config, runtime, conversationId, request, now = 
   const token = crypto.randomBytes(18).toString("hex");
   const reviewUrl = `${config.nativeApprovalPublicBaseUrl}/native-approvals/${token}`;
   const title = formatTitle(config.approvalTitle, threadLabel);
-  const messageText = formatNativeApprovalMessage(kind, request.params ?? {}, config.defaultLocale);
+  const rawParams = isPlainObject(request.params) ? cloneJson(request.params) : {};
+  const fileRefs = kind === "file" ? extractApprovalFileRefs(rawParams) : [];
+  const diffText = kind === "file" ? extractApprovalDiffText(rawParams, fileRefs) : "";
+  const diffCounts = diffLineCounts(diffText);
+  const messageText = formatNativeApprovalMessage(kind, rawParams, config.defaultLocale);
 
   return {
     token,
@@ -2766,6 +3809,13 @@ function createNativeApproval({ config, runtime, conversationId, request, now = 
     requestId,
     requestKey: nativeRequestKey(conversationId, requestId),
     ownerClientId: runtime.threadOwnerClientIds.get(conversationId) ?? null,
+    rawParams,
+    fileRefs,
+    diffText,
+    diffAvailable: Boolean(diffText),
+    diffSource: diffText ? "approval_request" : "",
+    diffAddedLines: diffCounts.addedLines,
+    diffRemovedLines: diffCounts.removedLines,
     createdAtMs: now,
     resolved: false,
     resolving: false,
@@ -4889,6 +5939,161 @@ function formatFileApprovalMessage(params, locale = config?.defaultLocale || DEF
   return truncate(parts.join("\n"), 1024);
 }
 
+function extractApprovalFileRefs(params) {
+  if (!isPlainObject(params)) {
+    return [];
+  }
+
+  const refs = [];
+  const candidateKeys = new Set([
+    "file",
+    "files",
+    "path",
+    "paths",
+    "filePath",
+    "filePaths",
+    "fileRef",
+    "fileRefs",
+    "updatedFile",
+    "updatedFiles",
+    "changedFile",
+    "changedFiles",
+    "targetFile",
+    "targetFiles",
+    "touchedFile",
+    "touchedFiles",
+  ]);
+
+  function visit(value, parentKey = "", depth = 0) {
+    if (depth > 5 || value == null) {
+      return;
+    }
+    const normalizedParentKey = cleanText(parentKey);
+
+    if (typeof value === "string") {
+      if (candidateKeys.has(normalizedParentKey)) {
+        refs.push(value);
+      }
+      return;
+    }
+
+    if (Array.isArray(value)) {
+      for (const item of value) {
+        visit(item, normalizedParentKey, depth + 1);
+      }
+      return;
+    }
+
+    if (!isPlainObject(value)) {
+      return;
+    }
+
+    if (candidateKeys.has(normalizedParentKey)) {
+      const directRef = cleanText(value.fileRef ?? value.filePath ?? value.path ?? value.filename ?? value.name ?? "");
+      if (directRef) {
+        refs.push(directRef);
+      }
+    }
+
+    for (const [key, child] of Object.entries(value)) {
+      visit(child, key, depth + 1);
+    }
+  }
+
+  for (const [key, value] of Object.entries(params)) {
+    visit(value, key, 0);
+  }
+
+  return normalizeTimelineFileRefs(refs);
+}
+
+function extractApprovalDiffText(params, fileRefs = []) {
+  if (!isPlainObject(params)) {
+    return "";
+  }
+
+  const candidateKeys = new Set([
+    "diff",
+    "diffText",
+    "patch",
+    "patchText",
+    "unifiedDiff",
+    "diffPreview",
+    "diffString",
+  ]);
+
+  let best = "";
+
+  function considerText(value) {
+    const normalized = normalizeTimelineDiffText(value);
+    if (!normalized) {
+      return;
+    }
+    if (!best || normalized.length > best.length) {
+      best = normalized;
+    }
+  }
+
+  function visit(value, parentKey = "", depth = 0) {
+    if (depth > 6 || value == null || best) {
+      return;
+    }
+
+    if (typeof value === "string") {
+      const normalizedParentKey = cleanText(parentKey);
+      if (
+        candidateKeys.has(normalizedParentKey) ||
+        value.includes("*** Begin Patch") ||
+        value.includes("\n@@ ") ||
+        value.includes("\n--- ") ||
+        value.includes("\n+++ ")
+      ) {
+        considerText(value);
+      }
+      return;
+    }
+
+    if (Array.isArray(value)) {
+      for (const item of value) {
+        visit(item, parentKey, depth + 1);
+        if (best) {
+          return;
+        }
+      }
+      return;
+    }
+
+    if (!isPlainObject(value)) {
+      return;
+    }
+
+    for (const [key, child] of Object.entries(value)) {
+      visit(child, key, depth + 1);
+      if (best) {
+        return;
+      }
+    }
+  }
+
+  visit(params, "", 0);
+  if (!best) {
+    return "";
+  }
+
+  const normalizedFileRefs = normalizeTimelineFileRefs(fileRefs);
+  if (normalizedFileRefs.length === 0) {
+    return best;
+  }
+
+  const filtered = splitUnifiedDiffTextByFile(best)
+    .filter((section) => normalizedFileRefs.some((fileRef) => timelineFileRefsMatch(section.fileRef, fileRef)))
+    .map((section) => section.diffText)
+    .filter(Boolean)
+    .join("\n");
+
+  return filtered ? normalizeTimelineDiffText(filtered) : best;
+}
+
 function buildNativeApprovalActions(reviewUrl, locale = config?.defaultLocale || DEFAULT_LOCALE) {
   return [{ action: "view", label: t(locale, "server.action.review"), url: reviewUrl, clear: true }];
 }
@@ -5912,9 +7117,183 @@ function buildCompletedInboxItems(runtime, state, config, locale) {
     }));
 }
 
+function buildDiffInboxItems(runtime, state, config, locale) {
+  return buildDiffThreadGroups(runtime, state, config).map((group) => ({
+    kind: "diff_thread",
+    token: group.token,
+    threadId: group.threadId,
+    threadLabel: group.threadLabel || "",
+    title: cleanText(group.threadLabel || "") || kindTitle(locale, "diff_thread"),
+    summary: t(locale, "diff.threadSummary", { count: group.changedFileCount }),
+    changedFileCount: group.changedFileCount,
+    fileRefs: normalizeTimelineFileRefs(group.files.map((file) => file.fileRef)),
+    latestChangedAtMs: group.latestChangedAtMs,
+    latestChangeType: cleanText(group.latestChangeType || ""),
+    latestChangeFileRefs: normalizeTimelineFileRefs(group.latestChangeFileRefs ?? []),
+    diffAddedLines: group.diffAddedLines,
+    diffRemovedLines: group.diffRemovedLines,
+    primaryLabel: t(locale, "server.action.detail"),
+    createdAtMs: group.latestChangedAtMs,
+  }));
+}
+
+function diffThreadToken(threadId, threadLabel = "") {
+  const normalizedThreadId = cleanText(threadId || "");
+  const normalizedThreadLabel = cleanText(threadLabel || "");
+  return historyToken(`diff_thread:${normalizedThreadId || normalizedThreadLabel || "unknown"}`);
+}
+
+function buildDiffThreadGroups(runtime, state, config) {
+  const items = normalizeCodeEvents(
+    state.recentCodeEvents ?? runtime.recentCodeEvents,
+    config.maxCodeEvents
+  );
+  runtime.recentCodeEvents = items;
+
+  const relevantItems = items
+    .slice()
+    .sort((left, right) => Number(left.createdAtMs ?? 0) - Number(right.createdAtMs ?? 0));
+
+  const groupsByThread = new Map();
+
+  for (const item of relevantItems) {
+    const threadId = cleanText(item.threadId || "");
+    const threadLabel = cleanText(item.threadLabel || "");
+    const threadKey = threadId || `unknown:${threadLabel || item.token}`;
+    const fileRefs = normalizeTimelineFileRefs(item.fileRefs ?? []);
+    if (fileRefs.length === 0) {
+      continue;
+    }
+
+    let threadGroup = groupsByThread.get(threadKey);
+    if (!threadGroup) {
+      threadGroup = {
+        kind: "diff_thread",
+        token: diffThreadToken(threadId, threadLabel),
+        threadId,
+        threadLabel,
+        changedFileCount: 0,
+        latestChangedAtMs: 0,
+        latestChangedAtMsForSummary: 0,
+        latestChangeType: "",
+        latestChangeFileRefs: [],
+        diffAddedLines: 0,
+        diffRemovedLines: 0,
+        filesByRef: new Map(),
+      };
+      groupsByThread.set(threadKey, threadGroup);
+    } else if (!threadGroup.threadLabel && threadLabel) {
+      threadGroup.threadLabel = threadLabel;
+    }
+
+    const eventFileEventType = normalizeTimelineFileEventType(item.fileEventType ?? "");
+    const splitSections = splitUnifiedDiffTextByFile(item.diffText);
+
+    for (const fileRef of fileRefs) {
+      const normalizedFileRef = cleanTimelineFileRef(fileRef);
+      if (!normalizedFileRef) {
+        continue;
+      }
+
+      let sectionDiffText = "";
+      const matchingSection = splitSections.find((section) => timelineFileRefsMatch(section.fileRef, normalizedFileRef));
+      if (matchingSection?.diffText) {
+        sectionDiffText = matchingSection.diffText;
+      } else if (fileRefs.length === 1) {
+        sectionDiffText = normalizeTimelineDiffText(item.diffText);
+      }
+
+      const sectionCounts = diffLineCounts(sectionDiffText);
+      const sectionAvailable = Boolean(sectionDiffText);
+
+      let fileGroup = threadGroup.filesByRef.get(normalizedFileRef);
+      if (!fileGroup) {
+        fileGroup = {
+          fileRef: normalizedFileRef,
+          fileLabel: path.basename(normalizedFileRef) || normalizedFileRef,
+          fileEventTypes: new Set(),
+          addedLines: 0,
+          removedLines: 0,
+          latestChangedAtMs: 0,
+          sections: [],
+        };
+        threadGroup.filesByRef.set(normalizedFileRef, fileGroup);
+      }
+
+      if (eventFileEventType) {
+        fileGroup.fileEventTypes.add(eventFileEventType);
+      }
+      fileGroup.sections.push({
+        createdAtMs: Number(item.createdAtMs) || 0,
+        diffText: sectionDiffText,
+        diffAvailable: sectionAvailable,
+        diffSource: normalizeTimelineDiffSource(item.diffSource ?? ""),
+        addedLines: sectionCounts.addedLines,
+        removedLines: sectionCounts.removedLines,
+        fileEventType: eventFileEventType,
+      });
+      fileGroup.addedLines += sectionCounts.addedLines;
+      fileGroup.removedLines += sectionCounts.removedLines;
+      fileGroup.latestChangedAtMs = Math.max(fileGroup.latestChangedAtMs, Number(item.createdAtMs) || 0);
+
+      const itemCreatedAtMs = Number(item.createdAtMs) || 0;
+      threadGroup.latestChangedAtMs = Math.max(threadGroup.latestChangedAtMs, itemCreatedAtMs);
+      threadGroup.diffAddedLines += sectionCounts.addedLines;
+      threadGroup.diffRemovedLines += sectionCounts.removedLines;
+
+      if (itemCreatedAtMs > threadGroup.latestChangedAtMsForSummary) {
+        threadGroup.latestChangedAtMsForSummary = itemCreatedAtMs;
+        threadGroup.latestChangeType = eventFileEventType || "";
+        threadGroup.latestChangeFileRefs = [normalizedFileRef];
+      } else if (itemCreatedAtMs === (threadGroup.latestChangedAtMsForSummary || 0)) {
+        if (eventFileEventType && threadGroup.latestChangeType && threadGroup.latestChangeType !== eventFileEventType) {
+          threadGroup.latestChangeType = "";
+        } else if (!threadGroup.latestChangeType && eventFileEventType && threadGroup.latestChangeFileRefs.length === 0) {
+          threadGroup.latestChangeType = eventFileEventType;
+        }
+        if (!threadGroup.latestChangeFileRefs.includes(normalizedFileRef)) {
+          threadGroup.latestChangeFileRefs.push(normalizedFileRef);
+        }
+      }
+    }
+  }
+
+  return [...groupsByThread.values()]
+    .map((group) => {
+      const files = [...group.filesByRef.values()]
+        .map((fileGroup) => ({
+          fileRef: fileGroup.fileRef,
+          fileLabel: fileGroup.fileLabel,
+          fileEventTypes: [...fileGroup.fileEventTypes.values()],
+          addedLines: fileGroup.addedLines,
+          removedLines: fileGroup.removedLines,
+          latestChangedAtMs: fileGroup.latestChangedAtMs,
+          sections: fileGroup.sections.sort((left, right) => Number(left.createdAtMs ?? 0) - Number(right.createdAtMs ?? 0)),
+        }))
+        .sort((left, right) => Number(right.latestChangedAtMs ?? 0) - Number(left.latestChangedAtMs ?? 0));
+
+      return {
+        kind: "diff_thread",
+        token: group.token,
+        threadId: group.threadId,
+        threadLabel: group.threadLabel,
+        changedFileCount: files.length,
+        latestChangedAtMs: group.latestChangedAtMs,
+        latestChangeType: group.latestChangeType,
+        latestChangeFileRefs: normalizeTimelineFileRefs(group.latestChangeFileRefs),
+        diffAddedLines: group.diffAddedLines,
+        diffRemovedLines: group.diffRemovedLines,
+        files,
+      };
+    })
+    .filter((group) => group.changedFileCount > 0)
+    .sort((left, right) => Number(right.latestChangedAtMs ?? 0) - Number(left.latestChangedAtMs ?? 0));
+}
+
 function buildInboxResponse(runtime, state, config, locale) {
   return {
     pending: buildPendingInboxItems(runtime, state, config, locale),
+    diff: buildDiffInboxItems(runtime, state, config, locale),
     completed: buildCompletedInboxItems(runtime, state, config, locale),
   };
 }
@@ -6088,8 +7467,12 @@ function buildTimelineResponse(runtime, state, config, locale) {
     threadId: entry.threadId,
     threadLabel: entry.threadLabel,
     summary: entry.summary,
+    fileEventType: normalizeTimelineFileEventType(entry.fileEventType ?? ""),
     imageUrls: buildTimelineEntryImageUrls(entry),
     fileRefs: normalizeTimelineFileRefs(entry.fileRefs ?? []),
+    diffAvailable: Boolean(entry.diffAvailable),
+    diffAddedLines: Math.max(0, Number(entry.diffAddedLines) || 0),
+    diffRemovedLines: Math.max(0, Number(entry.diffRemovedLines) || 0),
     outcome: entry.outcome || "",
     createdAtMs: entry.createdAtMs,
   }));
@@ -6109,6 +7492,12 @@ function buildPendingApprovalDetail(runtime, approval, locale) {
     threadLabel: approval.threadLabel || "",
     createdAtMs: Number(approval.createdAtMs) || 0,
     messageHtml: renderMessageHtml(approval.messageText, `<p>${escapeHtml(t(locale, "detail.approvalRequested"))}</p>`),
+    fileRefs: normalizeTimelineFileRefs(approval.fileRefs ?? []),
+    diffText: normalizeTimelineDiffText(approval.diffText ?? ""),
+    diffAvailable: approval.diffAvailable === true || Boolean(approval.diffText),
+    diffSource: normalizeTimelineDiffSource(approval.diffSource ?? ""),
+    diffAddedLines: Math.max(0, Number(approval.diffAddedLines) || 0),
+    diffRemovedLines: Math.max(0, Number(approval.diffRemovedLines) || 0),
     previousContext,
     readOnly: false,
     actions: [
@@ -6378,6 +7767,71 @@ function buildTimelineMessageDetail(entry, locale, runtime = null) {
     fileRefs: normalizeTimelineFileRefs(entry.fileRefs ?? []),
     previousContext: buildInterruptedTimelineContext(runtime, entry, locale),
     interruptNotice: interruptedDetailNotice(entry.messageText, locale),
+    readOnly: true,
+    actions: [],
+  };
+}
+
+function buildTimelineFileEventDetail(entry, locale) {
+  const fileEventType = normalizeTimelineFileEventType(entry?.fileEventType ?? "");
+  return {
+    kind: "file_event",
+    token: entry.token,
+    threadId: cleanText(entry.threadId || ""),
+    title: cleanText(entry.threadLabel || entry.title || "") || kindTitle(locale, "file_event"),
+    threadLabel: entry.threadLabel || "",
+    fileEventType,
+    createdAtMs: Number(entry.createdAtMs) || 0,
+    messageHtml: renderMessageHtml(fileEventDetailCopy(locale, fileEventType), `<p>${escapeHtml(t(locale, "detail.detailUnavailable"))}</p>`),
+    fileRefs: normalizeTimelineFileRefs(entry.fileRefs ?? []),
+    diffAvailable: Boolean(entry.diffAvailable),
+    diffText: normalizeTimelineDiffText(entry.diffText ?? ""),
+    diffSource: normalizeTimelineDiffSource(entry.diffSource ?? ""),
+    diffAddedLines: Math.max(0, Number(entry.diffAddedLines) || 0),
+    diffRemovedLines: Math.max(0, Number(entry.diffRemovedLines) || 0),
+    readOnly: true,
+    actions: [],
+  };
+}
+
+function buildDiffThreadDetail(group, locale) {
+  return {
+    kind: "diff_thread",
+    token: group.token,
+    threadId: cleanText(group.threadId || ""),
+    title: cleanText(group.threadLabel || "") || kindTitle(locale, "diff_thread"),
+    threadLabel: group.threadLabel || "",
+    createdAtMs: Number(group.latestChangedAtMs) || 0,
+    changedFileCount: Math.max(0, Number(group.changedFileCount) || 0),
+    diffAddedLines: Math.max(0, Number(group.diffAddedLines) || 0),
+    diffRemovedLines: Math.max(0, Number(group.diffRemovedLines) || 0),
+    messageHtml: renderMessageHtml(
+      t(locale, "detail.diffThread.copy", { count: Math.max(0, Number(group.changedFileCount) || 0) }),
+      `<p>${escapeHtml(t(locale, "detail.detailUnavailable"))}</p>`
+    ),
+    files: Array.isArray(group.files)
+      ? group.files.map((fileGroup) => ({
+          fileRef: cleanTimelineFileRef(fileGroup.fileRef),
+          fileLabel: cleanText(fileGroup.fileLabel || "") || path.basename(cleanTimelineFileRef(fileGroup.fileRef)) || cleanTimelineFileRef(fileGroup.fileRef),
+          fileEventTypes: Array.isArray(fileGroup.fileEventTypes)
+            ? fileGroup.fileEventTypes.map((value) => normalizeTimelineFileEventType(value)).filter(Boolean)
+            : [],
+          addedLines: Math.max(0, Number(fileGroup.addedLines) || 0),
+          removedLines: Math.max(0, Number(fileGroup.removedLines) || 0),
+          latestChangedAtMs: Math.max(0, Number(fileGroup.latestChangedAtMs) || 0),
+          sections: Array.isArray(fileGroup.sections)
+            ? fileGroup.sections.map((section) => ({
+                createdAtMs: Math.max(0, Number(section.createdAtMs) || 0),
+                diffText: normalizeTimelineDiffText(section.diffText ?? ""),
+                diffAvailable: section.diffAvailable === true || Boolean(section.diffText),
+                diffSource: normalizeTimelineDiffSource(section.diffSource ?? ""),
+                addedLines: Math.max(0, Number(section.addedLines) || 0),
+                removedLines: Math.max(0, Number(section.removedLines) || 0),
+                fileEventType: normalizeTimelineFileEventType(section.fileEventType ?? ""),
+              }))
+            : [],
+        }))
+      : [],
     readOnly: true,
     actions: [],
   };
@@ -6914,6 +8368,14 @@ async function handleNativeApprovalDecision({ config, runtime, state, approval, 
 }
 
 function buildApiItemDetail({ config, runtime, state, kind, token, locale }) {
+  if (kind === "diff_thread") {
+    const group = buildDiffThreadGroups(runtime, state, config).find((entry) => entry.token === token);
+    return group ? buildDiffThreadDetail(group, locale) : null;
+  }
+  if (kind === "file_event") {
+    const entry = timelineEntryByToken(runtime, token, kind);
+    return entry ? buildTimelineFileEventDetail(entry, locale) : null;
+  }
   if (timelineMessageKinds.has(kind)) {
     const entry = timelineEntryByToken(runtime, token, kind);
     return entry ? buildTimelineMessageDetail(entry, locale, runtime) : null;
@@ -9279,6 +10741,7 @@ function buildConfig(cli) {
     maxSeenEvents: numberEnv("MAX_SEEN_EVENTS", 500),
     maxHistoryItems: numberEnv("MAX_HISTORY_ITEMS", 100),
     maxTimelineEntries: numberEnv("MAX_TIMELINE_ENTRIES", 250),
+    maxCodeEvents: numberEnv("MAX_CODE_EVENTS", 1000),
     maxTimelineThreads: numberEnv("MAX_TIMELINE_THREADS", 20),
     maxReadBytes: numberEnv("MAX_READ_BYTES", 2 * 1024 * 1024),
     maxMessageChars: numberEnv("MAX_MESSAGE_CHARS", 320),
@@ -9491,6 +10954,7 @@ async function loadState(stateFile) {
       pendingUserInputRequests: parsed.pendingUserInputRequests ?? {},
       recentHistoryItems: parsed.recentHistoryItems ?? [],
       recentTimelineEntries: parsed.recentTimelineEntries ?? [],
+      recentCodeEvents: parsed.recentCodeEvents ?? null,
       timelineImagePathAliases: parsed.timelineImagePathAliases ?? {},
       sqliteCompletionCursorId: Number(parsed.sqliteCompletionCursorId) || 0,
       sqliteCompletionSourceFile: cleanText(parsed.sqliteCompletionSourceFile ?? ""),
@@ -9516,6 +10980,7 @@ async function loadState(stateFile) {
       pendingUserInputRequests: {},
       recentHistoryItems: [],
       recentTimelineEntries: [],
+      recentCodeEvents: null,
       timelineImagePathAliases: {},
       sqliteCompletionCursorId: 0,
       sqliteCompletionSourceFile: "",
@@ -10005,6 +11470,40 @@ function refreshResolvedThreadLabels({ config, runtime, state }) {
     changed = true;
   }
 
+  const nextCodeEvents = normalizeCodeEvents(
+    runtime.recentCodeEvents.map((entry) => {
+      const threadId = cleanText(entry.threadId || "");
+      if (!threadId) {
+        return entry;
+      }
+      const threadLabel = getNativeThreadLabel({
+        runtime,
+        conversationId: threadId,
+        cwd: "",
+      });
+      const title = threadLabel || kindTitle(config.defaultLocale, entry.kind);
+      if (threadLabel === entry.threadLabel && title === entry.title) {
+        return entry;
+      }
+      changed = true;
+      return {
+        ...entry,
+        threadLabel,
+        title,
+      };
+    }),
+    config.maxCodeEvents
+  );
+
+  if (
+    JSON.stringify(nextCodeEvents.map((entry) => [entry.stableId, entry.title, entry.threadLabel])) !==
+    JSON.stringify(runtime.recentCodeEvents.map((entry) => [entry.stableId, entry.title, entry.threadLabel]))
+  ) {
+    runtime.recentCodeEvents = nextCodeEvents;
+    state.recentCodeEvents = nextCodeEvents;
+    changed = true;
+  }
+
   return changed;
 }
 
@@ -10371,6 +11870,7 @@ async function main() {
       migratedPairedDevicesStateChanged ||
       restoredPendingPlanStateChanged ||
       restoredTimelineImagePathsStateChanged ||
+      migratedRecentCodeEventsStateChanged ||
       restoredPendingUserInputStateChanged ||
       refreshResolvedThreadLabels({ config, runtime, state })
     ) {
