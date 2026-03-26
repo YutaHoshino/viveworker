@@ -267,6 +267,187 @@ function withNotificationIcon(kind, title) {
   return prefix ? `${prefix} ${title}` : title;
 }
 
+function normalizeTimelineOutcome(value) {
+  const normalized = cleanText(value || "").toLowerCase();
+  return ["pending", "approved", "rejected", "implemented", "dismissed", "submitted"].includes(normalized)
+    ? normalized
+    : "";
+}
+
+function inferTimelineOutcome(kind, summary = "", messageText = "") {
+  const normalizedKind = cleanText(kind || "");
+  if (!normalizedKind) {
+    return "";
+  }
+
+  const candidates = [cleanText(summary || ""), cleanText(messageText || "")].filter(Boolean);
+  if (candidates.length === 0) {
+    return "";
+  }
+
+  const startsWithAny = (keys) =>
+    candidates.some((text) => SUPPORTED_LOCALES.some((locale) => keys.some((key) => text.startsWith(t(locale, key)))));
+
+  if (normalizedKind === "approval") {
+    if (startsWithAny(["server.message.approvalAccepted"])) {
+      return "approved";
+    }
+    if (startsWithAny(["server.message.approvalRejected"])) {
+      return "rejected";
+    }
+    return "";
+  }
+
+  if (normalizedKind === "plan") {
+    if (startsWithAny(["server.message.planImplemented"])) {
+      return "implemented";
+    }
+    if (startsWithAny(["server.message.planDismissed"])) {
+      return "dismissed";
+    }
+    return "";
+  }
+
+  if (normalizedKind === "choice") {
+    if (
+      startsWithAny([
+        "server.message.choiceSubmitted",
+        "server.message.choiceSubmittedTest",
+        "server.message.choiceSummarySubmitted",
+        "server.message.choiceSummaryReceivedTest",
+      ])
+    ) {
+      return "submitted";
+    }
+    return "";
+  }
+
+  return "";
+}
+
+function normalizeTimelineFileRefs(rawFileRefs) {
+  if (!Array.isArray(rawFileRefs)) {
+    return [];
+  }
+
+  const deduped = [];
+  const seen = new Set();
+  for (const rawRef of rawFileRefs) {
+    const normalized = cleanTimelineFileRef(rawRef);
+    if (!normalized || seen.has(normalized)) {
+      continue;
+    }
+    seen.add(normalized);
+    deduped.push(normalized);
+    if (deduped.length >= 8) {
+      break;
+    }
+  }
+  return deduped;
+}
+
+function cleanTimelineFileRef(value) {
+  let normalized = cleanText(value || "");
+  if (!normalized) {
+    return "";
+  }
+
+  normalized = normalized
+    .replace(/^[`"'([{<]+/u, "")
+    .replace(/[)`"'\]}>.,:;!?]+$/u, "")
+    .replace(/[#:]L?\d+(?::\d+)?$/u, "");
+
+  if (!normalized || /^https?:\/\//iu.test(normalized)) {
+    return "";
+  }
+
+  if (normalized.startsWith("/")) {
+    const segments = normalized.split("/").filter(Boolean);
+    if (segments.length >= 2 && looksLikeFileRefBasename(segments[segments.length - 1])) {
+      return normalized;
+    }
+    return "";
+  }
+
+  if (normalized.includes("/")) {
+    const segments = normalized.split("/").filter(Boolean);
+    if (
+      segments.length >= 2 &&
+      segments.every((segment) => /^[A-Za-z0-9._-]+$/u.test(segment)) &&
+      looksLikeFileRefBasename(segments[segments.length - 1])
+    ) {
+      return normalized;
+    }
+    return "";
+  }
+
+  return looksLikeFileRefBasename(normalized) ? normalized : "";
+}
+
+function looksLikeFileRefBasename(value) {
+  const normalized = cleanText(value || "");
+  if (!normalized || /[\s\\]/u.test(normalized)) {
+    return false;
+  }
+  if (
+    [
+      ".env",
+      ".env.example",
+      ".gitignore",
+      "Dockerfile",
+      "LICENSE",
+      "Makefile",
+      "README.md",
+      "package-lock.json",
+      "package.json",
+      "pnpm-lock.yaml",
+      "tsconfig.json",
+      "vite.config.ts",
+    ].includes(normalized)
+  ) {
+    return true;
+  }
+  return /^(?:\.[A-Za-z0-9_-]+(?:\.[A-Za-z][A-Za-z0-9_-]{0,9})?|[A-Za-z0-9_-][A-Za-z0-9._-]*\.[A-Za-z][A-Za-z0-9_-]{0,9})$/u.test(
+    normalized
+  );
+}
+
+function extractTimelineFileRefs(messageText = "") {
+  const sourceText = String(messageText || "");
+  if (!sourceText) {
+    return [];
+  }
+
+  const refs = [];
+  const pushCandidate = (candidate) => {
+    const normalized = cleanTimelineFileRef(candidate);
+    if (normalized) {
+      refs.push(normalized);
+    }
+  };
+  const collectCandidates = (text) => {
+    for (const candidate of String(text || "").split(/\s+/u)) {
+      pushCandidate(candidate);
+    }
+  };
+
+  for (const match of sourceText.matchAll(/\[[^\]]+\]\((\/[^)\s]+)\)/gu)) {
+    pushCandidate(match[1]);
+  }
+
+  for (const match of sourceText.matchAll(/`([^`\n]+)`/gu)) {
+    collectCandidates(match[1]);
+  }
+
+  collectCandidates(
+    sourceText
+      .replace(/`[^`\n]+`/gu, " ")
+      .replace(/\[[^\]]+\]\(([^)]+)\)/gu, " ")
+  );
+
+  return normalizeTimelineFileRefs(refs);
+}
+
 function handleSignal() {
   runtime.stopping = true;
 }
@@ -304,10 +485,13 @@ function normalizeHistoryItem(raw) {
   const kind = cleanText(raw.kind ?? "");
   const title = cleanText(raw.title ?? "");
   const messageText = normalizeTimelineMessageText(raw.messageText ?? "");
+  const summary = normalizeNotificationText(raw.summary ?? "") || formatNotificationBody(messageText, 100) || "";
   const createdAtMs = Number(raw.createdAtMs) || Date.now();
   if (!stableId || !historyKinds.has(kind) || !title) {
     return null;
   }
+
+  const outcome = normalizeTimelineOutcome(raw.outcome ?? "") || inferTimelineOutcome(kind, summary, messageText);
 
   return {
     stableId,
@@ -316,9 +500,11 @@ function normalizeHistoryItem(raw) {
     threadId: cleanText(raw.threadId ?? extractConversationIdFromStableId(stableId) ?? ""),
     title,
     threadLabel: cleanText(raw.threadLabel ?? ""),
-    summary: normalizeNotificationText(raw.summary ?? "") || formatNotificationBody(messageText, 100) || "",
+    summary,
     messageText,
     imagePaths: normalizeTimelineImagePaths(raw.imagePaths ?? raw.localImagePaths ?? []),
+    fileRefs: normalizeTimelineFileRefs(raw.fileRefs ?? extractTimelineFileRefs(messageText)),
+    outcome,
     createdAtMs,
     readOnly: raw.readOnly !== false,
     primaryLabel: cleanText(raw.primaryLabel ?? "") || "詳細",
@@ -400,6 +586,7 @@ function normalizeTimelineEntry(raw) {
     "";
   const threadLabel = cleanText(raw.threadLabel ?? "");
   const title = cleanText(raw.title ?? "") || threadLabel || kindTitle(DEFAULT_LOCALE, kind);
+  const outcome = normalizeTimelineOutcome(raw.outcome ?? "") || inferTimelineOutcome(kind, summary, messageText);
 
   return {
     stableId,
@@ -411,6 +598,8 @@ function normalizeTimelineEntry(raw) {
     summary,
     messageText,
     imagePaths: normalizeTimelineImagePaths(raw.imagePaths ?? raw.localImagePaths ?? []),
+    fileRefs: normalizeTimelineFileRefs(raw.fileRefs ?? extractTimelineFileRefs(messageText)),
+    outcome,
     createdAtMs,
     readOnly: raw.readOnly !== false,
     primaryLabel: cleanText(raw.primaryLabel ?? "") || "詳細",
@@ -498,26 +687,48 @@ function recordHistoryItem({ config, runtime, state, item }) {
   return changed;
 }
 
-function recordActionHistoryItem({ config, runtime, state, kind, stableId, token, title, threadLabel = "", messageText, summary }) {
-  return recordHistoryItem({
+function recordActionHistoryItem({
+  config,
+  runtime,
+  state,
+  kind,
+  stableId,
+  token,
+  title,
+  threadLabel = "",
+  messageText,
+  summary,
+  outcome = "",
+}) {
+  const item = {
+    stableId,
+    token,
+    kind,
+    title,
+    threadId: cleanText(extractConversationIdFromStableId(stableId) ?? ""),
+    threadLabel,
+    summary,
+    messageText,
+    outcome,
+    createdAtMs: Date.now(),
+    readOnly: true,
+    primaryLabel: "詳細",
+    tone: "secondary",
+  };
+
+  const historyChanged = recordHistoryItem({
     config,
     runtime,
     state,
-    item: {
-      stableId,
-      token,
-      kind,
-      title,
-      threadId: cleanText(extractConversationIdFromStableId(stableId) ?? ""),
-      threadLabel,
-      summary,
-      messageText,
-      createdAtMs: Date.now(),
-      readOnly: true,
-      primaryLabel: "詳細",
-      tone: "secondary",
-    },
+    item,
   });
+  const timelineChanged = recordTimelineEntry({
+    config,
+    runtime,
+    state,
+    entry: item,
+  });
+  return historyChanged || timelineChanged;
 }
 
 function pendingApprovalStableId(approval) {
@@ -5685,6 +5896,7 @@ function buildCompletedInboxItems(runtime, state, config, locale) {
   const items = normalizeHistoryItems(state.recentHistoryItems ?? runtime.recentHistoryItems, config.maxHistoryItems);
   runtime.recentHistoryItems = items;
   return items
+    .filter((item) => cleanText(item?.kind || "") === "completion")
     .slice()
     .sort((left, right) => Number(right.createdAtMs ?? 0) - Number(left.createdAtMs ?? 0))
     .map((item) => ({
@@ -5694,6 +5906,7 @@ function buildCompletedInboxItems(runtime, state, config, locale) {
       threadLabel: item.threadLabel || "",
       title: item.threadLabel ? formatTitle(kindTitle(locale, item.kind), item.threadLabel) : item.title,
       summary: item.summary,
+      fileRefs: normalizeTimelineFileRefs(item.fileRefs ?? []),
       primaryLabel: t(locale, "server.action.detail"),
       createdAtMs: item.createdAtMs,
     }));
@@ -5724,6 +5937,7 @@ function buildOperationalTimelineEntries(runtime, state, config, locale) {
         title: formatLocalizedTitle(locale, "server.title.approval", approval.threadLabel),
         summary: formatNotificationBody(approval.messageText, 180) || approval.messageText,
         messageText: approval.messageText,
+        outcome: "pending",
         createdAtMs: Number(approval.createdAtMs) || now,
       })
     );
@@ -5746,6 +5960,7 @@ function buildOperationalTimelineEntries(runtime, state, config, locale) {
         title: formatLocalizedTitle(locale, "server.title.plan", planRequest.threadLabel),
         summary: formatNotificationBody(planRequest.messageText, 180) || planRequest.messageText,
         messageText: planRequest.messageText,
+        outcome: "pending",
         createdAtMs: Number(planRequest.createdAtMs) || now,
       })
     );
@@ -5772,6 +5987,7 @@ function buildOperationalTimelineEntries(runtime, state, config, locale) {
         ),
         summary: userInputRequest.notificationText || formatNotificationBody(userInputRequest.messageText, 180),
         messageText: userInputRequest.messageText,
+        outcome: "pending",
         createdAtMs: Number(userInputRequest.createdAtMs) || now,
       })
     );
@@ -5791,6 +6007,7 @@ function buildOperationalTimelineEntries(runtime, state, config, locale) {
         title: historyItem.threadLabel ? formatTitle(kindTitle(locale, historyItem.kind), historyItem.threadLabel) : historyItem.title,
         summary: historyItem.summary,
         messageText: historyItem.messageText,
+        outcome: historyItem.outcome,
         createdAtMs: historyItem.createdAtMs,
       })
     );
@@ -5872,6 +6089,8 @@ function buildTimelineResponse(runtime, state, config, locale) {
     threadLabel: entry.threadLabel,
     summary: entry.summary,
     imageUrls: buildTimelineEntryImageUrls(entry),
+    fileRefs: normalizeTimelineFileRefs(entry.fileRefs ?? []),
+    outcome: entry.outcome || "",
     createdAtMs: entry.createdAtMs,
   }));
 
@@ -6120,6 +6339,7 @@ function buildHistoryDetail(item, locale, runtime = null) {
     threadLabel: item.threadLabel || "",
     createdAtMs: Number(item.createdAtMs) || 0,
     messageHtml: renderMessageHtml(item.messageText, `<p>${escapeHtml(t(locale, "detail.detailUnavailable"))}</p>`),
+    fileRefs: normalizeTimelineFileRefs(item.fileRefs ?? []),
     interruptNotice: interruptedDetailNotice(item.messageText, locale),
     readOnly: true,
     reply: replyEnabled
@@ -6155,6 +6375,7 @@ function buildTimelineMessageDetail(entry, locale, runtime = null) {
     createdAtMs: Number(entry.createdAtMs) || 0,
     messageHtml: renderMessageHtml(entry.messageText, `<p>${escapeHtml(t(locale, "detail.detailUnavailable"))}</p>`),
     imageUrls: buildTimelineEntryImageUrls(entry),
+    fileRefs: normalizeTimelineFileRefs(entry.fileRefs ?? []),
     previousContext: buildInterruptedTimelineContext(runtime, entry, locale),
     interruptNotice: interruptedDetailNotice(entry.messageText, locale),
     readOnly: true,
@@ -6234,6 +6455,7 @@ async function submitGenericUserInputDecision({ config, runtime, state, userInpu
     summary: userInputRequest.testRequest
       ? t(config.defaultLocale, "server.message.choiceSummaryReceivedTest")
       : t(config.defaultLocale, "server.message.choiceSummarySubmitted"),
+    outcome: "submitted",
   }) || stateChanged;
   if (stateChanged) {
     await saveState(config.stateFile, state);
@@ -6659,6 +6881,7 @@ async function handlePlanDecision({ config, runtime, state, planRequest, decisio
     title: planRequest.title,
     messageText: `${planDecisionMessage(decision, config.defaultLocale)}\n\n${planRequest.messageText}`,
     summary: planDecisionMessage(decision, config.defaultLocale),
+    outcome: decision === "implement" ? "implemented" : "dismissed",
   }) || stateChanged;
   if (stateChanged) {
     await saveState(config.stateFile, state);
@@ -6682,6 +6905,7 @@ async function handleNativeApprovalDecision({ config, runtime, state, approval, 
     title: approval.title,
     messageText: `${approvalDecisionMessage(decision, config.defaultLocale)}\n\n${approval.messageText}`,
     summary: approvalDecisionMessage(decision, config.defaultLocale),
+    outcome: decision === "accept" ? "approved" : "rejected",
   });
   if (stateChanged) {
     await saveState(config.stateFile, state);

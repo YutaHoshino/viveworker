@@ -22,6 +22,7 @@ node_modules/
 
 # Generated local config and state
 .viveworker/
+.codex-notes/
 viveworker.env
 .viveworker-state.json
 .tmp-viveworker-state.json

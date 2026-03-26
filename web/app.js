@@ -8,6 +8,8 @@ const TIMELINE_MESSAGE_KINDS = new Set(["user_message", "assistant_commentary", 
 const TIMELINE_OPERATIONAL_KINDS = new Set(["approval", "plan", "plan_ready", "choice", "completion"]);
 const THREAD_FILTER_INTERACTION_DEFER_MS = 8000;
 const MAX_COMPLETION_REPLY_IMAGE_COUNT = 4;
+const NOTIFICATION_INTENT_CACHE = "viveworker-notification-intent-v1";
+const NOTIFICATION_INTENT_PATH = "/__viveworker_notification_intent__";
 
 const state = {
   session: null,
@@ -21,6 +23,8 @@ const state = {
   detailLoadingItem: null,
   detailOpen: false,
   timelineThreadFilter: "all",
+  timelineKindFilter: "all",
+  timelineKindFilterOpen: false,
   completedThreadFilter: "all",
   settingsSubpage: "",
   settingsScrollState: null,
@@ -86,6 +90,9 @@ async function boot() {
   await registerServiceWorker();
   navigator.serviceWorker?.addEventListener("message", handleServiceWorkerMessage);
   window.addEventListener("resize", handleViewportChange, { passive: true });
+  window.addEventListener("focus", handlePotentialExternalNavigation, { passive: true });
+  window.addEventListener("pageshow", handlePotentialExternalNavigation, { passive: true });
+  document.addEventListener("visibilitychange", handleDocumentVisibilityChange);
 
   await refreshSession();
 
@@ -121,6 +128,7 @@ async function boot() {
     return;
   }
 
+  await consumePendingNotificationIntent();
   await syncDetectedLocalePreference();
   await refreshAuthenticatedState();
   ensureCurrentSelection();
@@ -128,6 +136,10 @@ async function boot() {
 
   setInterval(async () => {
     if (!state.session?.authenticated) {
+      return;
+    }
+    const consumedNotificationIntent = await consumePendingNotificationIntent();
+    if (consumedNotificationIntent) {
       return;
     }
     await refreshAuthenticatedState();
@@ -314,6 +326,7 @@ async function refreshInbox() {
 async function refreshTimeline() {
   state.timeline = await apiGet("/api/timeline");
   syncTimelineThreadFilter();
+  syncTimelineKindFilter();
 }
 
 async function refreshDevices() {
@@ -420,10 +433,14 @@ function filteredTimelineEntries() {
   if (!entries.length) {
     return [];
   }
-  if (!state.timelineThreadFilter || state.timelineThreadFilter === "all") {
-    return entries;
+  let filtered = entries;
+  if (state.timelineThreadFilter && state.timelineThreadFilter !== "all") {
+    filtered = filtered.filter((entry) => entry.threadId === state.timelineThreadFilter);
   }
-  return entries.filter((entry) => entry.threadId === state.timelineThreadFilter);
+  if (!state.timelineKindFilter || state.timelineKindFilter === "all") {
+    return filtered;
+  }
+  return filtered.filter((entry) => timelineEntryMatchesKindFilter(entry, state.timelineKindFilter));
 }
 
 function filteredCompletedEntries() {
@@ -445,6 +462,49 @@ function syncTimelineThreadFilter() {
   }
   if (!threads.some((thread) => thread.id === state.timelineThreadFilter)) {
     state.timelineThreadFilter = "all";
+  }
+}
+
+function syncTimelineKindFilter() {
+  const validIds = new Set(timelineKindFilterOptions().map((option) => option.id));
+  if (!state.timelineKindFilter || !validIds.has(state.timelineKindFilter)) {
+    state.timelineKindFilter = "all";
+  }
+}
+
+function timelineKindFilterOptions() {
+  return [
+    { id: "all", label: L("timeline.kindFilter.all"), icon: "filter" },
+    { id: "messages", label: L("timeline.kindFilter.messages"), icon: "timeline" },
+    { id: "approvals", label: L("timeline.kindFilter.approvals"), icon: "approval" },
+    { id: "plans", label: L("timeline.kindFilter.plans"), icon: "plan" },
+    { id: "choices", label: L("timeline.kindFilter.choices"), icon: "choice" },
+    { id: "completions", label: L("timeline.kindFilter.completions"), icon: "completion-item" },
+  ];
+}
+
+function currentTimelineKindFilterOption() {
+  return (
+    timelineKindFilterOptions().find((option) => option.id === state.timelineKindFilter) ||
+    timelineKindFilterOptions()[0]
+  );
+}
+
+function timelineEntryMatchesKindFilter(entry, filterId) {
+  const kind = normalizeClientText(entry?.kind || entry?.item?.kind || "");
+  switch (filterId) {
+    case "messages":
+      return TIMELINE_MESSAGE_KINDS.has(kind);
+    case "approvals":
+      return kind === "approval";
+    case "plans":
+      return kind === "plan" || kind === "plan_ready";
+    case "choices":
+      return kind === "choice";
+    case "completions":
+      return kind === "completion";
+    default:
+      return true;
   }
 }
 
@@ -1459,6 +1519,7 @@ function renderTimelineThreadDropdown() {
     inputId: "timeline-thread-select",
     dataAttribute: "data-timeline-thread-select",
     selectedThreadId: state.timelineThreadFilter,
+    controlsHtml: renderTimelineKindFilterControls(),
     threads: threads.map((thread) => ({
       id: thread.id,
       label: dropdownThreadLabel(thread.id, thread.label || ""),
@@ -1475,7 +1536,7 @@ function renderCompletedThreadDropdown() {
   });
 }
 
-function renderThreadDropdown({ inputId, dataAttribute, selectedThreadId, threads }) {
+function renderThreadDropdown({ inputId, dataAttribute, selectedThreadId, threads, controlsHtml = "" }) {
   const options = [
     {
       id: "all",
@@ -1490,20 +1551,68 @@ function renderThreadDropdown({ inputId, dataAttribute, selectedThreadId, thread
   return `
     <div class="timeline-thread-filter">
       <label class="timeline-thread-filter__label" for="${escapeHtml(inputId)}">${escapeHtml(L("timeline.filterLabel"))}</label>
-      <div class="timeline-thread-select-wrap">
-        <select id="${escapeHtml(inputId)}" class="timeline-thread-select" ${dataAttribute}>
-          ${options
-            .map(
-              (thread) => `
-                <option value="${escapeHtml(thread.id)}" ${selectedThreadId === thread.id ? "selected" : ""}>
-                  ${escapeHtml(thread.label)}
-                </option>
-              `
-            )
-            .join("")}
-        </select>
-        <span class="timeline-thread-select__chevron" aria-hidden="true">${renderIcon("chevron-down")}</span>
+      <div class="timeline-thread-filter__row">
+        <div class="timeline-thread-select-wrap">
+          <select id="${escapeHtml(inputId)}" class="timeline-thread-select" ${dataAttribute}>
+            ${options
+              .map(
+                (thread) => `
+                  <option value="${escapeHtml(thread.id)}" ${selectedThreadId === thread.id ? "selected" : ""}>
+                    ${escapeHtml(thread.label)}
+                  </option>
+                `
+              )
+              .join("")}
+          </select>
+          <span class="timeline-thread-select__chevron" aria-hidden="true">${renderIcon("chevron-down")}</span>
+        </div>
+        ${controlsHtml}
       </div>
+    </div>
+  `;
+}
+
+function renderTimelineKindFilterControls() {
+  const current = currentTimelineKindFilterOption();
+  const options = timelineKindFilterOptions();
+  return `
+    <div class="timeline-kind-filter" data-timeline-kind-filter-root>
+      <button
+        type="button"
+        class="timeline-kind-filter__button ${current.id !== "all" ? "is-active" : ""}"
+        data-timeline-kind-filter-toggle
+        aria-expanded="${state.timelineKindFilterOpen ? "true" : "false"}"
+        aria-label="${escapeHtml(L("timeline.kindFilterButtonLabel"))}"
+      >
+        <span class="timeline-kind-filter__button-icon" aria-hidden="true">${renderIcon(current.icon)}</span>
+      </button>
+      ${
+        state.timelineKindFilterOpen
+          ? `
+            <div class="timeline-kind-filter__popover" role="menu" aria-label="${escapeHtml(L("timeline.kindFilterLabel"))}">
+              ${options
+                .map(
+                  (option) => `
+                    <button
+                      type="button"
+                      class="timeline-kind-filter__option ${option.id === current.id ? "is-selected" : ""}"
+                      data-timeline-kind-filter-option="${escapeHtml(option.id)}"
+                      role="menuitemradio"
+                      aria-checked="${option.id === current.id ? "true" : "false"}"
+                    >
+                      <span class="timeline-kind-filter__option-icon" aria-hidden="true">${renderIcon(option.icon)}</span>
+                      <span class="timeline-kind-filter__option-label">${escapeHtml(option.label)}</span>
+                      <span class="timeline-kind-filter__option-check" aria-hidden="true">${
+                        option.id === current.id ? renderIcon("check") : ""
+                      }</span>
+                    </button>
+                  `
+                )
+                .join("")}
+            </div>
+          `
+          : ""
+      }
     </div>
   `;
 }
@@ -1515,13 +1624,14 @@ function renderTimelineEntry(entry, { desktop }) {
   const kindNameClass = escapeHtml(String(item.kind || "item").replace(/_/gu, "-"));
   const isMessageLike = TIMELINE_MESSAGE_KINDS.has(item.kind) || item.kind === "completion";
   const imageUrls = Array.isArray(item.imageUrls) ? item.imageUrls.filter(Boolean) : [];
+  const fileRefs = normalizeClientFileRefs(item.fileRefs);
   const primaryText = isMessageLike
     ? item.summary || fallbackSummaryForKind(item.kind, entry.status)
     : item.title || L("common.untitledItem");
   const secondaryText = isMessageLike ? "" : item.summary || fallbackSummaryForKind(item.kind, entry.status);
   const threadLabel = timelineEntryThreadLabel(item, isMessageLike);
   const timestampLabel = formatTimelineTimestamp(item.createdAtMs);
-  const statusLabel = isMessageLike ? "" : L("common.actionNeeded");
+  const statusLabel = timelineEntryStatusLabel(item, isMessageLike);
 
   return `
     <button
@@ -1545,10 +1655,40 @@ function renderTimelineEntry(entry, { desktop }) {
         <p class="timeline-entry__title">${escapeHtml(primaryText)}</p>
         ${secondaryText ? `<p class="timeline-entry__summary">${escapeHtml(secondaryText)}</p>` : ""}
         ${renderTimelineEntryImageStrip(imageUrls)}
+        ${renderTimelineEntryFileStrip(fileRefs)}
       </div>
       ${statusLabel ? `<div class="timeline-entry__footer"><span class="timeline-entry__status">${escapeHtml(statusLabel)}</span></div>` : ""}
     </button>
   `;
+}
+
+function timelineEntryStatusLabel(item, isMessageLike) {
+  if (isMessageLike) {
+    return "";
+  }
+
+  const outcome = normalizeClientText(item?.outcome || "");
+  switch (outcome) {
+    case "pending":
+      return L("common.actionNeeded");
+    case "approved":
+      return L("timeline.status.approved");
+    case "rejected":
+      return L("timeline.status.rejected");
+    case "implemented":
+      return L("timeline.status.implemented");
+    case "dismissed":
+      return L("timeline.status.dismissed");
+    case "submitted":
+      return L("timeline.status.submitted");
+    default:
+      break;
+  }
+
+  if (item?.kind === "approval" || item?.kind === "plan" || item?.kind === "plan_ready" || item?.kind === "choice") {
+    return L("common.actionNeeded");
+  }
+  return "";
 }
 
 function renderTimelineEntryImageStrip(imageUrls) {
@@ -1569,6 +1709,28 @@ function renderTimelineEntryImageStrip(imageUrls) {
                 alt="${escapeHtml(L("detail.imageAlt", { index: index + 1 }))}"
                 loading="lazy"
               >
+            </span>
+          `
+        )
+        .join("")}
+    </div>
+  `;
+}
+
+function renderTimelineEntryFileStrip(fileRefs) {
+  if (!Array.isArray(fileRefs) || fileRefs.length === 0) {
+    return "";
+  }
+
+  return `
+    <div class="timeline-entry__files" aria-label="${escapeHtml(L("detail.filesTitle"))}">
+      ${fileRefs
+        .slice(0, 4)
+        .map(
+          (fileRef) => `
+            <span class="file-ref-chip" title="${escapeHtml(fileRef)}">
+              <span class="file-ref-chip__icon" aria-hidden="true">${renderIcon("item")}</span>
+              <span class="file-ref-chip__label">${escapeHtml(fileRefLabel(fileRef))}</span>
             </span>
           `
         )
@@ -2307,6 +2469,7 @@ function renderStandardDetailDesktop(detail) {
         <div class="detail-body ${spaciousBodyDetail ? "detail-body--message " : ""}markdown">${detail.messageHtml || ""}</div>
       </section>
       ${renderDetailImageGallery(detail)}
+      ${renderDetailFileRefs(detail)}
       ${renderCompletionReplyComposer(detail)}
       ${detail.readOnly ? "" : renderActionButtons(detail.actions || [])}
     </div>
@@ -2328,6 +2491,7 @@ function renderStandardDetailMobile(detail) {
             <div class="detail-body ${spaciousBodyDetail ? "detail-body--message " : ""}markdown">${detail.messageHtml || ""}</div>
           </section>
           ${renderDetailImageGallery(detail, { mobile: true })}
+          ${renderDetailFileRefs(detail, { mobile: true })}
           ${renderCompletionReplyComposer(detail, { mobile: true })}
         </div>
         ${detail.readOnly ? "" : renderActionButtons(detail.actions || [], { mobileSticky: true })}
@@ -2429,6 +2593,34 @@ function renderDetailImageGallery(detail, options = {}) {
               </button>
             `;
           })
+          .join("")}
+      </div>
+    </section>
+  `;
+}
+
+function renderDetailFileRefs(detail, options = {}) {
+  const fileRefs = normalizeClientFileRefs(detail?.fileRefs);
+  if (fileRefs.length === 0) {
+    return "";
+  }
+
+  return `
+    <section class="detail-card detail-card--files ${options.mobile ? "detail-card--mobile" : ""}">
+      <div class="detail-files-card__header">
+        <span class="detail-files-card__icon" aria-hidden="true">${renderIcon("item")}</span>
+        <span>${escapeHtml(L("detail.filesTitle"))}</span>
+      </div>
+      <div class="detail-file-grid">
+        ${fileRefs
+          .map(
+            (fileRef) => `
+              <div class="detail-file-chip" title="${escapeHtml(fileRef)}">
+                <span class="detail-file-chip__label">${escapeHtml(fileRefLabel(fileRef))}</span>
+                <span class="detail-file-chip__path">${escapeHtml(fileRef)}</span>
+              </div>
+            `
+          )
           .join("")}
       </div>
     </section>
@@ -3060,6 +3252,27 @@ function bindShellInteractions() {
     select.addEventListener("change", async () => {
       clearThreadFilterInteraction();
       state.timelineThreadFilter = select.value || "all";
+      state.timelineKindFilterOpen = false;
+      alignCurrentItemToVisibleEntries();
+      await renderShell();
+    });
+  }
+
+  for (const button of document.querySelectorAll("[data-timeline-kind-filter-toggle]")) {
+    button.addEventListener("click", async (event) => {
+      event.preventDefault();
+      markThreadFilterInteraction();
+      state.timelineKindFilterOpen = !state.timelineKindFilterOpen;
+      await renderShell();
+    });
+  }
+
+  for (const button of document.querySelectorAll("[data-timeline-kind-filter-option]")) {
+    button.addEventListener("click", async (event) => {
+      event.preventDefault();
+      clearThreadFilterInteraction();
+      state.timelineKindFilter = button.dataset.timelineKindFilterOption || "all";
+      state.timelineKindFilterOpen = false;
       alignCurrentItemToVisibleEntries();
       await renderShell();
     });
@@ -3550,6 +3763,7 @@ function closeSettingsSubpage() {
 
 async function switchTab(tab) {
   state.currentTab = tab;
+  state.timelineKindFilterOpen = false;
   state.pushNotice = "";
   state.pushError = "";
   state.settingsSubpage = "";
@@ -3570,6 +3784,7 @@ function openItem({ kind, token, sourceTab }) {
   const previousItem = state.currentItem ? { ...state.currentItem } : null;
   clearPinnedDetailState();
   const nextTab = sourceTab || tabForItemKind(kind, state.currentTab);
+  state.timelineKindFilterOpen = false;
   if (previousItem && (previousItem.kind !== kind || previousItem.token !== token)) {
     clearChoiceLocalDraftForItem(previousItem);
   }
@@ -4044,6 +4259,8 @@ function renderIcon(name) {
       return `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M10.4 13.6 8.3 15.7a3 3 0 0 1-4.2-4.2l2.8-2.8a3 3 0 0 1 4.2 0"/><path d="m13.6 10.4 2.1-2.1a3 3 0 1 1 4.2 4.2l-2.8 2.8a3 3 0 0 1-4.2 0"/><path d="m9.5 14.5 5-5"/></svg>`;
     case "clip":
       return `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="m9.5 12.5 5.9-5.9a3 3 0 1 1 4.2 4.2l-7.7 7.7a5 5 0 1 1-7.1-7.1l8.1-8.1"/></svg>`;
+    case "filter":
+      return `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M5 7h14"/><path d="M8 12h8"/><path d="M10.5 17h3"/></svg>`;
     case "check":
       return `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="m6.8 12.5 3.2 3.2 7.2-7.4"/></svg>`;
     case "back":
@@ -4151,7 +4368,29 @@ function handleServiceWorkerMessage(event) {
   const type = event?.data?.type || "";
   if (type === "pushsubscriptionchange") {
     refreshPushStatus().then(renderCurrentSurface).catch(() => {});
+    return;
   }
+  if (type === "open-target-url" && event?.data?.url) {
+    applyExternalTargetUrl(event.data.url).catch(() => {});
+  }
+}
+
+function handlePotentialExternalNavigation() {
+  consumePendingNotificationIntent()
+    .then((consumed) => {
+      if (consumed) {
+        return;
+      }
+      return applyExternalTargetUrl(window.location.href, { allowRefresh: false });
+    })
+    .catch(() => {});
+}
+
+function handleDocumentVisibilityChange() {
+  if (document.visibilityState !== "visible") {
+    return;
+  }
+  handlePotentialExternalNavigation();
 }
 
 async function apiGet(url) {
@@ -4250,9 +4489,122 @@ function normalizeClientText(value) {
   return String(value ?? "").trim();
 }
 
+function normalizeClientFileRefs(fileRefs) {
+  if (!Array.isArray(fileRefs)) {
+    return [];
+  }
+  const deduped = [];
+  const seen = new Set();
+  for (const fileRef of fileRefs) {
+    const normalized = normalizeClientText(fileRef);
+    if (!normalized || seen.has(normalized)) {
+      continue;
+    }
+    seen.add(normalized);
+    deduped.push(normalized);
+    if (deduped.length >= 8) {
+      break;
+    }
+  }
+  return deduped;
+}
+
+function fileRefLabel(fileRef) {
+  const normalized = normalizeClientText(fileRef);
+  if (!normalized) {
+    return "";
+  }
+  const segments = normalized.split("/").filter(Boolean);
+  return segments[segments.length - 1] || normalized;
+}
+
 function parseItemRef(value) {
   const [kind, token] = String(value || "").split(":");
   return kind && token ? { kind, token } : null;
+}
+
+async function applyExternalTargetUrl(urlString, { allowRefresh = true } = {}) {
+  if (!state.session?.authenticated) {
+    return;
+  }
+
+  let nextUrl;
+  try {
+    nextUrl = new URL(urlString, window.location.origin);
+  } catch {
+    return;
+  }
+
+  const itemRef = parseItemRef(nextUrl.searchParams.get("item"));
+  if (!itemRef) {
+    return;
+  }
+
+  const sameItem =
+    Boolean(state.currentItem) &&
+    isSameItemRef(state.currentItem, itemRef) &&
+    (isDesktopLayout() || state.detailOpen);
+  if (sameItem) {
+    if (allowRefresh) {
+      await refreshAuthenticatedState();
+      ensureCurrentSelection();
+      await renderShell();
+    }
+    return;
+  }
+
+  openItem({
+    kind: itemRef.kind,
+    token: itemRef.token,
+    sourceTab: tabForItemKind(itemRef.kind, state.currentTab),
+  });
+  if (isFastPathItemRef(itemRef)) {
+    state.launchItemIntent = {
+      ...itemRef,
+      status: "pending",
+    };
+  }
+  await renderShell();
+
+  if (!allowRefresh) {
+    return;
+  }
+  await refreshAuthenticatedState();
+  ensureCurrentSelection();
+  await renderShell();
+}
+
+async function consumePendingNotificationIntent() {
+  if (!state.session?.authenticated || typeof caches === "undefined") {
+    return false;
+  }
+  let cache;
+  try {
+    cache = await caches.open(NOTIFICATION_INTENT_CACHE);
+  } catch {
+    return false;
+  }
+
+  const request = new Request(NOTIFICATION_INTENT_PATH);
+  const match = await cache.match(request).catch(() => null);
+  if (!match) {
+    return false;
+  }
+
+  let payload = null;
+  try {
+    payload = await match.json();
+  } catch {
+    payload = null;
+  }
+  await cache.delete(request).catch(() => {});
+
+  const url = normalizeClientText(payload?.url || "");
+  if (!url) {
+    return false;
+  }
+  await applyExternalTargetUrl(url, { allowRefresh: true });
+  return true;
 }
 
 function buildAppUrl(nextParams) {

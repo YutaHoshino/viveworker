@@ -180,4 +180,4 @@ Planned next steps include:
 
 - Android support
 - Windows support
-- image attachment support from mobile
+- ✅ ~~image attachment support from mobile~~ (Mar 26, 2026)

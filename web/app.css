@@ -974,6 +974,13 @@ code {
   gap: 0.38rem;
 }
 
+.timeline-thread-filter__row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 0.6rem;
+  align-items: start;
+}
+
 .timeline-thread-filter__label {
   color: var(--muted);
   font-size: 0.8rem;
@@ -1007,6 +1014,92 @@ code {
   color: rgba(236, 248, 255, 0.72);
   transform: translateY(-50%);
   pointer-events: none;
+}
+
+.timeline-kind-filter {
+  position: relative;
+}
+
+.timeline-kind-filter__button {
+  width: 2.72rem;
+  min-width: 2.72rem;
+  min-height: 2.72rem;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 15px;
+  border: 1px solid rgba(156, 181, 197, 0.14);
+  background: rgba(255, 255, 255, 0.05);
+  color: rgba(236, 248, 255, 0.78);
+  box-shadow: var(--shadow-card);
+}
+
+.timeline-kind-filter__button.is-active {
+  border-color: rgba(104, 211, 164, 0.34);
+  background: rgba(31, 83, 63, 0.46);
+  color: rgba(224, 255, 240, 0.96);
+}
+
+.timeline-kind-filter__button-icon,
+.timeline-kind-filter__option-icon,
+.timeline-kind-filter__option-check {
+  width: 1rem;
+  height: 1rem;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.timeline-kind-filter__button-icon svg,
+.timeline-kind-filter__option-icon svg,
+.timeline-kind-filter__option-check svg {
+  width: 100%;
+  height: 100%;
+}
+
+.timeline-kind-filter__popover {
+  position: absolute;
+  right: 0;
+  top: calc(100% + 0.46rem);
+  z-index: 14;
+  width: min(15rem, calc(100vw - 2.25rem));
+  display: grid;
+  gap: 0.22rem;
+  padding: 0.4rem;
+  border: 1px solid rgba(156, 181, 197, 0.16);
+  border-radius: 18px;
+  background: rgba(15, 23, 31, 0.94);
+  box-shadow: 0 24px 46px rgba(5, 9, 14, 0.34);
+  -webkit-backdrop-filter: blur(24px) saturate(1.08);
+  backdrop-filter: blur(24px) saturate(1.08);
+}
+
+.timeline-kind-filter__option {
+  width: 100%;
+  display: grid;
+  grid-template-columns: auto 1fr auto;
+  gap: 0.62rem;
+  align-items: center;
+  padding: 0.74rem 0.78rem;
+  border: 0;
+  border-radius: 14px;
+  background: transparent;
+  color: var(--text);
+  text-align: left;
+}
+
+.timeline-kind-filter__option.is-selected {
+  background: rgba(255, 255, 255, 0.06);
+}
+
+.timeline-kind-filter__option-label {
+  font-size: 0.9rem;
+  font-weight: 600;
+  line-height: 1.3;
+}
+
+.timeline-kind-filter__option-check {
+  color: rgba(104, 211, 164, 0.94);
 }
 
 .timeline-list {
@@ -1088,6 +1181,42 @@ code {
   grid-template-columns: repeat(auto-fit, minmax(68px, 1fr));
   gap: 0.46rem;
   margin-top: 0.08rem;
+}
+
+.timeline-entry__files {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.42rem;
+  margin-top: 0.14rem;
+}
+
+.file-ref-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.34rem;
+  min-width: 0;
+  padding: 0.4rem 0.56rem;
+  border-radius: 999px;
+  background: rgba(16, 24, 31, 0.72);
+  border: 1px solid rgba(156, 181, 197, 0.12);
+  color: var(--muted);
+  font-size: 0.76rem;
+  line-height: 1.2;
+}
+
+.file-ref-chip__icon {
+  width: 0.82rem;
+  height: 0.82rem;
+  color: rgba(202, 220, 233, 0.72);
+  flex: 0 0 auto;
+}
+
+.file-ref-chip__label {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 13.5rem;
 }
 
 .timeline-entry__image-frame {
@@ -1463,6 +1592,12 @@ code {
   padding: 0.5rem;
 }
 
+.detail-card--files {
+  margin-top: 0.24rem;
+  gap: 0.62rem;
+  padding: 0.72rem;
+}
+
 .detail-card--reply {
   margin-top: 0.32rem;
   gap: 0.72rem;
@@ -1473,6 +1608,50 @@ code {
   grid-template-columns: repeat(auto-fit, minmax(132px, 1fr));
   gap: 0.56rem;
   width: 100%;
+}
+
+.detail-files-card__header {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.42rem;
+  font-size: 0.84rem;
+  color: var(--muted);
+}
+
+.detail-files-card__icon {
+  width: 0.92rem;
+  height: 0.92rem;
+  color: rgba(202, 220, 233, 0.72);
+}
+
+.detail-file-grid {
+  display: grid;
+  gap: 0.52rem;
+}
+
+.detail-file-chip {
+  display: grid;
+  gap: 0.14rem;
+  padding: 0.68rem 0.78rem;
+  border-radius: 16px;
+  background:
+    linear-gradient(180deg, rgba(255, 255, 255, 0.04), rgba(255, 255, 255, 0.02)),
+    rgba(10, 17, 22, 0.76);
+  border: 1px solid rgba(156, 181, 197, 0.12);
+}
+
+.detail-file-chip__label {
+  font-size: 0.88rem;
+  line-height: 1.35;
+  color: var(--text);
+  overflow-wrap: anywhere;
+}
+
+.detail-file-chip__path {
+  font-size: 0.76rem;
+  line-height: 1.45;
+  color: var(--muted);
+  overflow-wrap: anywhere;
 }
 
 .detail-image-link {
