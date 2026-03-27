@@ -48,6 +48,10 @@ const state = {
   pushError: "",
   deviceNotice: "",
   deviceError: "",
+  remoteAccess: null,
+  remoteBootstrapUrl: "",
+  remoteNotice: "",
+  remoteError: "",
   imageViewer: null,
   serviceWorkerRegistration: null,
   installGuideOpen: false,
@@ -68,6 +72,7 @@ const app = document.querySelector("#app");
 const params = new URLSearchParams(window.location.search);
 const initialItem = params.get("item") || "";
 const initialPairToken = params.get("pairToken") || "";
+const initialRemoteBootstrapToken = params.get("remoteBootstrapToken") || "";
 let didReloadForServiceWorker = false;
 let lastViewportMode = isDesktopLayout();
 
@@ -99,14 +104,22 @@ async function boot() {
 
   await refreshSession();
 
-  if (!state.session?.authenticated && initialPairToken && shouldAutoPairFromBootstrapToken()) {
-    try {
-      await pair({
-        token: initialPairToken,
-        temporary: shouldUseTemporaryBootstrapPairing(),
-      });
-    } catch (error) {
-      state.pairError = error.message || String(error);
+  if (!state.session?.authenticated) {
+    if (initialRemoteBootstrapToken) {
+      try {
+        await remoteBootstrap(initialRemoteBootstrapToken);
+      } catch (error) {
+        state.pairError = error.message || String(error);
+      }
+    } else if (initialPairToken && shouldAutoPairFromBootstrapToken()) {
+      try {
+        await pair({
+          token: initialPairToken,
+          temporary: shouldUseTemporaryBootstrapPairing(),
+        });
+      } catch (error) {
+        state.pairError = error.message || String(error);
+      }
     }
     await refreshSession();
   }
@@ -198,6 +211,7 @@ async function refreshAuthenticatedState() {
   await refreshTimeline();
   await refreshDevices();
   await refreshPushStatus();
+  await refreshRemoteAccess();
   ensureCurrentSelection();
 }
 
@@ -350,6 +364,30 @@ async function refreshDevices() {
     state.deviceError = "";
   } catch (error) {
     state.deviceError = error.message || String(error);
+  }
+}
+
+async function refreshRemoteAccess() {
+  if (!state.session?.authenticated) {
+    state.remoteAccess = null;
+    state.remoteBootstrapUrl = "";
+    state.remoteError = "";
+    return;
+  }
+  try {
+    const payload = await apiGet("/api/settings/remote-access");
+    if (payload?.active !== true) {
+      state.remoteBootstrapUrl = "";
+    }
+    state.remoteAccess = {
+      ...payload,
+      bootstrapUrl: state.remoteBootstrapUrl || payload?.bootstrapUrl || null,
+    };
+    state.remoteError = "";
+  } catch (error) {
+    state.remoteAccess = null;
+    state.remoteBootstrapUrl = "";
+    state.remoteError = error.message || String(error);
   }
 }
 
@@ -677,6 +715,14 @@ async function pair(payload) {
   return result;
 }
 
+async function remoteBootstrap(token) {
+  const normalizedToken = normalizeClientText(token);
+  if (!normalizedToken) {
+    return null;
+  }
+  return await apiPost("/api/session/remote-bootstrap", { token: normalizedToken });
+}
+
 async function logout({ revokeCurrentDeviceTrust = false } = {}) {
   await apiPost("/api/session/logout", { revokeCurrentDeviceTrust });
   resetAuthenticatedState();
@@ -709,6 +755,10 @@ function resetAuthenticatedState() {
   state.pushError = "";
   state.deviceNotice = "";
   state.deviceError = "";
+  state.remoteAccess = null;
+  state.remoteBootstrapUrl = "";
+  state.remoteNotice = "";
+  state.remoteError = "";
   state.logoutConfirmOpen = false;
   state.pairError = "";
 }
@@ -2393,6 +2443,37 @@ function formatSettingsTimestamp(value) {
   }
 }
 
+function formatRelativeDurationFromNow(value) {
+  const timestamp = Number(value) || 0;
+  if (!timestamp) {
+    return L("common.unavailable");
+  }
+  const diffMs = Math.max(0, timestamp - Date.now());
+  const diffMinutes = Math.max(1, Math.round(diffMs / 60000));
+  if (diffMinutes < 60) {
+    return L("settings.remote.expiresMinutes", { count: diffMinutes });
+  }
+  const diffHours = Math.max(1, Math.round(diffMinutes / 60));
+  if (diffHours < 24) {
+    return L("settings.remote.expiresHours", { count: diffHours });
+  }
+  const diffDays = Math.max(1, Math.round(diffHours / 24));
+  return L("settings.remote.expiresDays", { count: diffDays });
+}
+
+function remoteAccessStatusLabelKey(remote) {
+  if (!remote || remote.configured !== true) {
+    return "settings.status.notConfigured";
+  }
+  if (remote.active === true) {
+    return "settings.status.enabled";
+  }
+  if (remote.expired === true) {
+    return "settings.status.expired";
+  }
+  return "settings.status.disabled";
+}
+
 function renderSettingsDetail({ mobile }) {
   const context = buildSettingsContext();
   if (state.settingsSubpage) {
@@ -2403,6 +2484,7 @@ function renderSettingsDetail({ mobile }) {
 
 function buildSettingsContext() {
   const push = state.pushStatus || {};
+  const remote = state.remoteAccess || {};
   const permission = push.notificationPermission || "default";
   const secureContext = push.secureContext === true;
   const standalone = push.standalone === true;
@@ -2426,6 +2508,10 @@ function buildSettingsContext() {
 
   return {
     push,
+    remote: {
+      ...remote,
+      statusLabelKey: remoteAccessStatusLabelKey(remote),
+    },
     permission,
     secureContext,
     standalone,
@@ -2435,6 +2521,7 @@ function buildSettingsContext() {
     setupState,
     devices: Array.isArray(state.devices) ? state.devices : [],
     devicesError: state.deviceError,
+    remoteError: state.remoteError,
     diagnostics: collectSettingsDiagnostics({
       push,
       permission,
@@ -2547,6 +2634,13 @@ function collectSettingsDiagnostics({ permission, secureContext, standalone, sup
 
 function settingsPageMeta(page) {
   switch (page) {
+    case "remote":
+      return {
+        id: "remote",
+        title: L("settings.remote.title"),
+        description: L("settings.remote.copy"),
+        icon: "link",
+      };
     case "notifications":
       return {
         id: "notifications",
@@ -2583,13 +2677,19 @@ function settingsPageMeta(page) {
         icon: "settings",
       };
     default:
-      return settingsPageMeta("notifications");
+      return settingsPageMeta("remote");
   }
 }
 
 function renderSettingsRoot(context, { mobile }) {
   const languageValue = localeDisplayName(state.locale, state.locale) || state.locale;
   const generalRows = [
+    renderSettingsNavRow({
+      page: "remote",
+      icon: "link",
+      title: L("settings.remote.title"),
+      value: L(context.remote.statusLabelKey),
+    }),
     renderSettingsNavRow({
       page: "notifications",
       icon: "notifications",
@@ -2670,6 +2770,9 @@ function renderSettingsSubpage(context, { mobile }) {
 
   let content = "";
   switch (state.settingsSubpage) {
+    case "remote":
+      content = renderSettingsRemotePage(context);
+      break;
     case "notifications":
       content = renderSettingsNotificationsPage(context);
       break;
@@ -2801,6 +2904,85 @@ function renderSettingsDevicePage(context) {
         `<button class="secondary secondary--wide" type="button" data-open-logout-confirm>${escapeHtml(L("common.logOut"))}</button>`,
         L("settings.group.actions")
       )}
+    </div>
+  `;
+}
+
+function renderSettingsRemotePage(context) {
+  const remote = context.remote || {};
+  const bootstrapUrl = normalizeClientText(state.remoteBootstrapUrl || remote.bootstrapUrl || "");
+  const rows = [
+    renderSettingsInfoRow(L("settings.row.status"), L(remote.statusLabelKey || "settings.status.notConfigured")),
+    renderSettingsInfoRow(L("settings.row.currentOrigin"), L(`settings.remote.origin.${remote.currentOrigin || "lan"}`)),
+    remote.publicUrl ? renderSettingsInfoRow(L("settings.row.remoteUrl"), remote.publicUrl, { valueClassName: "settings-info-row__value--mono" }) : "",
+    remote.active
+      ? renderSettingsInfoRow(L("settings.row.remoteExpires"), formatSettingsTimestamp(remote.expiresAtMs))
+      : "",
+    remote.active
+      ? renderSettingsInfoRow(L("settings.row.remoteExpiresIn"), formatRelativeDurationFromNow(remote.expiresAtMs))
+      : "",
+    Array.isArray(remote.allowedEmails) && remote.allowedEmails.length > 0
+      ? renderSettingsInfoRow(L("settings.row.remoteAllowEmails"), remote.allowedEmails.join(", "))
+      : "",
+  ].filter(Boolean);
+
+  let copyBlock = "";
+  if (!remote.configured) {
+    copyBlock = `
+      <section class="settings-copy-block">
+        <p class="muted">${escapeHtml(L("settings.remote.configureOnMac"))}</p>
+      </section>
+    `;
+  } else if (remote.currentOrigin !== "lan") {
+    copyBlock = `
+      <section class="settings-copy-block">
+        <p class="muted">${escapeHtml(L("settings.remote.lanOnlyToggle"))}</p>
+      </section>
+    `;
+  } else if (remote.active) {
+    copyBlock = `
+      <section class="settings-copy-block settings-copy-block--stacked">
+        <div class="helper-copy">
+          <strong>${escapeHtml(L("settings.remote.publicUrlLabel"))}</strong>
+          <p class="muted">${escapeHtml(remote.publicUrl || L("common.unavailable"))}</p>
+        </div>
+        ${
+          bootstrapUrl
+            ? `
+              <div class="helper-copy">
+                <strong>${escapeHtml(L("settings.remote.bootstrapUrlLabel"))}</strong>
+                <p class="muted">${escapeHtml(bootstrapUrl)}</p>
+              </div>
+            `
+            : ""
+        }
+      </section>
+    `;
+  }
+
+  const actions = [];
+  if (remote.configured && remote.currentOrigin === "lan" && remote.active !== true) {
+    actions.push(`<button class="primary primary--wide" type="button" data-remote-action="enable">${escapeHtml(L("settings.remote.enable"))}</button>`);
+  }
+  if (remote.configured && remote.currentOrigin === "lan" && remote.active === true) {
+    actions.push(`<button class="secondary secondary--wide" type="button" data-remote-action="copy-url">${escapeHtml(L("settings.remote.copyUrl"))}</button>`);
+    if (bootstrapUrl) {
+      actions.push(`<button class="secondary secondary--wide" type="button" data-remote-action="copy-bootstrap">${escapeHtml(L("settings.remote.copyBootstrap"))}</button>`);
+      actions.push(`<button class="secondary secondary--wide" type="button" data-remote-action="open-bootstrap">${escapeHtml(L("settings.remote.openBootstrap"))}</button>`);
+    }
+    actions.push(`<button class="secondary secondary--wide" type="button" data-remote-action="disable">${escapeHtml(L("settings.remote.disable"))}</button>`);
+  }
+  if (remote.configured && remote.currentOrigin !== "lan" && remote.publicUrl) {
+    actions.push(`<button class="secondary secondary--wide" type="button" data-remote-action="copy-url">${escapeHtml(L("settings.remote.copyUrl"))}</button>`);
+  }
+
+  return `
+    <div class="settings-page">
+      ${state.remoteNotice ? `<p class="inline-alert inline-alert--success">${escapeHtml(state.remoteNotice)}</p>` : ""}
+      ${(state.remoteError || context.remoteError) ? `<p class="inline-alert inline-alert--danger">${escapeHtml(state.remoteError || context.remoteError)}</p>` : ""}
+      ${renderSettingsGroup("", rows, { listClassName: "settings-list settings-list--compact" })}
+      ${copyBlock}
+      ${actions.length ? renderSettingsActionPanel(actions.join(""), L("settings.group.actions")) : ""}
     </div>
   `;
 }
@@ -4248,6 +4430,46 @@ function bindShellInteractions() {
     });
   }
 
+  for (const button of document.querySelectorAll("[data-remote-action]")) {
+    button.addEventListener("click", async () => {
+      const action = button.dataset.remoteAction || "";
+      const remote = state.remoteAccess || {};
+      state.remoteError = "";
+      state.remoteNotice = "";
+      try {
+        if (action === "enable") {
+          const result = await apiPost("/api/settings/remote-access/enable", {});
+          state.remoteAccess = result;
+          state.remoteBootstrapUrl = normalizeClientText(result?.bootstrapUrl || "");
+          state.remoteNotice = result?.alreadyTrustedForRemote
+            ? L("notice.remoteAccessEnabledTrusted")
+            : L("notice.remoteAccessEnabled");
+        } else if (action === "disable") {
+          const result = await apiPost("/api/settings/remote-access/disable", {});
+          state.remoteAccess = result;
+          state.remoteBootstrapUrl = "";
+          state.remoteNotice = L("notice.remoteAccessDisabled");
+        } else if (action === "copy-url") {
+          await copyTextToClipboard(remote.publicUrl || "");
+          state.remoteNotice = L("notice.remoteUrlCopied");
+        } else if (action === "copy-bootstrap") {
+          await copyTextToClipboard(state.remoteBootstrapUrl || remote.bootstrapUrl || "");
+          state.remoteNotice = L("notice.remoteBootstrapCopied");
+        } else if (action === "open-bootstrap") {
+          const url = state.remoteBootstrapUrl || remote.bootstrapUrl || "";
+          if (!url) {
+            throw new Error(L("error.remoteBootstrapUnavailable"));
+          }
+          window.open(url, "_blank", "noopener,noreferrer");
+          state.remoteNotice = L("notice.remoteBootstrapOpened");
+        }
+      } catch (error) {
+        state.remoteError = error.message || String(error);
+      }
+      await renderShell();
+    });
+  }
+
   for (const button of document.querySelectorAll("[data-locale-option]")) {
     button.addEventListener("click", async () => {
       state.pushError = "";
@@ -5221,6 +5443,17 @@ async function apiPost(url, body) {
   return response.json();
 }
 
+async function copyTextToClipboard(value) {
+  const text = normalizeClientText(value);
+  if (!text) {
+    throw new Error(L("error.copyUnavailable"));
+  }
+  if (!navigator.clipboard?.writeText) {
+    throw new Error(L("error.copyUnavailable"));
+  }
+  await navigator.clipboard.writeText(text);
+}
+
 async function readError(response) {
   try {
     const payload = await response.json();
@@ -5263,6 +5496,12 @@ function localizeApiError(value) {
     "choice-input-read-only": "error.choiceInputReadOnly",
     "choice-input-already-handled": "error.choiceInputAlreadyHandled",
     "mkcert-root-ca-not-found": "error.mkcertRootCaNotFound",
+    "remote-access-not-configured": "error.remoteAccessNotConfigured",
+    "remote-access-enable-lan-only": "error.remoteAccessLanOnly",
+    "remote-bootstrap-invalid": "error.remoteBootstrapInvalid",
+    "remote-bootstrap-expired": "error.remoteBootstrapExpired",
+    "remote-bootstrap-origin-mismatch": "error.remoteBootstrapExpired",
+    "remote-bootstrap-device-revoked": "error.remoteBootstrapDeviceRevoked",
   };
   const key = map[raw];
   return key ? L(key) : raw;

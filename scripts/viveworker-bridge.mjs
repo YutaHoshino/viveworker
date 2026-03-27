@@ -2,8 +2,8 @@
 
 import { spawn } from "node:child_process";
 import crypto from "node:crypto";
-import { createServer as createHttpServer } from "node:http";
-import { createServer as createHttpsServer } from "node:https";
+import { createServer as createHttpServer, request as httpRequest } from "node:http";
+import { createServer as createHttpsServer, request as httpsRequest } from "node:https";
 import { promises as fs, readFileSync, createReadStream } from "node:fs";
 import net from "node:net";
 import os from "node:os";
@@ -13,9 +13,40 @@ import { createInterface } from "node:readline";
 import { inspect } from "node:util";
 import { fileURLToPath } from "node:url";
 import webPush from "web-push";
+import WebSocket from "ws";
 import { DEFAULT_LOCALE, SUPPORTED_LOCALES, localeDisplayName, normalizeLocale, resolveLocalePreference, t } from "../web/i18n.js";
 import { generatePairingCredentials, shouldRotatePairing, upsertEnvText } from "./lib/pairing.mjs";
 import { renderMarkdownHtml } from "./lib/markdown-render.mjs";
+import {
+  ACCESS_MODE_CLOUDFLARE,
+  ACCESS_MODE_LAN,
+  ACCESS_MODE_VIVEWORKER,
+  accessModeHasRemoteOverlay,
+  accessModeRequiresHttps,
+  isLegacyVpnAccessMode,
+  normalizeAccessMode,
+} from "./lib/vpn.mjs";
+import {
+  DEFAULT_REMOTE_ACCESS_TTL_MS,
+  DEFAULT_REMOTE_BOOTSTRAP_TTL_MS,
+  buildRemotePublicOrigin,
+  buildRemotePublicUrl,
+  cleanText as cleanRemoteText,
+  normalizeRemoteAccessAllowedEmails,
+  normalizeRemoteAccessProvider,
+  remoteAccessActive,
+  remoteAccessConfigured,
+  remoteAccessExpired,
+  startCloudflaredLaunchAgent,
+  stopCloudflaredLaunchAgent,
+} from "./lib/cloudflare.mjs";
+import {
+  buildManagedRemotePublicOrigin,
+  buildManagedRemotePublicUrl,
+  managedRemoteConfigured,
+  readManagedRemoteSecrets,
+  updateManagedRemoteState,
+} from "./lib/managed-remote.mjs";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -78,12 +109,19 @@ const runtime = {
   recentCodeEvents: [],
   pairingAttemptsByRemoteAddress: new Map(),
   ipcClient: null,
+  managedRemoteAgent: {
+    ws: null,
+    connected: false,
+    reconnectTimer: null,
+    lastError: "",
+  },
   stopping: false,
 };
 const state = await loadState(config.stateFile);
 const migratedPairedDevicesStateChanged = migratePairedDevicesState({ config, state });
 const restoredPendingPlanStateChanged = restorePendingPlanRequests({ config, runtime, state });
 const restoredPendingUserInputStateChanged = restorePendingUserInputRequests({ config, runtime, state });
+const prunedRemoteBootstrapTokensStateChanged = pruneRemoteBootstrapTokens(state);
 runtime.recentHistoryItems = normalizeHistoryItems(state.recentHistoryItems ?? [], config.maxHistoryItems);
 runtime.recentTimelineEntries = normalizeTimelineEntries(state.recentTimelineEntries ?? [], config.maxTimelineEntries);
 const migratedRecentCodeEventsStateChanged = migrateRecentCodeEventsState({ config, runtime, state });
@@ -6467,6 +6505,8 @@ function buildDevicesResponse({ config, state, session, locale }) {
 
 function readSession(req, config, state) {
   const deviceId = readDeviceId(req, config);
+  const remoteOrigin = requestIsRemoteOrigin(req, config);
+  const remoteWindowId = currentRemoteWindowId(state);
   if (!config.authRequired) {
     return {
       authenticated: true,
@@ -6480,6 +6520,24 @@ function readSession(req, config, state) {
   const token = parseCookies(req)[sessionCookieName];
   const payload = token ? verifySessionToken(token, config.sessionSecret) : null;
   if (!payload) {
+    if (remoteOrigin) {
+      const trusted = isDeviceTrustedForRemoteOrigin(state, configuredRemoteOrigin(config), remoteWindowId, deviceId);
+      if (trusted) {
+        return {
+          authenticated: true,
+          sessionId: "restored-remote-device",
+          pairedAtMs: Date.now(),
+          expiresAtMs: Date.now() + config.sessionTtlMs,
+          deviceId,
+          restoredFromDevice: true,
+        };
+      }
+      return {
+        authenticated: false,
+        pairingAvailable: isPairingAvailable(config),
+        deviceId,
+      };
+    }
     const trustedRecord = getActiveDeviceTrustRecord(state, config, deviceId);
     if (trustedRecord) {
       return {
@@ -6499,6 +6557,14 @@ function readSession(req, config, state) {
     };
   }
 
+  if (remoteOrigin && cleanText(payload?.remoteWindowId ?? "") !== remoteWindowId) {
+    return {
+      authenticated: false,
+      pairingAvailable: isPairingAvailable(config),
+      deviceId,
+    };
+  }
+
   return {
     authenticated: true,
     sessionId: cleanText(payload.sessionId ?? "") || null,
@@ -6506,15 +6572,17 @@ function readSession(req, config, state) {
     expiresAtMs: Number(payload.expiresAtMs) || 0,
     deviceId,
     temporaryPairing: payload?.temporaryPairing === true,
+    remoteWindowId: cleanText(payload?.remoteWindowId ?? ""),
   };
 }
 
-function buildSessionCookie(config) {
+function buildSessionCookie(config, options = {}) {
   const now = Date.now();
   const payload = {
     sessionId: crypto.randomUUID(),
     pairedAtMs: now,
     expiresAtMs: now + config.sessionTtlMs,
+    remoteWindowId: cleanText(options.remoteWindowId ?? ""),
   };
   return signSessionPayload(payload, config.sessionSecret);
 }
@@ -6553,9 +6621,9 @@ function buildSetCookieHeader({ value, maxAgeSecs, secure = false }) {
   return buildCookieHeader(sessionCookieName, { value, maxAgeSecs, secure });
 }
 
-function setSessionCookie(res, config) {
+function setSessionCookie(res, config, options = {}) {
   const secure = config.nativeApprovalPublicBaseUrl.startsWith("https://");
-  const token = buildSessionCookie(config);
+  const token = buildSessionCookie(config, options);
   res.setHeader("Set-Cookie", buildSetCookieHeader({
     value: token,
     maxAgeSecs: Math.max(1, Math.floor(config.sessionTtlMs / 1000)),
@@ -6584,9 +6652,9 @@ function clearSessionCookie(res, config) {
   res.setHeader("Set-Cookie", buildSetCookieHeader({ value: "", maxAgeSecs: 0, secure }));
 }
 
-function setPairingCookies(res, config, existingDeviceId = "") {
+function setPairingCookies(res, config, existingDeviceId = "", options = {}) {
   const secure = config.nativeApprovalPublicBaseUrl.startsWith("https://");
-  const sessionToken = buildSessionCookie(config);
+  const sessionToken = buildSessionCookie(config, options);
   const deviceToken = buildDeviceCookie(config, existingDeviceId);
   res.setHeader("Set-Cookie", [
     buildCookieHeader(sessionCookieName, {
@@ -6736,7 +6804,7 @@ function pairingCredentialConsumed(config, state) {
 }
 
 function isPairingAvailableForState(config, state) {
-  return isPairingAvailable(config) && !pairingCodeConsumed(config, state);
+  return isPairingAvailable(config) && !pairingCredentialConsumed(config, state);
 }
 
 function pairingCodeConsumed(config, state) {
@@ -6764,6 +6832,157 @@ function markPairingConsumed(state, credential, now = Date.now()) {
   return true;
 }
 
+function normalizeRemoteBootstrapRecord(raw) {
+  if (!isPlainObject(raw)) {
+    return null;
+  }
+  const token = cleanText(raw.token ?? "");
+  const deviceId = cleanText(raw.deviceId ?? "");
+  const origin = cleanText(raw.origin ?? "");
+  const windowId = cleanText(raw.windowId ?? "");
+  const expiresAtMs = Number(raw.expiresAtMs) || 0;
+  if (!token || !deviceId || !origin || !windowId || !expiresAtMs) {
+    return null;
+  }
+  return {
+    token,
+    deviceId,
+    origin,
+    windowId,
+    createdAtMs: Number(raw.createdAtMs) || 0,
+    expiresAtMs,
+    usedAtMs: Number(raw.usedAtMs) || 0,
+  };
+}
+
+function pruneRemoteBootstrapTokens(state, now = Date.now()) {
+  const existing = isPlainObject(state?.remoteBootstrapTokens) ? state.remoteBootstrapTokens : {};
+  state.remoteBootstrapTokens = existing;
+  let changed = false;
+  for (const [token, rawRecord] of Object.entries(existing)) {
+    const record = normalizeRemoteBootstrapRecord(rawRecord);
+    if (!record || record.expiresAtMs <= now || record.usedAtMs > 0) {
+      delete existing[token];
+      changed = true;
+    }
+  }
+  return changed;
+}
+
+function issueRemoteBootstrapToken(state, { deviceId, origin, windowId }, now = Date.now()) {
+  const normalizedDeviceId = cleanText(deviceId || "");
+  const normalizedOrigin = cleanText(origin || "");
+  const normalizedWindowId = cleanText(windowId || "");
+  if (!normalizedDeviceId || !normalizedOrigin || !normalizedWindowId) {
+    return "";
+  }
+  pruneRemoteBootstrapTokens(state, now);
+  if (!isPlainObject(state.remoteBootstrapTokens)) {
+    state.remoteBootstrapTokens = {};
+  }
+  for (const [token, rawRecord] of Object.entries(state.remoteBootstrapTokens)) {
+    const record = normalizeRemoteBootstrapRecord(rawRecord);
+    if (record?.deviceId === normalizedDeviceId && record.origin === normalizedOrigin && record.windowId === normalizedWindowId) {
+      delete state.remoteBootstrapTokens[token];
+    }
+  }
+  const token = crypto.randomBytes(24).toString("hex");
+  state.remoteBootstrapTokens[token] = {
+    token,
+    deviceId: normalizedDeviceId,
+    origin: normalizedOrigin,
+    windowId: normalizedWindowId,
+    createdAtMs: now,
+    expiresAtMs: now + DEFAULT_REMOTE_BOOTSTRAP_TTL_MS,
+    usedAtMs: 0,
+  };
+  return token;
+}
+
+function consumeRemoteBootstrapToken(state, { token, origin, windowId }, now = Date.now()) {
+  const normalizedToken = cleanText(token || "");
+  const normalizedOrigin = cleanText(origin || "");
+  const normalizedWindowId = cleanText(windowId || "");
+  pruneRemoteBootstrapTokens(state, now);
+  if (!normalizedToken || !normalizedOrigin || !normalizedWindowId || !isPlainObject(state?.remoteBootstrapTokens)) {
+    return { ok: false, error: "remote-bootstrap-invalid" };
+  }
+  const record = normalizeRemoteBootstrapRecord(state.remoteBootstrapTokens[normalizedToken]);
+  if (!record) {
+    return { ok: false, error: "remote-bootstrap-invalid" };
+  }
+  if (record.origin !== normalizedOrigin || record.windowId !== normalizedWindowId) {
+    return { ok: false, error: "remote-bootstrap-origin-mismatch" };
+  }
+  if (record.expiresAtMs <= now) {
+    delete state.remoteBootstrapTokens[normalizedToken];
+    return { ok: false, error: "remote-bootstrap-expired" };
+  }
+  if (record.usedAtMs > 0) {
+    delete state.remoteBootstrapTokens[normalizedToken];
+    return { ok: false, error: "remote-bootstrap-expired" };
+  }
+  state.remoteBootstrapTokens[normalizedToken] = {
+    ...record,
+    usedAtMs: now,
+  };
+  return {
+    ok: true,
+    deviceId: record.deviceId,
+    windowId: record.windowId,
+  };
+}
+
+function invalidateRemoteBootstrapTokens(state, origin = "") {
+  if (!isPlainObject(state?.remoteBootstrapTokens)) {
+    return false;
+  }
+  const normalizedOrigin = cleanText(origin || "");
+  let changed = false;
+  for (const [token, rawRecord] of Object.entries(state.remoteBootstrapTokens)) {
+    const record = normalizeRemoteBootstrapRecord(rawRecord);
+    if (!record) {
+      delete state.remoteBootstrapTokens[token];
+      changed = true;
+      continue;
+    }
+    if (!normalizedOrigin || record.origin === normalizedOrigin) {
+      delete state.remoteBootstrapTokens[token];
+      changed = true;
+    }
+  }
+  return changed;
+}
+
+function remoteTrustKey(origin, windowId, deviceId) {
+  const normalizedOrigin = cleanText(origin || "");
+  const normalizedWindowId = cleanText(windowId || "");
+  const normalizedDeviceId = cleanText(deviceId || "");
+  return normalizedOrigin && normalizedWindowId && normalizedDeviceId ? `${normalizedOrigin}::${normalizedWindowId}::${normalizedDeviceId}` : "";
+}
+
+function markRemoteOriginTrusted(state, origin, windowId, deviceId, now = Date.now()) {
+  const key = remoteTrustKey(origin, windowId, deviceId);
+  if (!key) {
+    return false;
+  }
+  if (!isPlainObject(state.remoteTrustedOrigins)) {
+    state.remoteTrustedOrigins = {};
+  }
+  const next = {
+    trustedAtMs: Number(state.remoteTrustedOrigins[key]?.trustedAtMs) || now,
+    lastAuthenticatedAtMs: now,
+  };
+  const previous = isPlainObject(state.remoteTrustedOrigins[key]) ? state.remoteTrustedOrigins[key] : null;
+  state.remoteTrustedOrigins[key] = next;
+  return JSON.stringify(previous) !== JSON.stringify(next);
+}
+
+function isDeviceTrustedForRemoteOrigin(state, origin, windowId, deviceId) {
+  const key = remoteTrustKey(origin, windowId, deviceId);
+  return Boolean(key && isPlainObject(state?.remoteTrustedOrigins?.[key]));
+}
+
 function validatePairingPayload(payload, config, state) {
   if (!config.authRequired) {
     return { ok: true };
@@ -6777,10 +6996,13 @@ function validatePairingPayload(payload, config, state) {
   const matchesCode = code && cleanText(config.pairingCode).toUpperCase() === code;
   const matchesToken = token && cleanText(config.pairingToken) === token;
   if (matchesToken) {
+    if (pairingCredentialConsumed(config, state)) {
+      return { ok: false, error: "pairing-unavailable" };
+    }
     return { ok: true, credential: `token:${token}` };
   }
   if (matchesCode) {
-    if (pairingCodeConsumed(config, state)) {
+    if (pairingCredentialConsumed(config, state)) {
       return { ok: false, error: "pairing-unavailable" };
     }
     return { ok: true, credential: `code:${code}` };
@@ -6885,6 +7107,86 @@ function nonLoopbackIpv4Origins(config) {
   return origins;
 }
 
+function configuredRemoteOrigin(config) {
+  if (config.accessMode === ACCESS_MODE_CLOUDFLARE) {
+    return buildRemotePublicOrigin(config.remoteAccessPublicHostname || "");
+  }
+  if (config.accessMode === ACCESS_MODE_VIVEWORKER) {
+    return buildManagedRemotePublicOrigin(config);
+  }
+  return "";
+}
+
+function configuredRemotePublicUrl(config) {
+  if (config.accessMode === ACCESS_MODE_CLOUDFLARE) {
+    return buildRemotePublicUrl(config.remoteAccessPublicHostname || "");
+  }
+  if (config.accessMode === ACCESS_MODE_VIVEWORKER) {
+    return buildManagedRemotePublicUrl(config);
+  }
+  return "";
+}
+
+function remoteOverlayConfigured(config) {
+  if (config.accessMode === ACCESS_MODE_CLOUDFLARE) {
+    return remoteAccessConfigured(config);
+  }
+  if (config.accessMode === ACCESS_MODE_VIVEWORKER) {
+    return managedRemoteConfigured(config);
+  }
+  return false;
+}
+
+function remoteOverlayActive(config, now = Date.now()) {
+  if (!remoteOverlayConfigured(config)) {
+    return false;
+  }
+  if (config.accessMode === ACCESS_MODE_CLOUDFLARE) {
+    return remoteAccessActive(config, now);
+  }
+  return config.remoteAccessEnabled === true && !remoteAccessExpired(config, now);
+}
+
+function currentRemoteWindowId(state) {
+  return cleanText(state?.remoteWindowId ?? "");
+}
+
+function setCurrentRemoteWindowId(state, value) {
+  const next = cleanText(value || "");
+  if (next) {
+    state.remoteWindowId = next;
+  } else {
+    delete state.remoteWindowId;
+  }
+}
+
+function requestHost(req) {
+  const relayedHost = isLoopbackRequest(req)
+    ? cleanText(req.headers?.["x-viveworker-remote-host"] ?? "")
+    : "";
+  if (relayedHost) {
+    return relayedHost.toLowerCase();
+  }
+  return cleanText(req.headers?.host ?? "").toLowerCase();
+}
+
+function requestIsRemoteOrigin(req, config) {
+  const host = requestHost(req);
+  const expectedHostname = config.accessMode === ACCESS_MODE_CLOUDFLARE
+    ? cleanText(config.remoteAccessPublicHostname || "").toLowerCase()
+    : configuredRemoteOrigin(config)
+      ? new URL(configuredRemotePublicUrl(config)).hostname.toLowerCase()
+      : "";
+  if (!host || !expectedHostname) {
+    return false;
+  }
+  return host === expectedHostname || host === `${expectedHostname}:443`;
+}
+
+function requestIsLanOrigin(req, config) {
+  return !requestIsRemoteOrigin(req, config);
+}
+
 function trustedMutationOrigins(config) {
   const origins = new Set();
   let baseUrl;
@@ -6905,8 +7207,15 @@ function trustedMutationOrigins(config) {
     origins.add(next.origin);
   }
 
-  for (const origin of nonLoopbackIpv4Origins(config)) {
-    origins.add(origin);
+  if (config.accessMode === ACCESS_MODE_LAN) {
+    for (const origin of nonLoopbackIpv4Origins(config)) {
+      origins.add(origin);
+    }
+  }
+
+  const remoteOrigin = configuredRemoteOrigin(config);
+  if (remoteOrigin && remoteOverlayActive(config)) {
+    origins.add(remoteOrigin);
   }
 
   return origins;
@@ -6972,6 +7281,278 @@ function requireApiSession(req, res, config, state) {
     pairingAvailable: isPairingAvailableForState(config, state),
   });
   return null;
+}
+
+function buildRemoteAccessResponse({ config, state, session, req, bootstrapUrl = null }) {
+  const publicUrl = configuredRemotePublicUrl(config);
+  const remoteOrigin = configuredRemoteOrigin(config);
+  const remoteWindowId = currentRemoteWindowId(state);
+  const alreadyTrustedForRemote =
+    Boolean(session?.deviceId) &&
+    Boolean(remoteOrigin) &&
+    Boolean(remoteWindowId) &&
+    isDeviceTrustedForRemoteOrigin(state, remoteOrigin, remoteWindowId, session.deviceId);
+  return {
+    accessMode: config.accessMode,
+    provider: config.accessMode,
+    configured: remoteOverlayConfigured(config),
+    publicUrl,
+    enabled: config.remoteAccessEnabled === true,
+    active: remoteOverlayActive(config),
+    expired: remoteAccessExpired(config),
+    expiresAtMs: Number(config.remoteAccessExpiresAtMs) || 0,
+    allowedEmails: Array.isArray(config.remoteAccessAllowedEmails) ? config.remoteAccessAllowedEmails : [],
+    currentOrigin: requestIsRemoteOrigin(req, config) ? "remote" : "lan",
+    canManage: requestIsLanOrigin(req, config),
+    alreadyTrustedForRemote,
+    bootstrapUrl,
+  };
+}
+
+function applyRuntimeEnvUpdatesToConfig(config, updates) {
+  if ("REMOTE_ACCESS_ENABLED" in updates) {
+    config.remoteAccessEnabled = truthy(updates.REMOTE_ACCESS_ENABLED);
+  }
+  if ("REMOTE_ACCESS_EXPIRES_AT_MS" in updates) {
+    config.remoteAccessExpiresAtMs = Number(updates.REMOTE_ACCESS_EXPIRES_AT_MS) || 0;
+  }
+}
+
+async function persistRuntimeEnvUpdates(envFile, config, updates) {
+  Object.assign(process.env, updates);
+  applyRuntimeEnvUpdatesToConfig(config, updates);
+
+  if (!envFile) {
+    return;
+  }
+
+  let currentText = "";
+  try {
+    currentText = readFileSync(envFile, "utf8");
+  } catch {
+    currentText = "";
+  }
+  const nextText = upsertEnvText(currentText, updates);
+  await fs.mkdir(path.dirname(envFile), { recursive: true });
+  await fs.writeFile(envFile, nextText, "utf8");
+}
+
+async function syncRemoteAccessServiceState(config) {
+  if (config.accessMode !== ACCESS_MODE_CLOUDFLARE) {
+    return;
+  }
+  if (remoteOverlayActive(config)) {
+    await startCloudflaredLaunchAgent();
+  } else {
+    await stopCloudflaredLaunchAgent();
+  }
+}
+
+async function expireRemoteAccessIfNeeded({ config, state }) {
+  if (!accessModeHasRemoteOverlay(config.accessMode) || !config.remoteAccessEnabled || !remoteAccessExpired(config)) {
+    return false;
+  }
+
+  invalidateRemoteBootstrapTokens(state, configuredRemoteOrigin(config));
+  setCurrentRemoteWindowId(state, "");
+  await persistRuntimeEnvUpdates(envFile, config, {
+    REMOTE_ACCESS_ENABLED: "0",
+    REMOTE_ACCESS_EXPIRES_AT_MS: "0",
+  });
+  await saveState(config.stateFile, state);
+  await syncRemoteAccessServiceState(config);
+  await syncManagedRemoteAccessState(runtime, config, state);
+  return true;
+}
+
+function managedRemoteWsUrl(config, secrets) {
+  const controlUrl = cleanText(config.managedRemoteControlUrl || "");
+  const installationId = cleanText(config.managedRemoteInstallationId || "");
+  const agentToken = cleanText(secrets?.agentToken || "");
+  if (!controlUrl || !installationId || !agentToken) {
+    return "";
+  }
+  const url = new URL(controlUrl);
+  url.protocol = url.protocol === "https:" ? "wss:" : "ws:";
+  url.pathname = "/api/relay/agent";
+  url.search = new URLSearchParams({
+    installationId,
+    agentToken,
+  }).toString();
+  return url.toString();
+}
+
+async function syncManagedRemoteAccessState(runtime, config, state) {
+  if (config.accessMode !== ACCESS_MODE_VIVEWORKER || !managedRemoteConfigured(config)) {
+    return;
+  }
+  const secrets = await readManagedRemoteSecrets(config.managedRemoteSecretFile);
+  if (!secrets?.agentToken) {
+    runtime.managedRemoteAgent.lastError = "managed-remote-agent-token-missing";
+    return;
+  }
+  await updateManagedRemoteState({
+    controlUrl: config.managedRemoteControlUrl,
+    installationId: config.managedRemoteInstallationId,
+    agentToken: secrets.agentToken,
+    remoteEnabled: config.remoteAccessEnabled,
+    remoteExpiresAtMs: config.remoteAccessExpiresAtMs,
+    remoteWindowId: currentRemoteWindowId(state),
+  }).catch((error) => {
+    runtime.managedRemoteAgent.lastError = error.message || String(error);
+  });
+
+  const ws = runtime.managedRemoteAgent.ws;
+  if (ws && ws.readyState === WebSocket.OPEN) {
+    ws.send(JSON.stringify({
+      type: "state",
+      remoteEnabled: config.remoteAccessEnabled,
+      remoteExpiresAtMs: config.remoteAccessExpiresAtMs,
+      remoteWindowId: currentRemoteWindowId(state),
+      publicUrl: configuredRemotePublicUrl(config),
+      subdomain: cleanText(config.managedRemoteSubdomain || ""),
+    }));
+  }
+}
+
+async function ensureManagedRemoteAgent(runtime, config, state) {
+  if (config.accessMode !== ACCESS_MODE_VIVEWORKER || !managedRemoteConfigured(config)) {
+    return;
+  }
+  const existing = runtime.managedRemoteAgent.ws;
+  if (existing && (existing.readyState === WebSocket.OPEN || existing.readyState === WebSocket.CONNECTING)) {
+    return;
+  }
+  const secrets = await readManagedRemoteSecrets(config.managedRemoteSecretFile);
+  const wsUrl = managedRemoteWsUrl(config, secrets);
+  if (!wsUrl) {
+    runtime.managedRemoteAgent.lastError = "managed-remote-ws-url-missing";
+    return;
+  }
+  const ws = new WebSocket(wsUrl);
+  runtime.managedRemoteAgent.ws = ws;
+  ws.on("open", async () => {
+    runtime.managedRemoteAgent.connected = true;
+    runtime.managedRemoteAgent.lastError = "";
+    await syncManagedRemoteAccessState(runtime, config, state);
+  });
+  ws.on("message", async (raw) => {
+    const payload = parseJsonSafe(raw.toString("utf8"));
+    if (!payload || payload.type !== "http.request") {
+      return;
+    }
+    const response = await proxyManagedRemoteHttpRequest(config, payload).catch((error) => ({
+      status: 502,
+      headers: { "content-type": "text/plain; charset=utf-8" },
+      bodyBase64: Buffer.from(error.message || String(error), "utf8").toString("base64"),
+    }));
+    if (ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify({
+        type: "http.response",
+        id: payload.id,
+        ...response,
+      }));
+    }
+  });
+  ws.on("close", () => {
+    runtime.managedRemoteAgent.connected = false;
+    runtime.managedRemoteAgent.ws = null;
+    if (!runtime.stopping) {
+      clearTimeout(runtime.managedRemoteAgent.reconnectTimer);
+      runtime.managedRemoteAgent.reconnectTimer = setTimeout(() => {
+        ensureManagedRemoteAgent(runtime, config, state).catch((error) => {
+          runtime.managedRemoteAgent.lastError = error.message || String(error);
+        });
+      }, 2000);
+    }
+  });
+  ws.on("error", (error) => {
+    runtime.managedRemoteAgent.lastError = error.message || String(error);
+  });
+}
+
+async function stopManagedRemoteAgent(runtime) {
+  clearTimeout(runtime.managedRemoteAgent.reconnectTimer);
+  runtime.managedRemoteAgent.reconnectTimer = null;
+  if (runtime.managedRemoteAgent.ws) {
+    try {
+      runtime.managedRemoteAgent.ws.close();
+    } catch {
+      // ignore
+    }
+    runtime.managedRemoteAgent.ws = null;
+  }
+}
+
+async function proxyManagedRemoteHttpRequest(config, payload) {
+  const upstreamUrl = buildCloudflareUpstreamUrl(config.nativeApprovalPublicBaseUrl);
+  if (!upstreamUrl) {
+    throw new Error("managed-remote-upstream-missing");
+  }
+  const url = new URL(cleanText(payload.path || "/"), upstreamUrl);
+  const body = cleanText(payload.bodyBase64 || "") ? Buffer.from(payload.bodyBase64, "base64") : Buffer.alloc(0);
+  const headers = isPlainObject(payload.headers) ? { ...payload.headers } : {};
+  delete headers.host;
+  delete headers.connection;
+  const remoteHost = cleanText(payload.remoteHost || "");
+  if (remoteHost) {
+    headers["x-viveworker-remote-host"] = remoteHost;
+  }
+  return await new Promise((resolve, reject) => {
+    const requestImpl = url.protocol === "https:" ? httpsRequest : httpRequest;
+    const req = requestImpl(
+      url,
+      {
+        method: cleanText(payload.method || "GET") || "GET",
+        headers,
+        rejectUnauthorized: false,
+      },
+      (res) => {
+        const chunks = [];
+        res.on("data", (chunk) => chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)));
+        res.on("end", () => {
+          resolve({
+            status: Number(res.statusCode) || 502,
+            headers: Object.fromEntries(
+              Object.entries(res.headers || {})
+                .filter(([, value]) => typeof value === "string" || Array.isArray(value))
+                .map(([key, value]) => [key, Array.isArray(value) ? value.join(", ") : value])
+            ),
+            bodyBase64: Buffer.concat(chunks).toString("base64"),
+          });
+        });
+      }
+    );
+    req.on("error", reject);
+    if (body.length > 0) {
+      req.write(body);
+    }
+    req.end();
+  });
+}
+
+function parseJsonSafe(value) {
+  try {
+    return JSON.parse(String(value || ""));
+  } catch {
+    return null;
+  }
+}
+
+function buildCloudflareUpstreamUrl(baseUrl) {
+  if (!baseUrl) {
+    return "";
+  }
+  try {
+    const url = new URL(baseUrl);
+    url.hostname = "127.0.0.1";
+    url.pathname = "";
+    url.search = "";
+    url.hash = "";
+    return url.toString();
+  } catch {
+    return "";
+  }
 }
 
 function renderMessageHtml(messageText, fallbackHtml = "<p></p>") {
@@ -8563,6 +9144,7 @@ function createNativeApprovalServer({ config, runtime, state }) {
   const requestHandler = async (req, res) => {
     try {
       const url = new URL(req.url, config.nativeApprovalPublicBaseUrl);
+      await expireRemoteAccessIfNeeded({ config, state });
 
       if (url.pathname === "/health") {
         return writeJson(res, 200, { ok: true });
@@ -8626,17 +9208,22 @@ function createNativeApprovalServer({ config, runtime, state }) {
         const session = readSession(req, config, state);
         const localeInfo = resolveDeviceLocaleInfo(config, state, session.deviceId);
         if (session.authenticated && session.deviceId) {
-          const trustChanged = touchDeviceTrust(state, config, session.deviceId);
+        const trustChanged = touchDeviceTrust(state, config, session.deviceId);
+        const remoteTrustChanged = requestIsRemoteOrigin(req, config)
+          ? markRemoteOriginTrusted(state, configuredRemoteOrigin(config), currentRemoteWindowId(state), session.deviceId)
+          : false;
           const metadataChanged = updateCurrentDeviceSnapshot(state, config, session.deviceId, {
             userAgent: requestUserAgent(req),
             lastLocale: localeInfo.locale,
           });
-          if (trustChanged || metadataChanged) {
+          if (trustChanged || remoteTrustChanged || metadataChanged) {
             await saveState(config.stateFile, state);
           }
         }
         if (session.authenticated && session.restoredFromDevice) {
-          setSessionCookie(res, config);
+          setSessionCookie(res, config, {
+            remoteWindowId: requestIsRemoteOrigin(req, config) ? currentRemoteWindowId(state) : "",
+          });
         }
         return writeJson(res, 200, {
           authenticated: Boolean(session.authenticated),
@@ -8696,12 +9283,14 @@ function createNativeApprovalServer({ config, runtime, state }) {
             lastLocale: normalizeSupportedLocale(payload?.detectedLocale),
           }
         );
-        if (String(validation.credential || "").startsWith("code:")) {
+        if (payload?.temporary !== true && validation.credential) {
           markPairingConsumed(state, validation.credential);
         }
         clearPairingFailures(runtime, remoteAddress);
         await saveState(config.stateFile, state);
-        setPairingCookies(res, config, pairedDeviceId);
+        setPairingCookies(res, config, pairedDeviceId, {
+          remoteWindowId: requestIsRemoteOrigin(req, config) ? currentRemoteWindowId(state) : "",
+        });
         return writeJson(res, 200, {
           ok: true,
           authenticated: true,
@@ -8767,6 +9356,137 @@ function createNativeApprovalServer({ config, runtime, state }) {
         return writeJson(res, 200, {
           ok: true,
           ...buildSessionLocalePayload(config, state, session.deviceId),
+        });
+      }
+
+      if (url.pathname === "/api/session/remote-bootstrap" && req.method === "POST") {
+        if (!requireTrustedMutationOrigin(req, res, config)) {
+          return;
+        }
+        if (!remoteOverlayActive(config) || !requestIsRemoteOrigin(req, config)) {
+          return writeJson(res, 409, { error: "remote-access-not-configured" });
+        }
+        const payload = await parseJsonBody(req);
+        const result = consumeRemoteBootstrapToken(state, {
+          token: payload?.token ?? "",
+          origin: configuredRemoteOrigin(config),
+          windowId: currentRemoteWindowId(state),
+        });
+        if (!result.ok) {
+          await saveState(config.stateFile, state);
+          return writeJson(res, 400, { error: result.error });
+        }
+        const trustedRecord = getActiveDeviceTrustRecord(state, config, result.deviceId);
+        if (!trustedRecord) {
+          await saveState(config.stateFile, state);
+          return writeJson(res, 409, { error: "remote-bootstrap-device-revoked" });
+        }
+
+        markDevicePaired(state, config, result.deviceId, {
+          userAgent: requestUserAgent(req),
+          standalone: false,
+          lastLocale: resolveDeviceLocaleInfo(config, state, result.deviceId).locale,
+        });
+        markRemoteOriginTrusted(state, configuredRemoteOrigin(config), result.windowId, result.deviceId);
+        await saveState(config.stateFile, state);
+        setPairingCookies(res, config, result.deviceId, { remoteWindowId: result.windowId });
+        return writeJson(res, 200, {
+          ok: true,
+          authenticated: true,
+          pairingAvailable: isPairingAvailableForState(config, state),
+        });
+      }
+
+      if (url.pathname === "/api/settings/remote-access" && req.method === "GET") {
+        const session = requireApiSession(req, res, config, state);
+        if (!session) {
+          return;
+        }
+        await expireRemoteAccessIfNeeded({ config, state });
+        return writeJson(res, 200, buildRemoteAccessResponse({ config, state, session, req }));
+      }
+
+      if (url.pathname === "/api/settings/remote-access/enable" && req.method === "POST") {
+        const session = requireMutatingApiSession(req, res, config, state);
+        if (!session) {
+          return;
+        }
+        if (!remoteOverlayConfigured(config)) {
+          return writeJson(res, 409, { error: "remote-access-not-configured" });
+        }
+        if (!requestIsLanOrigin(req, config)) {
+          return writeJson(res, 409, { error: "remote-access-enable-lan-only" });
+        }
+        if (!session.deviceId) {
+          return writeJson(res, 409, { error: "device-id-missing" });
+        }
+
+        const publicUrl = configuredRemotePublicUrl(config);
+        const remoteOrigin = configuredRemoteOrigin(config);
+        const remoteWindowId = crypto.randomUUID();
+        const alreadyTrustedForRemote = false;
+        const expiresAtMs = Date.now() + DEFAULT_REMOTE_ACCESS_TTL_MS;
+        const bootstrapToken = alreadyTrustedForRemote
+          ? ""
+          : issueRemoteBootstrapToken(state, {
+              deviceId: session.deviceId,
+              origin: remoteOrigin,
+              windowId: remoteWindowId,
+            });
+        const bootstrapUrl = bootstrapToken
+          ? `${publicUrl}/app?remoteBootstrapToken=${encodeURIComponent(bootstrapToken)}`
+          : null;
+        setCurrentRemoteWindowId(state, remoteWindowId);
+
+        await persistRuntimeEnvUpdates(envFile, config, {
+          REMOTE_ACCESS_ENABLED: "1",
+          REMOTE_ACCESS_EXPIRES_AT_MS: String(expiresAtMs),
+        });
+        try {
+          await syncRemoteAccessServiceState(config);
+          await syncManagedRemoteAccessState(runtime, config, state);
+        } catch (error) {
+          invalidateRemoteBootstrapTokens(state, remoteOrigin);
+          setCurrentRemoteWindowId(state, "");
+          await persistRuntimeEnvUpdates(envFile, config, {
+            REMOTE_ACCESS_ENABLED: "0",
+            REMOTE_ACCESS_EXPIRES_AT_MS: "0",
+          });
+          await saveState(config.stateFile, state);
+          return writeJson(res, 500, { error: error.message });
+        }
+        await saveState(config.stateFile, state);
+        return writeJson(res, 200, {
+          ok: true,
+          ...buildRemoteAccessResponse({ config, state, session, req, bootstrapUrl }),
+        });
+      }
+
+      if (url.pathname === "/api/settings/remote-access/disable" && req.method === "POST") {
+        const session = requireMutatingApiSession(req, res, config, state);
+        if (!session) {
+          return;
+        }
+        if (!remoteOverlayConfigured(config)) {
+          return writeJson(res, 409, { error: "remote-access-not-configured" });
+        }
+        if (!requestIsLanOrigin(req, config)) {
+          return writeJson(res, 409, { error: "remote-access-enable-lan-only" });
+        }
+        const changed = invalidateRemoteBootstrapTokens(state, configuredRemoteOrigin(config));
+        setCurrentRemoteWindowId(state, "");
+        await persistRuntimeEnvUpdates(envFile, config, {
+          REMOTE_ACCESS_ENABLED: "0",
+          REMOTE_ACCESS_EXPIRES_AT_MS: "0",
+        });
+        await syncRemoteAccessServiceState(config);
+        await syncManagedRemoteAccessState(runtime, config, state);
+        if (changed) {
+          await saveState(config.stateFile, state);
+        }
+        return writeJson(res, 200, {
+          ok: true,
+          ...buildRemoteAccessResponse({ config, state, session, req }),
         });
       }
 
@@ -9595,7 +10315,7 @@ function createNativeApprovalServer({ config, runtime, state }) {
     }
   };
 
-  if (config.webPushEnabled) {
+  if (accessModeRequiresHttps(config.accessMode, config.webPushEnabled)) {
     return createHttpsServer({
       cert: readFileSync(config.tlsCertFile, "utf8"),
       key: readFileSync(config.tlsKeyFile, "utf8"),
@@ -10696,6 +11416,14 @@ function isLoopbackHostname(value) {
 function buildConfig(cli) {
   const codexHome = resolvePath(process.env.CODEX_HOME || path.join(os.homedir(), ".codex"));
   const stateFile = resolvePath(process.env.STATE_FILE || path.join(workspaceRoot, ".viveworker-state.json"));
+  const rawAccessMode = normalizeAccessMode(process.env.ACCESS_MODE, ACCESS_MODE_LAN);
+  const legacyRemoteProvider = normalizeRemoteAccessProvider(
+    process.env.REMOTE_ACCESS_PROVIDER,
+    "none"
+  );
+  const accessMode = rawAccessMode === ACCESS_MODE_LAN && legacyRemoteProvider === "cloudflare"
+    ? ACCESS_MODE_CLOUDFLARE
+    : rawAccessMode;
   return {
     dryRun: cli.dryRun || truthy(process.env.DRY_RUN),
     once: cli.once,
@@ -10727,6 +11455,24 @@ function buildConfig(cli) {
     ntfyPublishBaseUrl: stripTrailingSlash(process.env.NTFY_PUBLISH_BASE_URL || process.env.NTFY_BASE_URL || "https://ntfy.sh"),
     ntfyTopic: process.env.NTFY_TOPIC || "",
     defaultLocale: normalizeSupportedLocale(process.env.DEFAULT_LOCALE, DEFAULT_LOCALE) || DEFAULT_LOCALE,
+    accessMode,
+    remoteAccessPublicHostname: cleanRemoteText(process.env.REMOTE_ACCESS_PUBLIC_HOSTNAME || ""),
+    remoteAccessEnabled: boolEnv("REMOTE_ACCESS_ENABLED", false),
+    remoteAccessExpiresAtMs: numberEnv("REMOTE_ACCESS_EXPIRES_AT_MS", 0),
+    remoteAccessAllowedEmails: normalizeRemoteAccessAllowedEmails(process.env.REMOTE_ACCESS_ALLOWED_EMAILS || ""),
+    managedRemoteInstallationId: cleanText(process.env.MANAGED_REMOTE_INSTALLATION_ID || ""),
+    managedRemoteSubdomain: cleanText(process.env.MANAGED_REMOTE_SUBDOMAIN || ""),
+    managedRemotePublicUrl: cleanText(process.env.MANAGED_REMOTE_PUBLIC_URL || ""),
+    managedRemoteControlUrl: cleanText(process.env.MANAGED_REMOTE_CONTROL_URL || ""),
+    managedRemoteSecretFile: resolvePath(process.env.MANAGED_REMOTE_SECRET_FILE || ""),
+    cloudflareAccountId: cleanRemoteText(process.env.CLOUDFLARE_ACCOUNT_ID || ""),
+    cloudflareZoneId: cleanRemoteText(process.env.CLOUDFLARE_ZONE_ID || ""),
+    cloudflareTunnelId: cleanRemoteText(process.env.CLOUDFLARE_TUNNEL_ID || ""),
+    cloudflareTunnelName: cleanRemoteText(process.env.CLOUDFLARE_TUNNEL_NAME || ""),
+    cloudflareTunnelCredentialsFile: resolvePath(process.env.CLOUDFLARE_TUNNEL_CREDENTIALS_FILE || ""),
+    cloudflareTunnelConfigFile: resolvePath(process.env.CLOUDFLARE_TUNNEL_CONFIG_FILE || ""),
+    cloudflareAccessAppId: cleanRemoteText(process.env.CLOUDFLARE_ACCESS_APP_ID || ""),
+    cloudflareAccessPolicyId: cleanRemoteText(process.env.CLOUDFLARE_ACCESS_POLICY_ID || ""),
     approvalTitle: process.env.APPROVAL_TITLE || t(normalizeSupportedLocale(process.env.DEFAULT_LOCALE, DEFAULT_LOCALE), "server.title.approval"),
     completeTitle: process.env.COMPLETE_TITLE || t(normalizeSupportedLocale(process.env.DEFAULT_LOCALE, DEFAULT_LOCALE), "server.title.complete"),
     planTitle: process.env.PLAN_TITLE || t(normalizeSupportedLocale(process.env.DEFAULT_LOCALE, DEFAULT_LOCALE), "server.title.plan"),
@@ -10799,18 +11545,68 @@ function validateConfig(config) {
 
   const isHttps = publicBaseUrl.protocol === "https:";
   const isLoopback = isLoopbackHostname(publicBaseUrl.hostname);
-  if (config.authRequired && !isHttps && !isLoopback && !config.allowInsecureLanHttp) {
+  if (isLegacyVpnAccessMode(config.accessMode)) {
+    throw new Error("ACCESS_MODE=vpn is no longer supported. Re-run setup with ACCESS_MODE=lan, viveworker, or cloudflare.");
+  }
+  if (config.accessMode === ACCESS_MODE_CLOUDFLARE) {
+    if (!config.remoteAccessPublicHostname) {
+      throw new Error("ACCESS_MODE=cloudflare requires REMOTE_ACCESS_PUBLIC_HOSTNAME");
+    }
+    if (!config.cloudflareAccountId) {
+      throw new Error("ACCESS_MODE=cloudflare requires CLOUDFLARE_ACCOUNT_ID");
+    }
+    if (!config.cloudflareZoneId || !config.cloudflareTunnelId || !config.cloudflareAccessAppId || !config.cloudflareAccessPolicyId) {
+      throw new Error("ACCESS_MODE=cloudflare requires the reconciled Cloudflare resource IDs.");
+    }
+    if (config.remoteAccessAllowedEmails.length === 0) {
+      throw new Error("ACCESS_MODE=cloudflare requires REMOTE_ACCESS_ALLOWED_EMAILS");
+    }
+    if (!isHttps) {
+      throw new Error("ACCESS_MODE=cloudflare requires NATIVE_APPROVAL_SERVER_PUBLIC_BASE_URL to use https://");
+    }
+    if (config.allowInsecureLanHttp) {
+      throw new Error("ACCESS_MODE=cloudflare does not allow ALLOW_INSECURE_LAN_HTTP=1");
+    }
+  }
+  if (config.accessMode === ACCESS_MODE_VIVEWORKER) {
+    if (!config.managedRemoteInstallationId) {
+      throw new Error("ACCESS_MODE=viveworker requires MANAGED_REMOTE_INSTALLATION_ID");
+    }
+    if (!config.managedRemotePublicUrl) {
+      throw new Error("ACCESS_MODE=viveworker requires MANAGED_REMOTE_PUBLIC_URL");
+    }
+    if (!config.managedRemoteControlUrl) {
+      throw new Error("ACCESS_MODE=viveworker requires MANAGED_REMOTE_CONTROL_URL");
+    }
+    if (!config.managedRemoteSecretFile) {
+      throw new Error("ACCESS_MODE=viveworker requires MANAGED_REMOTE_SECRET_FILE");
+    }
+    if (!isHttps) {
+      throw new Error("ACCESS_MODE=viveworker requires NATIVE_APPROVAL_SERVER_PUBLIC_BASE_URL to use https://");
+    }
+    if (config.allowInsecureLanHttp) {
+      throw new Error("ACCESS_MODE=viveworker does not allow ALLOW_INSECURE_LAN_HTTP=1");
+    }
+  }
+
+  if (config.authRequired && config.accessMode === ACCESS_MODE_LAN && !isHttps && !isLoopback && !config.allowInsecureLanHttp) {
     throw new Error(
       "LAN auth requires HTTPS. Use setup defaults, switch to a loopback URL, or set ALLOW_INSECURE_LAN_HTTP=1 intentionally."
     );
   }
 
+  if (accessModeRequiresHttps(config.accessMode, config.webPushEnabled)) {
+    if (!isHttps) {
+      throw new Error("HTTPS is required for the configured access mode.");
+    }
+    if (!config.tlsCertFile || !config.tlsKeyFile) {
+      throw new Error("TLS_CERT_FILE and TLS_KEY_FILE are required for HTTPS mode");
+    }
+  }
+
   if (config.webPushEnabled) {
     if (!isHttps) {
       throw new Error("WEB_PUSH_ENABLED=1 requires NATIVE_APPROVAL_SERVER_PUBLIC_BASE_URL to use https://");
-    }
-    if (!config.tlsCertFile || !config.tlsKeyFile) {
-      throw new Error("WEB_PUSH_ENABLED=1 requires TLS_CERT_FILE and TLS_KEY_FILE");
     }
     if (!config.webPushVapidPublicKey || !config.webPushVapidPrivateKey) {
       throw new Error("WEB_PUSH_ENABLED=1 requires WEB_PUSH_VAPID_PUBLIC_KEY and WEB_PUSH_VAPID_PRIVATE_KEY");
@@ -10952,6 +11748,9 @@ async function loadState(stateFile) {
       suppressedPlanReadyTurns: parsed.suppressedPlanReadyTurns ?? {},
       pendingPlanRequests: parsed.pendingPlanRequests ?? {},
       pendingUserInputRequests: parsed.pendingUserInputRequests ?? {},
+      remoteWindowId: cleanText(parsed.remoteWindowId ?? ""),
+      remoteBootstrapTokens: parsed.remoteBootstrapTokens ?? {},
+      remoteTrustedOrigins: parsed.remoteTrustedOrigins ?? {},
       recentHistoryItems: parsed.recentHistoryItems ?? [],
       recentTimelineEntries: parsed.recentTimelineEntries ?? [],
       recentCodeEvents: parsed.recentCodeEvents ?? null,
@@ -10978,6 +11777,9 @@ async function loadState(stateFile) {
       suppressedPlanReadyTurns: {},
       pendingPlanRequests: {},
       pendingUserInputRequests: {},
+      remoteWindowId: "",
+      remoteBootstrapTokens: {},
+      remoteTrustedOrigins: {},
       recentHistoryItems: [],
       recentTimelineEntries: [],
       recentCodeEvents: null,
@@ -11872,6 +12674,7 @@ async function main() {
       restoredTimelineImagePathsStateChanged ||
       migratedRecentCodeEventsStateChanged ||
       restoredPendingUserInputStateChanged ||
+      prunedRemoteBootstrapTokensStateChanged ||
       refreshResolvedThreadLabels({ config, runtime, state })
     ) {
       await saveState(config.stateFile, state);
@@ -11889,6 +12692,9 @@ async function main() {
       approvalServer = createNativeApprovalServer({ config, runtime, state });
       await startHttpServer(approvalServer, config.nativeApprovalListenHost, config.nativeApprovalListenPort);
       console.log(`Native approval server: ${config.nativeApprovalPublicBaseUrl}`);
+      await syncRemoteAccessServiceState(config);
+      await ensureManagedRemoteAgent(runtime, config, state);
+      await syncManagedRemoteAccessState(runtime, config, state);
 
       if (config.nativeApprovals && (config.notifyApprovals || config.webUiEnabled)) {
         runtime.ipcClient = new NativeIpcClient({
@@ -11957,6 +12763,7 @@ async function main() {
 
     while (!runtime.stopping) {
       try {
+        await expireRemoteAccessIfNeeded({ config, state });
         const dirty = await scanOnce({ config, runtime, state });
         if (dirty) {
           await saveState(config.stateFile, state);
@@ -11981,5 +12788,7 @@ async function main() {
     if (approvalServer) {
       await stopHttpServer(approvalServer);
     }
+    await stopCloudflaredLaunchAgent();
+    await stopManagedRemoteAgent(runtime);
   }
 }

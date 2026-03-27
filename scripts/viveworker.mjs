@@ -11,6 +11,51 @@ import { createInterface as createReadlineInterface } from "node:readline/promis
 import { fileURLToPath } from "node:url";
 import { DEFAULT_LOCALE, normalizeLocale, t } from "../web/i18n.js";
 import { generatePairingCredentials, shouldRotatePairing, upsertEnvText } from "./lib/pairing.mjs";
+import {
+  ACCESS_MODE_LAN,
+  ACCESS_MODE_VIVEWORKER,
+  ACCESS_MODE_CLOUDFLARE,
+  LEGACY_ACCESS_MODE_VPN,
+  accessModeHasRemoteOverlay,
+  accessModeRequiresHttps,
+  isCloudflareAccessMode,
+  isLegacyVpnAccessMode,
+  normalizeAccessMode,
+} from "./lib/vpn.mjs";
+import {
+  DEFAULT_CLOUDFLARED_LABEL,
+  DEFAULT_CLOUDFLARED_LAUNCH_AGENT_PATH,
+  buildCloudflaredLaunchAgentPlist,
+  buildRemotePublicUrl,
+  cleanText as cleanRemoteText,
+  cloudflaredLaunchAgentStatus,
+  defaultCloudflareTunnelName,
+  detectCloudflaredInstallation,
+  ensureCloudflaredInstalled,
+  normalizeRemoteAccessAllowedEmails,
+  reconcileCloudflareRemoteAccess,
+  remoteAccessActive,
+  remoteAccessConfigured,
+  remoteAccessExpired,
+  resolveCloudflareAssetPaths,
+  startCloudflaredLaunchAgent,
+  stopCloudflaredLaunchAgent,
+  verifyCloudflareRemoteAccess,
+  writeCloudflareTunnelAssets,
+} from "./lib/cloudflare.mjs";
+import {
+  DEFAULT_MANAGED_REMOTE_CONTROL_URL,
+  buildManagedRemotePublicOrigin,
+  buildManagedRemotePublicUrl,
+  managedRemoteConfigured,
+  pollManagedDeviceFlow,
+  readManagedRemoteSecrets,
+  resolveManagedRemoteAssetPaths,
+  rotateManagedRemoteSubdomain,
+  startManagedDeviceFlow,
+  updateManagedRemoteState,
+  writeManagedRemoteArtifacts,
+} from "./lib/managed-remote.mjs";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -24,7 +69,6 @@ const defaultLogFile = path.join(defaultLogDir, "viveworker.log");
 const defaultPidFile = path.join(defaultConfigDir, "viveworker.pid");
 const defaultLaunchAgentPath = path.join(os.homedir(), "Library", "LaunchAgents", "io.viveworker.app.plist");
 const defaultLabel = "io.viveworker.app";
-const defaultTlsDir = path.join(defaultConfigDir, "tls");
 const defaultServerPort = 8810;
 
 const cli = parseArgs(process.argv.slice(2));
@@ -43,6 +87,9 @@ async function main(cliOptions) {
   switch (cliOptions.command) {
     case "setup":
       await runSetup(cliOptions);
+      return;
+    case "remote":
+      await runRemote(cliOptions);
       return;
     case "start":
       await runStart(cliOptions);
@@ -73,27 +120,61 @@ async function runSetup(cliOptions) {
   const locale = await resolveSetupLocale(cliOptions, existing);
   const progress = createCliProgressReporter(locale);
   progress.update("cli.setup.progress.prepare");
+  const accessMode = resolveConfiguredAccessMode({ cliOptions, existing });
+  if (isLegacyVpnAccessMode(accessMode)) {
+    throw new Error("ACCESS_MODE=vpn has been removed. Re-run setup with --access-mode lan, viveworker, or cloudflare.");
+  }
   const port = cliOptions.port || Number(existing.NATIVE_APPROVAL_SERVER_PORT) || defaultServerPort;
   const hostname = cliOptions.hostname || existing.VIVEWORKER_HOSTNAME || os.hostname();
   const localHostname = hostname.endsWith(".local") ? hostname : `${hostname}.local`;
   const ips = await findLocalIpv4Addresses();
   const chosenIp = ips[0] || "127.0.0.1";
   const webPushEnabled = resolveSetupWebPushEnabled(cliOptions);
-  const allowInsecureHttpLan = Boolean(cliOptions.allowInsecureHttpLan && !webPushEnabled);
-  const tlsCertFile = resolvePath(
-    cliOptions.tlsCertFile || existing.TLS_CERT_FILE || path.join(configDir, "tls", "cert.pem")
-  );
-  const tlsKeyFile = resolvePath(
-    cliOptions.tlsKeyFile || existing.TLS_KEY_FILE || path.join(configDir, "tls", "key.pem")
-  );
-  const scheme = webPushEnabled ? "https" : "http";
-  const publicBaseUrl = webPushEnabled || allowInsecureHttpLan
-    ? `${scheme}://${localHostname}:${port}`
-    : `http://127.0.0.1:${port}`;
-  const fallbackBaseUrl = webPushEnabled || allowInsecureHttpLan
-    ? `${scheme}://${chosenIp}:${port}`
-    : publicBaseUrl;
-  const listenHost = webPushEnabled || allowInsecureHttpLan ? "0.0.0.0" : "127.0.0.1";
+  const existingAccessMode = resolveConfiguredAccessMode({ existing });
+  const remoteAccessPublicHostname = accessMode === ACCESS_MODE_CLOUDFLARE
+    ? cleanSetupValue(cliOptions.publicHostname || existing.REMOTE_ACCESS_PUBLIC_HOSTNAME).toLowerCase()
+    : "";
+  const remoteAccessAllowedEmails = accessMode === ACCESS_MODE_CLOUDFLARE
+    ? normalizeRemoteAccessAllowedEmails(
+        cliOptions.accessAllowEmails || existing.REMOTE_ACCESS_ALLOWED_EMAILS || ""
+      )
+    : [];
+  const cloudflareAccountId = accessMode === ACCESS_MODE_CLOUDFLARE
+    ? cleanSetupValue(cliOptions.cloudflareAccountId || existing.CLOUDFLARE_ACCOUNT_ID)
+    : "";
+  const managedRemoteControlUrl = accessMode === ACCESS_MODE_VIVEWORKER
+    ? cleanSetupValue(existing.MANAGED_REMOTE_CONTROL_URL || process.env.MANAGED_REMOTE_CONTROL_URL || DEFAULT_MANAGED_REMOTE_CONTROL_URL)
+    : cleanSetupValue(existing.MANAGED_REMOTE_CONTROL_URL || process.env.MANAGED_REMOTE_CONTROL_URL || DEFAULT_MANAGED_REMOTE_CONTROL_URL);
+  const lanTlsRequired = accessModeRequiresHttps(accessMode, webPushEnabled);
+  const allowInsecureHttpLan =
+    accessMode === ACCESS_MODE_LAN
+      ? Boolean(cliOptions.allowInsecureHttpLan && !lanTlsRequired)
+      : false;
+  validateSetupAccessModeOptions({
+    cliOptions,
+    accessMode,
+    remoteAccessPublicHostname,
+    cloudflareAccountId,
+    remoteAccessAllowedEmails,
+  });
+  const tlsCertFile = resolvePath(cliOptions.tlsCertFile || existing.TLS_CERT_FILE || path.join(configDir, "tls", "cert.pem"));
+  const tlsKeyFile = resolvePath(cliOptions.tlsKeyFile || existing.TLS_KEY_FILE || path.join(configDir, "tls", "key.pem"));
+  const publicBaseUrl = buildSetupPublicBaseUrl({
+    tlsRequired: lanTlsRequired,
+    allowInsecureHttpLan,
+    localHostname,
+    port,
+  });
+  const fallbackBaseUrl = buildSetupFallbackBaseUrl({
+    publicBaseUrl,
+    chosenIp,
+    tlsRequired: lanTlsRequired,
+    allowInsecureHttpLan,
+    port,
+  });
+  const listenHost = lanTlsRequired || allowInsecureHttpLan
+    ? "0.0.0.0"
+    : "127.0.0.1";
   const shouldRotatePairingValue = shouldRotatePairing(
     {
       force: cliOptions.pair,
@@ -124,27 +205,140 @@ async function runSetup(cliOptions) {
     cliOptions.webPushSubject ||
     existing.WEB_PUSH_SUBJECT ||
     "mailto:viveworker@example.com";
-  const tlsAssets = webPushEnabled
-    ? await ensureWebPushAssets({
-        cliOptions,
-        existing,
-        hostname,
-        localHostname,
-        locale,
-        progress,
-        chosenIp,
-        tlsCertFile,
-        tlsKeyFile,
-      })
+  const vapidKeys = webPushEnabled
+    ? await ensureVapidKeys({ cliOptions, existing, progress })
+    : null;
+  let managedBootstrap = null;
+  if (!cliOptions.pair && accessMode === ACCESS_MODE_VIVEWORKER) {
+    progress.update("cli.setup.progress.remoteBootstrap");
+    const flow = await startManagedDeviceFlow({
+      controlUrl: managedRemoteControlUrl || DEFAULT_MANAGED_REMOTE_CONTROL_URL,
+      machineName: hostname,
+      locale,
+    });
+    console.log("");
+    console.log(`Managed remote login: ${flow.verifyUrl}`);
+    if (process.platform === "darwin") {
+      await execCommand(["open", flow.verifyUrl], { ignoreError: true });
+    }
+    const approved = await pollManagedDeviceFlow({
+      controlUrl: managedRemoteControlUrl || DEFAULT_MANAGED_REMOTE_CONTROL_URL,
+      flowId: flow.flowId,
+    });
+    const managedPaths = await writeManagedRemoteArtifacts({
+      configDir,
+      installationId: approved.installation.installationId,
+      subdomain: approved.installation.subdomain,
+      publicUrl: approved.installation.publicUrl,
+      controlUrl: approved.controlUrl || managedRemoteControlUrl || DEFAULT_MANAGED_REMOTE_CONTROL_URL,
+      email: approved.installation.email || "",
+      agentToken: approved.agentToken,
+    });
+    managedBootstrap = {
+      installationId: approved.installation.installationId,
+      subdomain: approved.installation.subdomain,
+      publicUrl: approved.installation.publicUrl,
+      controlUrl: approved.controlUrl || managedRemoteControlUrl || DEFAULT_MANAGED_REMOTE_CONTROL_URL,
+      email: approved.installation.email || "",
+      agentToken: approved.agentToken,
+      paths: managedPaths,
+      enabled: truthyString(existing.REMOTE_ACCESS_ENABLED),
+      expiresAtMs: Number(existing.REMOTE_ACCESS_EXPIRES_AT_MS) || 0,
+    };
+  }
+  let remoteBootstrap = null;
+  if (!cliOptions.pair && accessMode === ACCESS_MODE_CLOUDFLARE) {
+    progress.update("cli.setup.progress.remoteBootstrap");
+    if (!cleanRemoteText(process.env.CLOUDFLARE_API_TOKEN || "")) {
+      throw new Error("CLOUDFLARE_API_TOKEN is required when ACCESS_MODE=cloudflare.");
+    }
+    const cloudflaredInstall = await ensureCloudflaredInstalled({
+      installIfMissing: true,
+      streamOutput: true,
+    });
+    const upstreamUrl = buildCloudflareUpstreamUrl(publicBaseUrl);
+    const reconciled = await reconcileCloudflareRemoteAccess({
+      apiToken: process.env.CLOUDFLARE_API_TOKEN || "",
+      accountId: cloudflareAccountId,
+      publicHostname: remoteAccessPublicHostname,
+      allowedEmails: remoteAccessAllowedEmails,
+      zoneId: existing.CLOUDFLARE_ZONE_ID || "",
+      tunnelId: existing.CLOUDFLARE_TUNNEL_ID || "",
+      tunnelName: existing.CLOUDFLARE_TUNNEL_NAME || defaultCloudflareTunnelName(remoteAccessPublicHostname),
+      accessAppId: existing.CLOUDFLARE_ACCESS_APP_ID || "",
+      accessPolicyId: existing.CLOUDFLARE_ACCESS_POLICY_ID || "",
+      upstreamUrl,
+    });
+    const paths = await writeCloudflareTunnelAssets({
+      configDir,
+      accountId: cloudflareAccountId,
+      zoneId: reconciled.zoneId,
+      tunnelId: reconciled.tunnelId,
+      tunnelName: reconciled.tunnelName,
+      publicHostname: remoteAccessPublicHostname,
+      allowedEmails: remoteAccessAllowedEmails,
+      upstreamUrl,
+      tunnelToken: reconciled.tunnelToken,
+    });
+    remoteBootstrap = {
+      ...reconciled,
+      cloudflaredPath: cloudflaredInstall.cloudflaredPath,
+      paths,
+      enabled: truthyString(existing.REMOTE_ACCESS_ENABLED),
+      expiresAtMs: Number(existing.REMOTE_ACCESS_EXPIRES_AT_MS) || 0,
+    };
+  }
+  const tlsAssets = lanTlsRequired
+    ? {
+        ...(await ensureLanTlsAssets({
+          cliOptions,
+          existing,
+          hostname,
+          localHostname,
+          locale,
+          progress,
+          chosenIp,
+          tlsCertFile,
+          tlsKeyFile,
+        })),
+        vapidPublicKey: vapidKeys?.publicKey || "",
+        vapidPrivateKey: vapidKeys?.privateKey || "",
+      }
+    : null;
+  const cloudflared = accessMode === ACCESS_MODE_CLOUDFLARE
+    ? await detectCloudflaredInstallation()
     : null;
 
   progress.update("cli.setup.progress.writeConfig");
   await fs.mkdir(path.dirname(envFile), { recursive: true });
   await fs.mkdir(path.dirname(logFile), { recursive: true });
+  const preserveRemoteRuntimeState =
+    accessModeHasRemoteOverlay(accessMode) &&
+    existingAccessMode === accessMode &&
+    (
+      accessMode === ACCESS_MODE_CLOUDFLARE
+        ? cleanSetupValue(existing.REMOTE_ACCESS_PUBLIC_HOSTNAME).toLowerCase() === remoteAccessPublicHostname &&
+          cleanSetupValue(existing.CLOUDFLARE_ACCOUNT_ID) === cloudflareAccountId
+        : cleanSetupValue(existing.MANAGED_REMOTE_INSTALLATION_ID) === cleanSetupValue(managedBootstrap?.installationId || existing.MANAGED_REMOTE_INSTALLATION_ID) &&
+          cleanSetupValue(existing.MANAGED_REMOTE_PUBLIC_URL) === cleanSetupValue(managedBootstrap?.publicUrl || existing.MANAGED_REMOTE_PUBLIC_URL)
+    );
+  const remoteAccessEnabled = accessModeHasRemoteOverlay(accessMode)
+    ? preserveRemoteRuntimeState && truthyString(existing.REMOTE_ACCESS_ENABLED)
+    : false;
+  const remoteAccessExpiresAtMs = accessModeHasRemoteOverlay(accessMode) && preserveRemoteRuntimeState
+    ? Number(existing.REMOTE_ACCESS_EXPIRES_AT_MS) || 0
+    : 0;
+  const cloudflarePaths = accessMode === ACCESS_MODE_CLOUDFLARE
+    ? (remoteBootstrap?.paths || resolveCloudflareAssetPaths(configDir))
+    : null;
+  const managedPaths = accessMode === ACCESS_MODE_VIVEWORKER
+    ? (managedBootstrap?.paths || resolveManagedRemoteAssetPaths(configDir))
+    : null;
 
   const envLines = [
     `WEB_UI_ENABLED=1`,
     `AUTH_REQUIRED=1`,
+    `ACCESS_MODE=${accessMode}`,
     `VIVEWORKER_HOSTNAME=${hostname}`,
     `CODEX_HOME=${existing.CODEX_HOME || process.env.CODEX_HOME || path.join(os.homedir(), ".codex")}`,
     `STATE_FILE=${stateFile}`,
@@ -156,11 +350,54 @@ async function runSetup(cliOptions) {
     `DEFAULT_LOCALE=${locale}`,
     `WEB_PUSH_ENABLED=${webPushEnabled ? 1 : 0}`,
     `ALLOW_INSECURE_LAN_HTTP=${allowInsecureHttpLan ? 1 : 0}`,
-    webPushEnabled ? `TLS_CERT_FILE=${tlsAssets.certFile}` : null,
-    webPushEnabled ? `TLS_KEY_FILE=${tlsAssets.keyFile}` : null,
+    lanTlsRequired ? `TLS_CERT_FILE=${tlsAssets.certFile}` : null,
+    lanTlsRequired ? `TLS_KEY_FILE=${tlsAssets.keyFile}` : null,
     webPushEnabled ? `WEB_PUSH_VAPID_PUBLIC_KEY=${tlsAssets.vapidPublicKey}` : null,
     webPushEnabled ? `WEB_PUSH_VAPID_PRIVATE_KEY=${tlsAssets.vapidPrivateKey}` : null,
     webPushEnabled ? `WEB_PUSH_SUBJECT=${webPushSubject}` : null,
+    accessModeHasRemoteOverlay(accessMode) ? `REMOTE_ACCESS_ENABLED=${remoteAccessEnabled ? 1 : 0}` : null,
+    accessModeHasRemoteOverlay(accessMode) ? `REMOTE_ACCESS_EXPIRES_AT_MS=${remoteAccessExpiresAtMs}` : null,
+    accessMode === ACCESS_MODE_CLOUDFLARE ? `REMOTE_ACCESS_PUBLIC_HOSTNAME=${remoteAccessPublicHostname}` : null,
+    accessMode === ACCESS_MODE_CLOUDFLARE
+      ? `REMOTE_ACCESS_ALLOWED_EMAILS=${remoteAccessAllowedEmails.join(",")}`
+      : null,
+    accessMode === ACCESS_MODE_CLOUDFLARE ? `CLOUDFLARE_ACCOUNT_ID=${cloudflareAccountId}` : null,
+    accessMode === ACCESS_MODE_CLOUDFLARE
+      ? `CLOUDFLARE_ZONE_ID=${remoteBootstrap?.zoneId || existing.CLOUDFLARE_ZONE_ID || ""}`
+      : null,
+    accessMode === ACCESS_MODE_CLOUDFLARE
+      ? `CLOUDFLARE_TUNNEL_ID=${remoteBootstrap?.tunnelId || existing.CLOUDFLARE_TUNNEL_ID || ""}`
+      : null,
+    accessMode === ACCESS_MODE_CLOUDFLARE
+      ? `CLOUDFLARE_TUNNEL_NAME=${remoteBootstrap?.tunnelName || existing.CLOUDFLARE_TUNNEL_NAME || defaultCloudflareTunnelName(remoteAccessPublicHostname)}`
+      : null,
+    accessMode === ACCESS_MODE_CLOUDFLARE
+      ? `CLOUDFLARE_TUNNEL_CREDENTIALS_FILE=${cloudflarePaths.credentialsFile}`
+      : null,
+    accessMode === ACCESS_MODE_CLOUDFLARE
+      ? `CLOUDFLARE_TUNNEL_CONFIG_FILE=${cloudflarePaths.configFile}`
+      : null,
+    accessMode === ACCESS_MODE_CLOUDFLARE
+      ? `CLOUDFLARE_ACCESS_APP_ID=${remoteBootstrap?.accessAppId || existing.CLOUDFLARE_ACCESS_APP_ID || ""}`
+      : null,
+    accessMode === ACCESS_MODE_CLOUDFLARE
+      ? `CLOUDFLARE_ACCESS_POLICY_ID=${remoteBootstrap?.accessPolicyId || existing.CLOUDFLARE_ACCESS_POLICY_ID || ""}`
+      : null,
+    accessMode === ACCESS_MODE_VIVEWORKER
+      ? `MANAGED_REMOTE_INSTALLATION_ID=${managedBootstrap?.installationId || existing.MANAGED_REMOTE_INSTALLATION_ID || ""}`
+      : null,
+    accessMode === ACCESS_MODE_VIVEWORKER
+      ? `MANAGED_REMOTE_SUBDOMAIN=${managedBootstrap?.subdomain || existing.MANAGED_REMOTE_SUBDOMAIN || ""}`
+      : null,
+    accessMode === ACCESS_MODE_VIVEWORKER
+      ? `MANAGED_REMOTE_PUBLIC_URL=${managedBootstrap?.publicUrl || existing.MANAGED_REMOTE_PUBLIC_URL || ""}`
+      : null,
+    accessMode === ACCESS_MODE_VIVEWORKER
+      ? `MANAGED_REMOTE_CONTROL_URL=${managedBootstrap?.controlUrl || existing.MANAGED_REMOTE_CONTROL_URL || managedRemoteControlUrl || DEFAULT_MANAGED_REMOTE_CONTROL_URL}`
+      : null,
+    accessMode === ACCESS_MODE_VIVEWORKER
+      ? `MANAGED_REMOTE_SECRET_FILE=${managedPaths.secretFile}`
+      : null,
     `PAIRING_CODE=${pairCode}`,
     `PAIRING_TOKEN=${pairToken}`,
     `PAIRING_EXPIRES_AT_MS=${pairingExpiresAtMs}`,
@@ -178,6 +415,21 @@ async function runSetup(cliOptions) {
   ].filter(Boolean);
 
   await fs.writeFile(envFile, `${envLines.join("\n")}\n`, "utf8");
+
+  if (accessMode === ACCESS_MODE_CLOUDFLARE && cloudflared?.cloudflaredPath && cloudflarePaths) {
+    await fs.mkdir(path.dirname(DEFAULT_CLOUDFLARED_LAUNCH_AGENT_PATH), { recursive: true });
+    await fs.mkdir(path.dirname(cloudflarePaths.logFile), { recursive: true });
+    await fs.writeFile(
+      DEFAULT_CLOUDFLARED_LAUNCH_AGENT_PATH,
+      buildCloudflaredLaunchAgentPlist({
+        label: DEFAULT_CLOUDFLARED_LABEL,
+        cloudflaredPath: cloudflared.cloudflaredPath,
+        credentialsFile: cloudflarePaths.credentialsFile,
+        logFile: cloudflarePaths.logFile,
+      }),
+      "utf8"
+    );
+  }
 
   if (!cliOptions.noLaunchd) {
     progress.update("cli.setup.progress.launchd");
@@ -203,6 +455,25 @@ async function runSetup(cliOptions) {
   const pairingReady = healthy
     ? await waitForExpectedPairing(publicBaseUrl, pairToken)
     : false;
+  if (accessMode === ACCESS_MODE_CLOUDFLARE && cloudflarePaths) {
+    if (remoteAccessActive({
+      accessMode,
+      remoteAccessPublicHostname,
+      cloudflareAccountId,
+      cloudflareZoneId: remoteBootstrap?.zoneId || existing.CLOUDFLARE_ZONE_ID || "",
+      cloudflareTunnelId: remoteBootstrap?.tunnelId || existing.CLOUDFLARE_TUNNEL_ID || "",
+      cloudflareAccessAppId: remoteBootstrap?.accessAppId || existing.CLOUDFLARE_ACCESS_APP_ID || "",
+      cloudflareAccessPolicyId: remoteBootstrap?.accessPolicyId || existing.CLOUDFLARE_ACCESS_POLICY_ID || "",
+      cloudflareTunnelCredentialsFile: cloudflarePaths.credentialsFile,
+      cloudflareTunnelConfigFile: cloudflarePaths.configFile,
+      remoteAccessEnabled,
+      remoteAccessExpiresAtMs,
+    })) {
+      await startCloudflaredLaunchAgent();
+    } else {
+      await stopCloudflaredLaunchAgent();
+    }
+  }
   progress.done(healthy && pairingReady ? "cli.setup.complete" : "cli.setup.completePending");
   if (healthy && !pairingReady) {
     console.log("");
@@ -213,7 +484,7 @@ async function runSetup(cliOptions) {
   const mkcertRootCaFile = resolvePath(
     existing.MKCERT_ROOT_CA_FILE || process.env.MKCERT_ROOT_CA_FILE || "~/Library/Application Support/mkcert/rootCA.pem"
   );
-  const canShowCaDownload = webPushEnabled && await fileExists(mkcertRootCaFile);
+  const canShowCaDownload = lanTlsRequired && await fileExists(mkcertRootCaFile);
   const caPath = "/ca/rootCA.pem";
   let caDownloadLocalUrl = `${publicBaseUrl}${caPath}`;
   let caDownloadIpUrl = `${fallbackBaseUrl}${caPath}`;
@@ -256,11 +527,43 @@ async function runSetup(cliOptions) {
     console.log(t(locale, "cli.setup.pairRefresh.reminder"));
     console.log("");
   }
+  const accessModeLabelKey =
+    accessMode === ACCESS_MODE_VIVEWORKER
+      ? "cli.accessMode.viveworker"
+      : accessMode === ACCESS_MODE_CLOUDFLARE
+        ? "cli.accessMode.cloudflare"
+        : "cli.accessMode.lan";
+  console.log(t(locale, "cli.setup.accessMode", { value: t(locale, accessModeLabelKey) }));
   console.log(t(locale, "cli.setup.primaryUrl", { url: publicBaseUrl }));
   console.log(t(locale, "cli.setup.fallbackUrl", { url: fallbackBaseUrl }));
   console.log(t(locale, "cli.setup.pairingCode", { code: pairCode }));
   console.log(t(locale, "cli.setup.pairingUrlLocal", { url: `${publicBaseUrl}${pairPath}` }));
   console.log(t(locale, "cli.setup.pairingUrlIp", { url: `${fallbackBaseUrl}${pairPath}` }));
+  if (accessMode === ACCESS_MODE_CLOUDFLARE) {
+    console.log(t(locale, "cli.setup.remoteAccessProvider", { value: "Cloudflare Zero Trust" }));
+    console.log(t(locale, "cli.setup.remoteAccessPublicUrl", { url: buildRemotePublicUrl(remoteAccessPublicHostname) }));
+    console.log(t(locale, "cli.setup.remoteAccessStatus", {
+      value: t(
+        locale,
+        remoteAccessEnabled && !remoteAccessExpired({ remoteAccessExpiresAtMs })
+          ? "cli.status.enabled"
+          : "cli.status.disabled"
+      ),
+    }));
+  } else if (accessMode === ACCESS_MODE_VIVEWORKER) {
+    console.log(t(locale, "cli.setup.remoteAccessProvider", { value: "viveworker managed relay" }));
+    console.log(t(locale, "cli.setup.remoteAccessPublicUrl", {
+      url: managedBootstrap?.publicUrl || existing.MANAGED_REMOTE_PUBLIC_URL || "",
+    }));
+    console.log(t(locale, "cli.setup.remoteAccessStatus", {
+      value: t(
+        locale,
+        remoteAccessEnabled && !remoteAccessExpired({ remoteAccessExpiresAtMs })
+          ? "cli.status.enabled"
+          : "cli.status.disabled"
+      ),
+    }));
+  }
   console.log(t(locale, webPushEnabled ? "cli.setup.webPushEnabled" : "cli.setup.webPushDisabled"));
   if (allowInsecureHttpLan) {
     console.log(t(locale, "cli.setup.warning.insecureHttpLan"));
@@ -269,8 +572,16 @@ async function runSetup(cliOptions) {
     console.log(t(locale, "cli.setup.caDownloadLocal", { url: caDownloadLocalUrl }));
     console.log(t(locale, "cli.setup.caDownloadIp", { url: caDownloadIpUrl }));
   }
+  if (accessMode === ACCESS_MODE_CLOUDFLARE) {
+    console.log(t(locale, "cli.setup.remoteAccessDisabledByDefault"));
+    console.log(t(locale, "cli.setup.remoteAccessIphoneToggle"));
+    console.log(t(locale, "cli.setup.remoteAccessAllowEmails", { value: remoteAccessAllowedEmails.join(", ") || "-" }));
+  } else if (accessMode === ACCESS_MODE_VIVEWORKER) {
+    console.log(t(locale, "cli.setup.remoteAccessDisabledByDefault"));
+    console.log(t(locale, "cli.setup.remoteAccessIphoneToggle"));
+  }
   console.log("");
-  if (webPushEnabled) {
+  if (lanTlsRequired) {
     console.log(t(locale, cliOptions.installMkcert ? "cli.setup.instructions.afterCa" : "cli.setup.instructions.https"));
   } else if (allowInsecureHttpLan) {
     console.log(t(locale, "cli.setup.instructions.insecureHttpLan"));
@@ -309,6 +620,7 @@ async function runStart(cliOptions) {
   const pidFile = resolvePath(cliOptions.pidFile || path.join(configDir, "viveworker.pid"));
   const launchAgentPath = resolvePath(cliOptions.launchAgentPath || defaultLaunchAgentPath);
   const healthUrl = buildLoopbackHealthUrl(config.NATIVE_APPROVAL_SERVER_PUBLIC_BASE_URL || "");
+  const remoteInfo = buildCliRemoteAccessInfo(config);
   if (await fileExists(launchAgentPath)) {
     progress.update("cli.start.progress.launchd");
     await execCommand(["launchctl", "bootstrap", `gui/${process.getuid()}`, launchAgentPath], { ignoreError: true });
@@ -319,6 +631,13 @@ async function runStart(cliOptions) {
     const pairingReady = healthy && rotatedPairing.rotated
       ? await waitForExpectedPairing(config.NATIVE_APPROVAL_SERVER_PUBLIC_BASE_URL || "", rotatedPairing.pairingToken)
       : true;
+    if (remoteInfo.configured) {
+      if (remoteInfo.active) {
+        await startCloudflaredLaunchAgent();
+      } else {
+        await stopCloudflaredLaunchAgent();
+      }
+    }
     progress.done(healthy && pairingReady ? "cli.start.launchdStarted" : "cli.start.launchdStartedPending");
     if (healthy && !pairingReady) {
       console.log("");
@@ -341,6 +660,13 @@ async function runStart(cliOptions) {
   const pairingReady = healthy && rotatedPairing.rotated
     ? await waitForExpectedPairing(config.NATIVE_APPROVAL_SERVER_PUBLIC_BASE_URL || "", rotatedPairing.pairingToken)
     : true;
+  if (remoteInfo.configured) {
+    if (remoteInfo.active) {
+      await startCloudflaredLaunchAgent();
+    } else {
+      await stopCloudflaredLaunchAgent();
+    }
+  }
   progress.done(healthy && pairingReady ? "cli.start.bridgeStarted" : "cli.start.bridgeStartedPending");
   if (healthy && !pairingReady) {
     console.log("");
@@ -353,8 +679,14 @@ async function runStart(cliOptions) {
 
 async function runStop(cliOptions) {
   const configDir = resolvePath(cliOptions.configDir || defaultConfigDir);
+  const envFile = resolvePath(cliOptions.envFile || path.join(configDir, "config.env"));
+  const config = await maybeReadEnvFile(envFile);
+  const remoteInfo = buildCliRemoteAccessInfo(config);
   const launchAgentPath = resolvePath(cliOptions.launchAgentPath || defaultLaunchAgentPath);
   const pidFile = resolvePath(cliOptions.pidFile || path.join(configDir, "viveworker.pid"));
+  if (remoteInfo.configured) {
+    await stopCloudflaredLaunchAgent();
+  }
   if (await fileExists(launchAgentPath)) {
     await execCommand(["launchctl", "bootout", `gui/${process.getuid()}`, launchAgentPath], { ignoreError: true });
     console.log(t(await resolveCliLocale(cliOptions), "cli.stop.launchdStopped"));
@@ -382,19 +714,87 @@ async function runStatus(cliOptions) {
   const configDir = resolvePath(cliOptions.configDir || defaultConfigDir);
   const envFile = resolvePath(cliOptions.envFile || path.join(configDir, "config.env"));
   const config = await ensureDefaultLocalePersisted(envFile, cliOptions);
+  const accessMode = resolveConfiguredAccessMode({ existing: config });
+  if (isLegacyVpnAccessMode(accessMode)) {
+    throw new Error("ACCESS_MODE=vpn is no longer supported. Re-run setup with --access-mode lan, viveworker, or cloudflare.");
+  }
   const baseUrl = config.NATIVE_APPROVAL_SERVER_PUBLIC_BASE_URL || "";
-  const healthUrl = baseUrl ? `${baseUrl}/health` : "";
+  const healthUrl = buildLoopbackHealthUrl(baseUrl);
   const launchAgentPath = resolvePath(cliOptions.launchAgentPath || defaultLaunchAgentPath);
   const pidFile = resolvePath(cliOptions.pidFile || path.join(configDir, "viveworker.pid"));
   const webPushEnabled = truthyString(config.WEB_PUSH_ENABLED);
   const httpsEnabled = isHttpsUrl(baseUrl);
+  const remoteInfo = buildCliRemoteAccessInfo(config);
+  const tlsActive = accessModeRequiresHttps(accessMode, webPushEnabled) || remoteInfo.configured;
   const locale = await resolveCliLocale(cliOptions, config);
+  const cloudflared = accessMode === ACCESS_MODE_CLOUDFLARE
+    ? await detectCloudflaredInstallation()
+    : null;
+  const cloudflaredStatus = accessMode === ACCESS_MODE_CLOUDFLARE
+    ? await cloudflaredLaunchAgentStatus()
+    : null;
+  const managedSecrets = accessMode === ACCESS_MODE_VIVEWORKER
+    ? await readManagedRemoteSecrets(config.MANAGED_REMOTE_SECRET_FILE || "")
+    : null;
 
+  console.log(t(locale, "cli.status.accessMode", { value: t(locale, `cli.accessMode.${accessMode}`) }));
   console.log(t(locale, "cli.status.envFile", { value: envFile }));
   console.log(t(locale, "cli.status.baseUrl", { value: baseUrl || "(not configured)" }));
+  if (accessModeHasRemoteOverlay(accessMode)) {
+    console.log(
+      t(locale, "cli.status.remoteConfigured", {
+        value: t(locale, remoteInfo.configured ? "cli.status.enabled" : "cli.status.disabled"),
+      })
+    );
+    console.log(t(locale, "cli.status.remoteUrl", { value: remoteInfo.publicUrl || "(not configured)" }));
+    console.log(
+      t(locale, "cli.status.remoteEnabled", {
+        value: t(
+          locale,
+          remoteInfo.active
+            ? "cli.status.enabled"
+            : remoteInfo.expired
+              ? "cli.status.expired"
+              : "cli.status.disabled"
+        ),
+      })
+    );
+    console.log(
+      t(locale, "cli.status.remoteExpiresAt", {
+        value: formatStatusTimestamp(remoteInfo.expiresAtMs),
+      })
+    );
+    if (accessMode === ACCESS_MODE_CLOUDFLARE) {
+      console.log(
+        t(locale, "cli.status.cloudflared", {
+          value: t(locale, cloudflared?.detected ? "cli.status.detected" : "cli.status.missing"),
+        })
+      );
+      console.log(
+        t(locale, "cli.status.cloudflaredLaunchd", {
+          value: t(
+            locale,
+            cloudflaredStatus?.running
+              ? "cli.status.running"
+              : cloudflaredStatus?.installed
+                ? "cli.status.installed"
+                : "cli.status.notRunning"
+          ),
+        })
+      );
+    } else if (accessMode === ACCESS_MODE_VIVEWORKER) {
+      console.log(t(locale, "cli.status.remoteControlUrl", { value: config.MANAGED_REMOTE_CONTROL_URL || "(not configured)" }));
+      console.log(t(locale, "cli.status.remoteSecretFile", { value: config.MANAGED_REMOTE_SECRET_FILE || "(missing)" }));
+      console.log(
+        t(locale, "cli.status.remoteAgent", {
+          value: t(locale, managedSecrets?.agentToken ? "cli.status.detected" : "cli.status.missing"),
+        })
+      );
+    }
+  }
   console.log(t(locale, "cli.status.webPush", { value: t(locale, webPushEnabled ? "cli.status.enabled" : "cli.status.disabled") }));
   console.log(t(locale, "cli.status.https", { value: t(locale, httpsEnabled ? "cli.status.enabled" : "cli.status.disabled") }));
-  if (webPushEnabled) {
+  if (tlsActive) {
     console.log(t(locale, "cli.status.tlsCert", { value: config.TLS_CERT_FILE || "(missing)" }));
     console.log(t(locale, "cli.status.tlsKey", { value: config.TLS_KEY_FILE || "(missing)" }));
   }
@@ -422,6 +822,7 @@ async function runStatus(cliOptions) {
   if (healthUrl) {
     const health = await execCommand(buildHealthCheckArgs(healthUrl), { ignoreError: true });
     console.log(t(locale, "cli.status.health", { value: t(locale, health.ok ? "cli.status.ok" : "cli.status.failed") }));
+    console.log(t(locale, "cli.status.localProbeUrl", { value: healthUrl }));
     if (health.stdout) {
       console.log(health.stdout.trim());
     }
@@ -432,9 +833,13 @@ async function runDoctor(cliOptions) {
   const configDir = resolvePath(cliOptions.configDir || defaultConfigDir);
   const envFile = resolvePath(cliOptions.envFile || path.join(configDir, "config.env"));
   const config = await ensureDefaultLocalePersisted(envFile, cliOptions);
+  const accessMode = resolveConfiguredAccessMode({ existing: config });
+  if (isLegacyVpnAccessMode(accessMode)) {
+    throw new Error("ACCESS_MODE=vpn is no longer supported. Re-run setup with --access-mode lan, viveworker, or cloudflare.");
+  }
   const issues = [];
   const baseUrl = config.NATIVE_APPROVAL_SERVER_PUBLIC_BASE_URL || "";
-  const healthUrl = baseUrl ? `${baseUrl}/health` : "";
+  const healthUrl = buildLoopbackHealthUrl(baseUrl);
   const webPushEnabled = truthyString(config.WEB_PUSH_ENABLED);
   const allowInsecureHttpLan = truthyString(config.ALLOW_INSECURE_LAN_HTTP);
   const hostname = config.VIVEWORKER_HOSTNAME || os.hostname();
@@ -442,6 +847,14 @@ async function runDoctor(cliOptions) {
   const ips = await findLocalIpv4Addresses();
   const chosenIp = ips[0] || "127.0.0.1";
   const locale = await resolveCliLocale(cliOptions, config);
+  const remoteInfo = buildCliRemoteAccessInfo(config);
+  const tlsActive = accessModeRequiresHttps(accessMode, webPushEnabled) || remoteInfo.configured;
+  const cloudflared = accessMode === ACCESS_MODE_CLOUDFLARE
+    ? await detectCloudflaredInstallation()
+    : null;
+  const managedSecrets = accessMode === ACCESS_MODE_VIVEWORKER
+    ? await readManagedRemoteSecrets(config.MANAGED_REMOTE_SECRET_FILE || "")
+    : null;
 
   if (!(await fileExists(envFile))) {
     issues.push(t(locale, "cli.doctor.issue.envMissing"));
@@ -455,11 +868,53 @@ async function runDoctor(cliOptions) {
   if (!baseUrl) {
     issues.push(t(locale, "cli.doctor.issue.baseUrlMissing"));
   }
-  if (baseUrl && !isHttpsUrl(baseUrl) && !isLoopbackBaseUrl(baseUrl) && !allowInsecureHttpLan) {
+  if (accessMode === ACCESS_MODE_CLOUDFLARE) {
+    if (!remoteInfo.publicHostname) {
+      issues.push(t(locale, "cli.doctor.issue.remoteHostnameMissing"));
+    }
+    if (!config.CLOUDFLARE_ACCOUNT_ID) {
+      issues.push(t(locale, "cli.doctor.issue.cloudflareAccountIdMissing"));
+    }
+    if (!(normalizeRemoteAccessAllowedEmails(config.REMOTE_ACCESS_ALLOWED_EMAILS).length > 0)) {
+      issues.push(t(locale, "cli.doctor.issue.remoteAllowedEmailsMissing"));
+    }
+    if (!isHttpsUrl(baseUrl)) {
+      issues.push(t(locale, "cli.doctor.issue.remoteRequiresHttps"));
+    }
+    if (!config.CLOUDFLARE_TUNNEL_CREDENTIALS_FILE || !(await fileExists(resolvePath(config.CLOUDFLARE_TUNNEL_CREDENTIALS_FILE)))) {
+      issues.push(t(locale, "cli.doctor.issue.cloudflareCredentialsMissing"));
+    }
+    if (!config.CLOUDFLARE_TUNNEL_CONFIG_FILE || !(await fileExists(resolvePath(config.CLOUDFLARE_TUNNEL_CONFIG_FILE)))) {
+      issues.push(t(locale, "cli.doctor.issue.cloudflareConfigMissing"));
+    }
+    if (!cloudflared?.detected) {
+      issues.push(t(locale, "cli.doctor.issue.cloudflaredMissing"));
+    }
+  } else if (accessMode === ACCESS_MODE_VIVEWORKER) {
+    if (!config.MANAGED_REMOTE_INSTALLATION_ID) {
+      issues.push(t(locale, "cli.doctor.issue.managedRemoteInstallationMissing"));
+    }
+    if (!config.MANAGED_REMOTE_PUBLIC_URL) {
+      issues.push(t(locale, "cli.doctor.issue.managedRemotePublicUrlMissing"));
+    }
+    if (!config.MANAGED_REMOTE_CONTROL_URL) {
+      issues.push(t(locale, "cli.doctor.issue.managedRemoteControlUrlMissing"));
+    }
+    if (!config.MANAGED_REMOTE_SECRET_FILE || !(await fileExists(resolvePath(config.MANAGED_REMOTE_SECRET_FILE)))) {
+      issues.push(t(locale, "cli.doctor.issue.managedRemoteSecretFileMissing"));
+    }
+    if (!managedSecrets?.agentToken) {
+      issues.push(t(locale, "cli.doctor.issue.managedRemoteAgentMissing"));
+    }
+    if (!isHttpsUrl(baseUrl)) {
+      issues.push(t(locale, "cli.doctor.issue.remoteRequiresHttps"));
+    }
+  }
+  if (baseUrl && accessMode === ACCESS_MODE_LAN && !isHttpsUrl(baseUrl) && !isLoopbackBaseUrl(baseUrl) && !allowInsecureHttpLan) {
     issues.push(t(locale, "cli.doctor.issue.lanHttpRequiresOverride"));
   }
-  if (webPushEnabled) {
-    if (!isHttpsUrl(baseUrl)) {
+  if (tlsActive) {
+    if (webPushEnabled && !isHttpsUrl(baseUrl)) {
       issues.push(t(locale, "cli.doctor.issue.webPushHttps"));
     }
     if (!config.TLS_CERT_FILE || !(await fileExists(resolvePath(config.TLS_CERT_FILE)))) {
@@ -468,6 +923,8 @@ async function runDoctor(cliOptions) {
     if (!config.TLS_KEY_FILE || !(await fileExists(resolvePath(config.TLS_KEY_FILE)))) {
       issues.push(t(locale, "cli.doctor.issue.tlsKeyMissing"));
     }
+  }
+  if (webPushEnabled) {
     if (!config.WEB_PUSH_VAPID_PUBLIC_KEY) {
       issues.push(t(locale, "cli.doctor.issue.vapidPublicMissing"));
     }
@@ -490,12 +947,27 @@ async function runDoctor(cliOptions) {
   if (healthUrl) {
     const health = await execCommand(buildHealthCheckArgs(healthUrl), { ignoreError: true });
     if (!health.ok) {
-      issues.push(t(locale, webPushEnabled ? "cli.doctor.issue.healthHttps" : "cli.doctor.issue.health"));
+      issues.push(t(locale, tlsActive ? "cli.doctor.issue.healthHttps" : "cli.doctor.issue.health"));
     }
+  }
+  if (accessMode === ACCESS_MODE_CLOUDFLARE && cleanRemoteText(process.env.CLOUDFLARE_API_TOKEN || "")) {
+    const remoteIssues = await verifyCloudflareRemoteAccess({
+      apiToken: process.env.CLOUDFLARE_API_TOKEN || "",
+      accountId: config.CLOUDFLARE_ACCOUNT_ID || "",
+      zoneId: config.CLOUDFLARE_ZONE_ID || "",
+      tunnelId: config.CLOUDFLARE_TUNNEL_ID || "",
+      publicHostname: config.REMOTE_ACCESS_PUBLIC_HOSTNAME || "",
+      accessAppId: config.CLOUDFLARE_ACCESS_APP_ID || "",
+      accessPolicyId: config.CLOUDFLARE_ACCESS_POLICY_ID || "",
+    });
+    issues.push(...remoteIssues);
   }
 
   if (issues.length === 0) {
     console.log(t(locale, "cli.doctor.ok"));
+    if (accessMode === ACCESS_MODE_CLOUDFLARE) {
+      console.log(t(locale, "cli.doctor.remoteLocalOnlyNote"));
+    }
     return;
   }
 
@@ -503,11 +975,61 @@ async function runDoctor(cliOptions) {
   for (const issue of issues) {
     console.log(`- ${issue}`);
   }
+  if (accessMode === ACCESS_MODE_CLOUDFLARE) {
+    if (!cleanRemoteText(process.env.CLOUDFLARE_API_TOKEN || "")) {
+      console.log(`- ${t(locale, "cli.doctor.remoteLocalOnlyNote")}`);
+    }
+  }
+}
+
+async function runRemote(cliOptions) {
+  if (cliOptions.subcommand !== "rotate") {
+    throw new Error("Supported remote command: viveworker remote rotate");
+  }
+  const configDir = resolvePath(cliOptions.configDir || defaultConfigDir);
+  const envFile = resolvePath(cliOptions.envFile || path.join(configDir, "config.env"));
+  const config = await ensureDefaultLocalePersisted(envFile, cliOptions);
+  const accessMode = resolveConfiguredAccessMode({ existing: config });
+  if (accessMode !== ACCESS_MODE_VIVEWORKER) {
+    throw new Error("viveworker remote rotate is only available with ACCESS_MODE=viveworker.");
+  }
+  const secretFile = resolvePath(config.MANAGED_REMOTE_SECRET_FILE || "");
+  const secrets = await readManagedRemoteSecrets(secretFile);
+  if (!secrets?.agentToken || !config.MANAGED_REMOTE_INSTALLATION_ID) {
+    throw new Error("Managed remote secret file or installation ID is missing.");
+  }
+  const rotated = await rotateManagedRemoteSubdomain({
+    controlUrl: config.MANAGED_REMOTE_CONTROL_URL || DEFAULT_MANAGED_REMOTE_CONTROL_URL,
+    installationId: config.MANAGED_REMOTE_INSTALLATION_ID,
+    agentToken: secrets.agentToken,
+  });
+  const paths = await writeManagedRemoteArtifacts({
+    configDir,
+    installationId: rotated.installationId,
+    subdomain: rotated.subdomain,
+    publicUrl: rotated.publicUrl,
+    controlUrl: config.MANAGED_REMOTE_CONTROL_URL || DEFAULT_MANAGED_REMOTE_CONTROL_URL,
+    email: config.MANAGED_REMOTE_EMAIL || "",
+    agentToken: rotated.agentToken,
+  });
+  const currentText = await maybeReadText(envFile);
+  const nextText = upsertEnvText(currentText, {
+    MANAGED_REMOTE_INSTALLATION_ID: rotated.installationId,
+    MANAGED_REMOTE_SUBDOMAIN: rotated.subdomain,
+    MANAGED_REMOTE_PUBLIC_URL: rotated.publicUrl,
+    MANAGED_REMOTE_SECRET_FILE: paths.secretFile,
+    REMOTE_ACCESS_ENABLED: "0",
+    REMOTE_ACCESS_EXPIRES_AT_MS: "0",
+  });
+  await fs.writeFile(envFile, nextText, "utf8");
+  console.log(`Managed remote URL rotated: ${rotated.publicUrl}`);
 }
 
 function parseArgs(argv) {
   const parsed = {
     command: "help",
+    subcommand: "",
+    accessMode: ACCESS_MODE_LAN,
     enableNtfy: false,
     enableWebPush: false,
     disableWebPush: false,
@@ -533,11 +1055,18 @@ function parseArgs(argv) {
     vapidPrivateKey: "",
     locale: "",
     mkcertTrustStores: "",
+    publicHostname: "",
+    cloudflareAccountId: "",
+    accessAllowEmails: "",
   };
 
   if (argv[0] && !argv[0].startsWith("-")) {
     parsed.command = argv[0];
     argv = argv.slice(1);
+    if (parsed.command === "remote" && argv[0] && !argv[0].startsWith("-")) {
+      parsed.subcommand = argv[0];
+      argv = argv.slice(1);
+    }
   }
 
   for (let index = 0; index < argv.length; index += 1) {
@@ -556,10 +1085,25 @@ function parseArgs(argv) {
     } else if (arg === "--mkcert-trust-stores") {
       parsed.mkcertTrustStores = next;
       index += 1;
+    } else if (arg === "--public-hostname") {
+      parsed.publicHostname = next;
+      index += 1;
+    } else if (arg === "--cloudflare-account-id") {
+      parsed.cloudflareAccountId = next;
+      index += 1;
+    } else if (arg === "--access-allow-emails") {
+      parsed.accessAllowEmails = next;
+      index += 1;
     } else if (arg === "--no-launchd") {
       parsed.noLaunchd = true;
     } else if (arg === "--port") {
       parsed.port = Number(next) || null;
+      index += 1;
+    } else if (arg === "--access-mode") {
+      parsed.accessMode = normalizeAccessMode(next, "");
+      if (!parsed.accessMode) {
+        throw new Error(`Unknown access mode: ${next}`);
+      }
       index += 1;
     } else if (arg === "--hostname") {
       parsed.hostname = next;
@@ -631,6 +1175,7 @@ function printHelp() {
 
 ${t(locale, "cli.help.commands")}
   ${t(locale, "cli.help.setup")}
+  ${t(locale, "cli.help.remote")}
   ${t(locale, "cli.help.start")}
   ${t(locale, "cli.help.stop")}
   ${t(locale, "cli.help.status")}
@@ -638,6 +1183,7 @@ ${t(locale, "cli.help.commands")}
 
 ${t(locale, "cli.help.commonOptions")}
   --port <n>
+  --access-mode <lan|viveworker|cloudflare>
   --hostname <name>
   --env-file <path>
   --config-dir <path>
@@ -646,6 +1192,9 @@ ${t(locale, "cli.help.commonOptions")}
   --allow-insecure-http-lan
   --install-mkcert
   --mkcert-trust-stores <system[,java][,nss]>
+  --public-hostname <fqdn>
+  --cloudflare-account-id <id>
+  --access-allow-emails <a@example.com,b@example.com>
   --tls-cert-file <path>
   --tls-key-file <path>
   --web-push-subject <mailto:...>
@@ -783,6 +1332,14 @@ async function maybeReadEnvFile(filePath) {
   return output;
 }
 
+async function maybeReadText(filePath) {
+  try {
+    return await fs.readFile(filePath, "utf8");
+  } catch {
+    return "";
+  }
+}
+
 async function ensureDefaultLocalePersisted(envFile, cliOptions = {}, existingConfig = null) {
   const config = existingConfig || (await maybeReadEnvFile(envFile));
   if (normalizeLocale(config.DEFAULT_LOCALE)) {
@@ -896,6 +1453,53 @@ function resolveSetupWebPushEnabled(cliOptions = {}) {
     return false;
   }
   return true;
+}
+
+function cleanSetupValue(value) {
+  return String(value ?? "").trim();
+}
+
+function validateSetupAccessModeOptions({
+  cliOptions,
+  accessMode,
+  remoteAccessPublicHostname,
+  cloudflareAccountId,
+  remoteAccessAllowedEmails,
+}) {
+  if (accessMode === ACCESS_MODE_CLOUDFLARE) {
+    if (!cleanSetupValue(remoteAccessPublicHostname)) {
+      throw new Error("--public-hostname is required with --access-mode cloudflare.");
+    }
+    if (!cleanSetupValue(cloudflareAccountId)) {
+      throw new Error("--cloudflare-account-id is required with --access-mode cloudflare.");
+    }
+    if (!(Array.isArray(remoteAccessAllowedEmails) && remoteAccessAllowedEmails.length > 0)) {
+      throw new Error("--access-allow-emails is required with --access-mode cloudflare.");
+    }
+    if (cliOptions.allowInsecureHttpLan) {
+      throw new Error("--allow-insecure-http-lan is not available with --access-mode cloudflare.");
+    }
+    return;
+  }
+  if (accessMode === ACCESS_MODE_VIVEWORKER && cliOptions.allowInsecureHttpLan) {
+    throw new Error("--allow-insecure-http-lan is not available with --access-mode viveworker.");
+  }
+}
+
+function buildSetupPublicBaseUrl({ tlsRequired, allowInsecureHttpLan, localHostname, port }) {
+  const scheme = tlsRequired ? "https" : "http";
+  if (tlsRequired || allowInsecureHttpLan) {
+    return `${scheme}://${localHostname}:${port}`;
+  }
+  return `http://127.0.0.1:${port}`;
+}
+
+function buildSetupFallbackBaseUrl({ publicBaseUrl, chosenIp, tlsRequired, allowInsecureHttpLan, port }) {
+  if (tlsRequired || allowInsecureHttpLan) {
+    const scheme = tlsRequired ? "https" : "http";
+    return `${scheme}://${chosenIp}:${port}`;
+  }
+  return publicBaseUrl;
 }
 
 function logSetupProgress(locale, key, vars = {}) {
@@ -1185,6 +1789,144 @@ function truthyString(value) {
   return /^(1|true|yes|on)$/iu.test(String(value || "").trim());
 }
 
+function resolveConfiguredAccessMode({ cliOptions = {}, existing = {} }) {
+  const explicit = normalizeAccessMode(cliOptions.accessMode, "");
+  if (explicit === LEGACY_ACCESS_MODE_VPN) {
+    return LEGACY_ACCESS_MODE_VPN;
+  }
+  if (explicit) {
+    return explicit;
+  }
+  const existingMode = normalizeAccessMode(existing.ACCESS_MODE, "");
+  if (existingMode === LEGACY_ACCESS_MODE_VPN) {
+    return LEGACY_ACCESS_MODE_VPN;
+  }
+  if (existingMode) {
+    return existingMode;
+  }
+  const legacyRemoteProvider = cleanRemoteText(existing.REMOTE_ACCESS_PROVIDER || "").toLowerCase();
+  if (legacyRemoteProvider === ACCESS_MODE_CLOUDFLARE) {
+    return ACCESS_MODE_CLOUDFLARE;
+  }
+  return ACCESS_MODE_LAN;
+}
+
+function configuredRemotePublicUrl({
+  accessMode,
+  remoteAccessPublicHostname = "",
+  managedRemotePublicUrl = "",
+  managedRemoteSubdomain = "",
+}) {
+  if (accessMode === ACCESS_MODE_CLOUDFLARE) {
+    return buildRemotePublicUrl(remoteAccessPublicHostname);
+  }
+  if (accessMode === ACCESS_MODE_VIVEWORKER) {
+    return buildManagedRemotePublicUrl({
+      publicUrl: managedRemotePublicUrl,
+      subdomain: managedRemoteSubdomain,
+    });
+  }
+  return "";
+}
+
+function configuredRemotePublicHostname({ accessMode, remoteAccessPublicHostname = "", managedRemotePublicUrl = "" }) {
+  if (accessMode === ACCESS_MODE_CLOUDFLARE) {
+    return cleanRemoteText(remoteAccessPublicHostname).toLowerCase();
+  }
+  if (accessMode === ACCESS_MODE_VIVEWORKER && managedRemotePublicUrl) {
+    try {
+      return new URL(managedRemotePublicUrl).hostname.toLowerCase();
+    } catch {
+      return "";
+    }
+  }
+  return "";
+}
+
+function buildCloudflareUpstreamUrl(baseUrl) {
+  if (!baseUrl) {
+    return "";
+  }
+  try {
+    const url = new URL(baseUrl);
+    url.hostname = "127.0.0.1";
+    url.pathname = "";
+    url.search = "";
+    url.hash = "";
+    return url.toString();
+  } catch {
+    return "";
+  }
+}
+
+function buildCliRemoteAccessInfo(config = {}) {
+  const accessMode = resolveConfiguredAccessMode({ existing: config });
+  const publicHostname = configuredRemotePublicHostname({
+    accessMode,
+    remoteAccessPublicHostname: config.REMOTE_ACCESS_PUBLIC_HOSTNAME || "",
+    managedRemotePublicUrl: config.MANAGED_REMOTE_PUBLIC_URL || "",
+  });
+  const publicUrl = configuredRemotePublicUrl({
+    accessMode,
+    remoteAccessPublicHostname: config.REMOTE_ACCESS_PUBLIC_HOSTNAME || "",
+    managedRemotePublicUrl: config.MANAGED_REMOTE_PUBLIC_URL || "",
+    managedRemoteSubdomain: config.MANAGED_REMOTE_SUBDOMAIN || "",
+  });
+  const view = {
+    accessMode,
+    publicHostname,
+    publicUrl,
+    enabled: truthyString(config.REMOTE_ACCESS_ENABLED),
+    expiresAtMs: Number(config.REMOTE_ACCESS_EXPIRES_AT_MS) || 0,
+  };
+  const base = {
+    accessMode,
+    remoteAccessPublicHostname: publicHostname,
+    remoteAccessEnabled: view.enabled,
+    remoteAccessExpiresAtMs: view.expiresAtMs,
+    cloudflareAccountId: config.CLOUDFLARE_ACCOUNT_ID || "",
+    cloudflareZoneId: config.CLOUDFLARE_ZONE_ID || "",
+    cloudflareTunnelId: config.CLOUDFLARE_TUNNEL_ID || "",
+    cloudflareAccessAppId: config.CLOUDFLARE_ACCESS_APP_ID || "",
+    cloudflareAccessPolicyId: config.CLOUDFLARE_ACCESS_POLICY_ID || "",
+    cloudflareTunnelCredentialsFile: config.CLOUDFLARE_TUNNEL_CREDENTIALS_FILE || "",
+    cloudflareTunnelConfigFile: config.CLOUDFLARE_TUNNEL_CONFIG_FILE || "",
+    managedRemoteInstallationId: config.MANAGED_REMOTE_INSTALLATION_ID || "",
+    managedRemotePublicUrl: config.MANAGED_REMOTE_PUBLIC_URL || "",
+    managedRemoteControlUrl: config.MANAGED_REMOTE_CONTROL_URL || "",
+    managedRemoteSecretFile: config.MANAGED_REMOTE_SECRET_FILE || "",
+    managedRemoteSubdomain: config.MANAGED_REMOTE_SUBDOMAIN || "",
+  };
+  return {
+    ...view,
+    configured:
+      accessMode === ACCESS_MODE_CLOUDFLARE
+        ? remoteAccessConfigured(base)
+        : accessMode === ACCESS_MODE_VIVEWORKER
+          ? managedRemoteConfigured(base)
+          : false,
+    active:
+      accessModeHasRemoteOverlay(accessMode) &&
+      view.enabled &&
+      !remoteAccessExpired({ remoteAccessExpiresAtMs: view.expiresAtMs }),
+    expired: remoteAccessExpired({
+      remoteAccessExpiresAtMs: view.expiresAtMs,
+    }),
+  };
+}
+
+function formatStatusTimestamp(value) {
+  const timestamp = Number(value) || 0;
+  if (!timestamp) {
+    return "(not set)";
+  }
+  try {
+    return new Date(timestamp).toLocaleString();
+  } catch {
+    return String(timestamp);
+  }
+}
+
 function isHttpsUrl(value) {
   return String(value || "").trim().toLowerCase().startsWith("https://");
 }
@@ -1209,12 +1951,11 @@ function collectTlsHosts({ hostname, localHostname, chosenIp }) {
   );
 }
 
-async function ensureWebPushAssets({
+async function ensureLanTlsAssets({
   cliOptions,
-  existing,
+  locale,
   hostname,
   localHostname,
-  locale,
   progress,
   chosenIp,
   tlsCertFile,
@@ -1282,7 +2023,13 @@ async function ensureWebPushAssets({
       });
     }
   }
+  return {
+    certFile: tlsCertFile,
+    keyFile: tlsKeyFile,
+  };
+}
 
+async function ensureVapidKeys({ cliOptions, existing, progress }) {
   const vapidPublicKey =
     cliOptions.vapidPublicKey ||
     existing.WEB_PUSH_VAPID_PUBLIC_KEY ||
@@ -1293,21 +2040,13 @@ async function ensureWebPushAssets({
     "";
   if (vapidPublicKey && vapidPrivateKey) {
     return {
-      certFile: tlsCertFile,
-      keyFile: tlsKeyFile,
-      vapidPublicKey,
-      vapidPrivateKey,
+      publicKey: vapidPublicKey,
+      privateKey: vapidPrivateKey,
     };
   }
 
   progress?.update("cli.setup.progress.generateVapid");
-  const generated = await generateVapidKeys();
-  return {
-    certFile: tlsCertFile,
-    keyFile: tlsKeyFile,
-    vapidPublicKey: generated.publicKey,
-    vapidPrivateKey: generated.privateKey,
-  };
+  return await generateVapidKeys();
 }
 
 async function generateVapidKeys() {
@@ -1409,11 +2148,11 @@ async function printPairingInfo(locale, config) {
   }
 
   const pairPath = `/app?pairToken=${encodeURIComponent(pairToken)}`;
-  const ips = await findLocalIpv4Addresses();
-  const fallbackBaseUrl = buildFallbackBaseUrl(baseUrl, ips[0] || "127.0.0.1");
 
   console.log("");
   console.log(t(locale, "cli.setup.pairingCode", { code: pairCode }));
+  const ips = await findLocalIpv4Addresses();
+  const fallbackBaseUrl = buildFallbackBaseUrl(baseUrl, ips[0] || "127.0.0.1");
   console.log(t(locale, "cli.setup.pairingUrlLocal", { url: `${baseUrl}${pairPath}` }));
   console.log(t(locale, "cli.setup.pairingUrlIp", { url: `${fallbackBaseUrl}${pairPath}` }));
 }
