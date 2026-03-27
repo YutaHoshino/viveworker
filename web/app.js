@@ -1870,7 +1870,9 @@ function renderTimelineEntry(entry, { desktop }) {
         ${
           isFileEvent && fileEventFileSummary
             ? `<p class="timeline-entry__file-summary" title="${escapeHtml(
-                normalizeClientFileRefs(item.fileRefs).join("\n")
+                normalizeClientFileChangeEntries(item)
+                  .map((entry) => fileChangeEntryTitle(entry))
+                  .join("\n")
               )}">${escapeHtml(fileEventFileSummary)}</p>`
             : ""
         }
@@ -2096,6 +2098,10 @@ function fileEventDisplayLabel(fileEventType) {
       return L("fileEvent.write");
     case "create":
       return L("fileEvent.create");
+    case "delete":
+      return L("fileEvent.delete");
+    case "rename":
+      return L("fileEvent.rename");
     default:
       return "";
   }
@@ -2114,6 +2120,10 @@ function fileEventTimelineCountLabel(item) {
       return L("fileEvent.timeline.write", { count });
     case "create":
       return L("fileEvent.timeline.create", { count });
+    case "delete":
+      return L("fileEvent.timeline.delete", { count });
+    case "rename":
+      return L("fileEvent.timeline.rename", { count });
     default:
       return L("common.fileEvent");
   }
@@ -2150,8 +2160,8 @@ function diffThreadCardSummary(item) {
 }
 
 function diffThreadFilesSummary(item) {
-  const labels = normalizeClientFileRefs(item?.fileRefs)
-    .map((fileRef) => fileRefLabel(fileRef))
+  const labels = normalizeClientFileChangeEntries(item)
+    .map((entry) => fileChangeEntryLabel(entry))
     .filter(Boolean);
   if (labels.length === 0) {
     return "";
@@ -2177,17 +2187,17 @@ function diffThreadLatestChangeSummary(item) {
 }
 
 function renderDiffEntryFileChips(item) {
-  const fileRefs = normalizeClientFileRefs(item?.fileRefs);
-  if (fileRefs.length === 0) {
+  const fileEntries = normalizeClientFileChangeEntries(item);
+  if (fileEntries.length === 0) {
     return "";
   }
-  const visibleRefs = fileRefs.slice(0, 4);
-  const hiddenCount = fileRefs.length - visibleRefs.length;
-  const chips = visibleRefs.map(
-    (fileRef) => `
-      <span class="file-ref-chip" title="${escapeHtml(fileRef)}">
+  const visibleEntries = fileEntries.slice(0, 4);
+  const hiddenCount = fileEntries.length - visibleEntries.length;
+  const chips = visibleEntries.map(
+    (entry) => `
+      <span class="file-ref-chip" title="${escapeHtml(fileChangeEntryTitle(entry))}">
         <span class="file-ref-chip__icon" aria-hidden="true">${renderIcon("item")}</span>
-        <span class="file-ref-chip__label">${escapeHtml(fileRefLabel(fileRef))}</span>
+        <span class="file-ref-chip__label">${escapeHtml(fileChangeEntryLabel(entry))}</span>
       </span>
     `
   );
@@ -2234,6 +2244,60 @@ function formatDiffCardTimestamp(value) {
   }
 }
 
+function normalizeClientFileChangeEntries(item) {
+  const files = Array.isArray(item?.files) ? item.files.filter(Boolean) : [];
+  if (files.length > 0) {
+    return files
+      .map((file) => ({
+        fileRef: normalizeClientText(file?.fileRef || file?.newFileRef || ""),
+        oldFileRef: normalizeClientText(file?.oldFileRef || ""),
+        newFileRef: normalizeClientText(file?.newFileRef || file?.fileRef || ""),
+        changeType: normalizeClientText(file?.changeType || file?.fileEventType || ""),
+      }))
+      .filter((entry) => entry.fileRef || entry.oldFileRef || entry.newFileRef);
+  }
+
+  const fileEventType = normalizeClientText(item?.changeType || item?.fileEventType || "");
+  const fileRefs = normalizeClientFileRefs(item?.fileRefs);
+  const previousFileRefs = normalizeClientFileRefs(item?.previousFileRefs);
+  if (fileEventType === "rename") {
+    const pairCount = Math.max(fileRefs.length, previousFileRefs.length);
+    return Array.from({ length: pairCount }, (_, index) => ({
+      fileRef: normalizeClientText(fileRefs[index] || previousFileRefs[index] || ""),
+      oldFileRef: normalizeClientText(previousFileRefs[index] || ""),
+      newFileRef: normalizeClientText(fileRefs[index] || ""),
+      changeType: fileEventType,
+    })).filter((entry) => entry.fileRef || entry.oldFileRef || entry.newFileRef);
+  }
+
+  return fileRefs.map((fileRef) => ({
+    fileRef,
+    oldFileRef: "",
+    newFileRef: fileEventType === "delete" ? "" : fileRef,
+    changeType: fileEventType,
+  }));
+}
+
+function fileChangeEntryLabel(entry) {
+  const changeType = normalizeClientText(entry?.changeType || "");
+  const oldFileRef = normalizeClientText(entry?.oldFileRef || "");
+  const newFileRef = normalizeClientText(entry?.newFileRef || entry?.fileRef || "");
+  if (changeType === "rename" && oldFileRef && newFileRef) {
+    return `${fileRefLabel(oldFileRef)} → ${fileRefLabel(newFileRef)}`;
+  }
+  return fileRefLabel(changeType === "delete" ? oldFileRef || newFileRef : newFileRef || oldFileRef);
+}
+
+function fileChangeEntryTitle(entry) {
+  const changeType = normalizeClientText(entry?.changeType || "");
+  const oldFileRef = normalizeClientText(entry?.oldFileRef || "");
+  const newFileRef = normalizeClientText(entry?.newFileRef || entry?.fileRef || "");
+  if (changeType === "rename" && oldFileRef && newFileRef) {
+    return `${oldFileRef} → ${newFileRef}`;
+  }
+  return changeType === "delete" ? oldFileRef || newFileRef : newFileRef || oldFileRef;
+}
+
 function diffThreadFileExpansionKey(token, fileRef) {
   return `${normalizeClientText(token || "")}:${normalizeClientText(fileRef || "")}`;
 }
@@ -2275,8 +2339,8 @@ function toggleDetailDiffExpanded(detail) {
 }
 
 function timelineFileEventFileSummary(item) {
-  const labels = normalizeClientFileRefs(item?.fileRefs)
-    .map((fileRef) => fileRefLabel(fileRef))
+  const labels = normalizeClientFileChangeEntries(item)
+    .map((entry) => fileChangeEntryLabel(entry))
     .filter(Boolean);
   if (labels.length === 0) {
     return "";
@@ -3185,8 +3249,11 @@ function renderDetailImageGallery(detail, options = {}) {
 }
 
 function renderDetailFileRefs(detail, options = {}) {
-  const fileRefs = normalizeClientFileRefs(detail?.fileRefs);
-  if (fileRefs.length === 0) {
+  if (detail?.kind === "diff_thread") {
+    return "";
+  }
+  const fileEntries = normalizeClientFileChangeEntries(detail);
+  if (fileEntries.length === 0) {
     return "";
   }
 
@@ -3197,12 +3264,12 @@ function renderDetailFileRefs(detail, options = {}) {
         <span>${escapeHtml(L("detail.filesTitle"))}</span>
       </div>
       <div class="detail-file-grid">
-        ${fileRefs
+        ${fileEntries
           .map(
-            (fileRef) => `
-              <div class="detail-file-chip" title="${escapeHtml(fileRef)}">
-                <span class="detail-file-chip__label">${escapeHtml(fileRefLabel(fileRef))}</span>
-                <span class="detail-file-chip__path">${escapeHtml(fileRef)}</span>
+            (entry) => `
+              <div class="detail-file-chip" title="${escapeHtml(fileChangeEntryTitle(entry))}">
+                <span class="detail-file-chip__label">${escapeHtml(fileChangeEntryLabel(entry))}</span>
+                <span class="detail-file-chip__path">${escapeHtml(fileChangeEntryTitle(entry))}</span>
               </div>
             `
           )
@@ -3219,7 +3286,7 @@ function renderDetailDiffPanel(detail, options = {}) {
   }
 
   const fileEventType = normalizeClientText(detail?.fileEventType || "");
-  if (detailKind === "file_event" && !["write", "create"].includes(fileEventType)) {
+  if (detailKind === "file_event" && !["write", "create", "delete", "rename"].includes(fileEventType)) {
     return "";
   }
   if (
@@ -3279,7 +3346,15 @@ function renderDetailDiffThreadGroups(detail, options = {}) {
 
 function renderDetailDiffThreadFileGroup(detail, fileGroup, options = {}) {
   const fileRef = normalizeClientText(fileGroup?.fileRef || "");
-  const fileLabel = normalizeClientText(fileGroup?.fileLabel || "") || fileRefLabel(fileRef) || L("common.unavailable");
+  const changeType = normalizeClientText(fileGroup?.changeType || "");
+  const fileEntry = {
+    fileRef,
+    oldFileRef: normalizeClientText(fileGroup?.oldFileRef || ""),
+    newFileRef: normalizeClientText(fileGroup?.newFileRef || fileRef || ""),
+    changeType,
+  };
+  const fileLabel = fileChangeEntryLabel(fileEntry) || normalizeClientText(fileGroup?.fileLabel || "") || fileRefLabel(fileRef) || L("common.unavailable");
+  const filePathLabel = fileChangeEntryTitle(fileEntry) || fileRef;
   const statsHtml = renderDiffEntryStatsHtml(fileGroup);
   const sections = Array.isArray(fileGroup?.sections) ? fileGroup.sections.filter(Boolean) : [];
   const expanded = isDiffThreadFileExpanded(detail?.token, fileRef);
@@ -3297,7 +3372,7 @@ function renderDetailDiffThreadFileGroup(detail, fileGroup, options = {}) {
           <span class="detail-diff-thread__icon" aria-hidden="true">${renderIcon("item")}</span>
           <div class="detail-diff-thread__title-text">
             <span class="detail-diff-thread__label">${escapeHtml(fileLabel)}</span>
-            ${fileRef ? `<span class="detail-diff-thread__path">${escapeHtml(fileRef)}</span>` : ""}
+            ${filePathLabel ? `<span class="detail-diff-thread__path">${escapeHtml(filePathLabel)}</span>` : ""}
           </div>
         </div>
         <div class="detail-diff-thread__header-right">
