@@ -39,6 +39,7 @@ const state = {
   pendingListScrollRestore: false,
   threadFilterInteractionUntilMs: 0,
   diffThreadExpandedFiles: {},
+  detailDiffExpanded: {},
   choiceLocalDrafts: {},
   completionReplyDrafts: {},
   pairError: "",
@@ -2253,6 +2254,26 @@ function toggleDiffThreadFileExpanded(token, fileRef) {
   };
 }
 
+function detailDiffExpansionKey(detail) {
+  return `${normalizeClientText(detail?.kind || "")}:${normalizeClientText(detail?.token || "")}`;
+}
+
+function isDetailDiffExpanded(detail) {
+  const key = detailDiffExpansionKey(detail);
+  return Boolean(key && state.detailDiffExpanded?.[key] === true);
+}
+
+function toggleDetailDiffExpanded(detail) {
+  const key = detailDiffExpansionKey(detail);
+  if (!key || key === ":") {
+    return;
+  }
+  state.detailDiffExpanded = {
+    ...(state.detailDiffExpanded || {}),
+    [key]: !isDetailDiffExpanded(detail),
+  };
+}
+
 function timelineFileEventFileSummary(item) {
   const labels = normalizeClientFileRefs(item?.fileRefs)
     .map((fileRef) => fileRefLabel(fileRef))
@@ -2989,7 +3010,7 @@ function renderStandardDetailDesktop(detail) {
     <div class="detail-shell">
       ${renderDetailMetaRow(detail, kindInfo)}
       <h2 class="detail-title detail-title--desktop">${escapeHtml(detailDisplayTitle(detail))}</h2>
-      ${detail.readOnly ? "" : renderDetailLead(detail, kindInfo)}
+      ${detail.readOnly || detail.kind === "approval" ? "" : renderDetailLead(detail, kindInfo)}
       ${renderPreviousContextCard(detail)}
       ${renderInterruptedDetailNotice(detail)}
       ${
@@ -3027,7 +3048,7 @@ function renderStandardDetailMobile(detail) {
               ? plainIntro
               : `
                 <section class="detail-card detail-card--body detail-card--mobile ${spaciousBodyDetail ? "detail-card--message-body" : ""}">
-                  ${detail.readOnly ? "" : renderDetailLead(detail, kindInfo, { mobile: true })}
+                  ${detail.readOnly || detail.kind === "approval" ? "" : renderDetailLead(detail, kindInfo, { mobile: true })}
                   <div class="detail-body ${spaciousBodyDetail ? "detail-body--message " : ""}markdown">${detail.messageHtml || ""}</div>
                 </section>
               `
@@ -3045,14 +3066,20 @@ function renderStandardDetailMobile(detail) {
 }
 
 function renderDetailPlainIntro(detail, options = {}) {
-  if (!["diff_thread", "file_event"].includes(detail?.kind || "")) {
+  if (!["approval", "diff_thread", "file_event"].includes(detail?.kind || "")) {
     return "";
   }
   if (!detail?.messageHtml) {
     return "";
   }
+  const approvalClass = detail?.kind === "approval" ? " detail-page-copy--approval" : "";
+  const approvalLead =
+    detail?.kind === "approval"
+      ? `<p>${escapeHtml(detailIntentText(detail))}</p>`
+      : "";
   return `
-    <div class="detail-page-copy ${options.mobile ? "detail-page-copy--mobile" : ""} markdown">
+    <div class="detail-page-copy${approvalClass} ${options.mobile ? "detail-page-copy--mobile" : ""} markdown">
+      ${approvalLead}
       ${detail.messageHtml}
     </div>
   `;
@@ -3206,21 +3233,31 @@ function renderDetailDiffPanel(detail, options = {}) {
 
   const diffText = String(detail?.diffText || "").replace(/\r\n/g, "\n").trim();
   const statsHtml = renderDiffEntryStatsHtml(detail);
+  const expanded = isDetailDiffExpanded(detail);
 
   return `
     <section class="detail-card detail-card--diff ${options.mobile ? "detail-card--mobile" : ""}">
-      <div class="detail-diff-card__header">
-        <div class="detail-diff-card__title-wrap">
-          <span class="detail-diff-card__icon" aria-hidden="true">${renderIcon("diff")}</span>
-          <span>${escapeHtml(L("detail.diffTitle"))}</span>
+      <button
+        type="button"
+        class="detail-diff-card__toggle ${expanded ? "is-open" : ""}"
+        data-detail-diff-toggle
+      >
+        <div class="detail-diff-card__header">
+          <div class="detail-diff-card__title-wrap">
+            <span class="detail-diff-card__icon" aria-hidden="true">${renderIcon("diff")}</span>
+            <span>${escapeHtml(L("detail.diffTitle"))}</span>
+          </div>
+          <div class="detail-diff-card__header-right">
+            ${statsHtml ? `<span class="detail-diff-card__stats diff-entry__stats">${statsHtml}</span>` : ""}
+            <span class="detail-diff-card__chevron" aria-hidden="true">${renderIcon("chevron-right")}</span>
+          </div>
         </div>
-        ${statsHtml ? `<span class="detail-diff-card__stats diff-entry__stats">${statsHtml}</span>` : ""}
-      </div>
-      ${
-        diffText
+      </button>
+      ${expanded
+        ? diffText
           ? `<div class="detail-diff-viewer">${renderDiffLines(diffText)}</div>`
           : `<p class="detail-diff-card__notice">${escapeHtml(L("detail.diffUnavailable"))}</p>`
-      }
+        : ""}
     </section>
   `;
 }
@@ -4055,6 +4092,18 @@ function bindShellInteractions() {
       event.preventDefault();
       event.stopPropagation();
       toggleDiffThreadFileExpanded(button.dataset.diffThreadToken || "", button.dataset.diffThreadFile || "");
+      await renderShell();
+    });
+  }
+
+  for (const button of document.querySelectorAll("[data-detail-diff-toggle]")) {
+    button.addEventListener("click", async (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      if (!state.currentDetail) {
+        return;
+      }
+      toggleDetailDiffExpanded(state.currentDetail);
       await renderShell();
     });
   }

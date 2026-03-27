@@ -64,6 +64,7 @@ const runtime = {
   threadOwnerClientIds: new Map(),
   nativeApprovalsByToken: new Map(),
   nativeApprovalsByRequestKey: new Map(),
+  fileApprovalDeltasById: new Map(),
   planRequestsByToken: new Map(),
   planRequestsByRequestKey: new Map(),
   planRequestsByTurnKey: new Map(),
@@ -897,6 +898,16 @@ function buildUnifiedDiffFromApplyPatchSection(section) {
     return normalizeTimelineDiffText(diffLines.join("\n"));
   }
 
+  if (section.kind === "delete") {
+    const removedCount = bodyLines.filter((line) => line.startsWith("-")).length;
+    diffLines.push("deleted file mode 100644");
+    diffLines.push(`--- ${diffPathForSide(fileRef, "a")}`);
+    diffLines.push("+++ /dev/null");
+    diffLines.push(`@@ -1,${Math.max(removedCount, 1)} +0,0 @@`);
+    diffLines.push(...bodyLines);
+    return normalizeTimelineDiffText(diffLines.join("\n"));
+  }
+
   return "";
 }
 
@@ -1020,6 +1031,82 @@ async function buildFileEventDiff({ fileState, callId, fileRefs, fileEventType, 
     diffText,
     diffSource,
     diffAvailable: Boolean(diffText),
+    diffAddedLines: counts.addedLines,
+    diffRemovedLines: counts.removedLines,
+  };
+}
+
+function approvalRequestCallId(params) {
+  if (!isPlainObject(params)) {
+    return "";
+  }
+  return cleanText(params.itemId ?? params.item_id ?? params.callId ?? params.call_id ?? "");
+}
+
+async function ensureRolloutFileState(runtime, threadId, rolloutFilePath) {
+  const normalizedRolloutFilePath = cleanText(rolloutFilePath || "");
+  if (!normalizedRolloutFilePath) {
+    return null;
+  }
+
+  let fileState = runtime.fileStates.get(normalizedRolloutFilePath);
+  if (fileState) {
+    return fileState;
+  }
+
+  fileState = {
+    offset: 0,
+    remainder: "",
+    threadId: cleanText(threadId || ""),
+    cwd: await findRolloutThreadCwd(runtime, threadId || ""),
+    applyPatchInputsByCallId: new Map(),
+    startupCutoffMs: 0,
+    skipPartialLine: false,
+  };
+  runtime.fileStates.set(normalizedRolloutFilePath, fileState);
+  return fileState;
+}
+
+async function buildApprovalPayloadDeltaFromRollout({ runtime, conversationId, params }) {
+  const callId = approvalRequestCallId(params);
+  const threadId = cleanText(conversationId || params?.threadId || params?.thread_id || "");
+  if (!callId || !threadId) {
+    return null;
+  }
+
+  const rolloutFilePath = findRolloutFileForThread(runtime, threadId);
+  if (!rolloutFilePath) {
+    return null;
+  }
+
+  const fileState = await ensureRolloutFileState(runtime, threadId, rolloutFilePath);
+  if (!fileState) {
+    return null;
+  }
+
+  const storedPatch = await findStoredApplyPatchInput({
+    fileState,
+    callId,
+    rolloutFilePath,
+  });
+  if (!storedPatch?.inputText) {
+    return null;
+  }
+
+  const sections = parseApplyPatchSections(storedPatch.inputText);
+  const fileRefs = normalizeTimelineFileRefs(sections.map((section) => section?.fileRef).filter(Boolean));
+  const diffText = normalizeTimelineDiffText(
+    sections
+      .map((section) => buildUnifiedDiffFromApplyPatchSection(section))
+      .filter(Boolean)
+      .join("\n\n")
+  );
+  const counts = diffLineCounts(diffText);
+  return {
+    fileRefs,
+    diffText,
+    diffAvailable: Boolean(diffText),
+    diffSource: diffText ? "apply_patch" : "",
     diffAddedLines: counts.addedLines,
     diffRemovedLines: counts.removedLines,
   };
@@ -1152,6 +1239,11 @@ function normalizeHistoryItem(raw) {
     messageText,
     imagePaths: normalizeTimelineImagePaths(raw.imagePaths ?? raw.localImagePaths ?? []),
     fileRefs: normalizeTimelineFileRefs(raw.fileRefs ?? extractTimelineFileRefs(messageText)),
+    diffText: normalizeTimelineDiffText(raw.diffText ?? ""),
+    diffSource: normalizeTimelineDiffSource(raw.diffSource ?? ""),
+    diffAvailable: raw.diffAvailable === true || Boolean(raw.diffText),
+    diffAddedLines: Math.max(0, Number(raw.diffAddedLines) || 0),
+    diffRemovedLines: Math.max(0, Number(raw.diffRemovedLines) || 0),
     outcome,
     createdAtMs,
     readOnly: raw.readOnly !== false,
@@ -1505,6 +1597,12 @@ function recordActionHistoryItem({
   threadLabel = "",
   messageText,
   summary,
+  fileRefs = [],
+  diffText = "",
+  diffSource = "",
+  diffAvailable = false,
+  diffAddedLines = 0,
+  diffRemovedLines = 0,
   outcome = "",
 }) {
   const item = {
@@ -1516,6 +1614,12 @@ function recordActionHistoryItem({
     threadLabel,
     summary,
     messageText,
+    fileRefs,
+    diffText,
+    diffSource,
+    diffAvailable,
+    diffAddedLines,
+    diffRemovedLines,
     outcome,
     createdAtMs: Date.now(),
     readOnly: true,
@@ -3361,18 +3465,23 @@ async function syncNativeApprovals({ config, runtime, state, conversationId, pre
   for (const [requestKey, request] of nextKeys) {
     const existing = runtime.nativeApprovalsByRequestKey.get(requestKey);
     if (existing) {
-      existing.ownerClientId =
-        runtime.threadOwnerClientIds.get(conversationId) ??
-        existing.ownerClientId ??
-        null;
+      const changed = await refreshNativeApprovalFromRequest({
+        config,
+        runtime,
+        conversationId,
+        request,
+        approval: existing,
+      });
+      if (changed) {
+        const fileKeys = isPlainObject(existing.rawParams) ? Object.keys(existing.rawParams).join(",") : "";
+        console.log(
+          `[native-approval-refresh] ${requestKey} | files=${normalizeTimelineFileRefs(existing.fileRefs ?? []).length} | diff=${existing.diffAvailable || Boolean(existing.diffText) ? "yes" : "no"} | keys=${fileKeys || "none"}`
+        );
+      }
       continue;
     }
 
-    if (previousKeys.has(requestKey)) {
-      continue;
-    }
-
-    const approval = createNativeApproval({
+    const approval = await createNativeApproval({
       config,
       runtime,
       conversationId,
@@ -3385,6 +3494,14 @@ async function syncNativeApprovals({ config, runtime, state, conversationId, pre
     runtime.nativeApprovalsByRequestKey.set(requestKey, approval);
     runtime.nativeApprovalsByToken.set(approval.token, approval);
 
+    if (previousKeys.has(requestKey)) {
+      const fileKeys = isPlainObject(approval.rawParams) ? Object.keys(approval.rawParams).join(",") : "";
+      console.log(
+        `[native-approval-recovered] ${requestKey} | files=${normalizeTimelineFileRefs(approval.fileRefs ?? []).length} | diff=${approval.diffAvailable || Boolean(approval.diffText) ? "yes" : "no"} | keys=${fileKeys || "none"}`
+      );
+      continue;
+    }
+
     try {
       await publishNtfy(config, {
         kind: "native_approval",
@@ -3395,7 +3512,10 @@ async function syncNativeApprovals({ config, runtime, state, conversationId, pre
         clickUrl: approval.reviewUrl,
         actions: buildNativeApprovalActions(approval.reviewUrl, config.defaultLocale),
       });
-      console.log(`[native-approval] ${requestKey} | ${approval.title}`);
+      const fileKeys = isPlainObject(approval.rawParams) ? Object.keys(approval.rawParams).join(",") : "";
+      console.log(
+        `[native-approval] ${requestKey} | ${approval.title} | files=${normalizeTimelineFileRefs(approval.fileRefs ?? []).length} | diff=${approval.diffAvailable || Boolean(approval.diffText) ? "yes" : "no"} | keys=${fileKeys || "none"}`
+      );
     } catch (error) {
       console.error(`[native-approval-error] ${requestKey} | ${error.message}`);
     }
@@ -3773,7 +3893,29 @@ async function syncGenericUserInputRequests({
   }
 }
 
-function createNativeApproval({ config, runtime, conversationId, request, now = Date.now() }) {
+async function createNativeApproval({ config, runtime, conversationId, request, now = Date.now() }) {
+  const token = crypto.randomBytes(18).toString("hex");
+  const payload = await buildNativeApprovalPayload({
+    config,
+    runtime,
+    conversationId,
+    request,
+    token,
+  });
+  if (!payload) {
+    return null;
+  }
+
+  return {
+    token,
+    ...payload,
+    createdAtMs: now,
+    resolved: false,
+    resolving: false,
+  };
+}
+
+async function buildNativeApprovalPayload({ config, runtime, conversationId, request, token }) {
   const kind = nativeApprovalKind(request.method);
   if (!kind) {
     return null;
@@ -3783,23 +3925,40 @@ function createNativeApproval({ config, runtime, conversationId, request, now = 
   if (requestId == null) {
     return null;
   }
+  const requestKey = nativeRequestKey(conversationId, requestId);
 
   const threadLabel = getNativeThreadLabel({
     runtime,
     conversationId,
     cwd: request.params?.cwd ?? request.params?.grantRoot ?? "",
   });
-  const token = crypto.randomBytes(18).toString("hex");
   const reviewUrl = `${config.nativeApprovalPublicBaseUrl}/native-approvals/${token}`;
   const title = formatTitle(config.approvalTitle, threadLabel);
   const rawParams = isPlainObject(request.params) ? cloneJson(request.params) : {};
-  const fileRefs = kind === "file" ? extractApprovalFileRefs(rawParams) : [];
-  const diffText = kind === "file" ? extractApprovalDiffText(rawParams, fileRefs) : "";
-  const diffCounts = diffLineCounts(diffText);
+  const approvalIds = kind === "file" ? collectFileApprovalCorrelationIds(rawParams, requestId) : [];
+  const requestDelta = kind === "file" ? extractApprovalPayloadDelta(rawParams, "approval_request") : null;
+  const cachedDelta =
+    kind === "file"
+      ? approvalIds.reduce(
+          (merged, approvalId) => mergeApprovalPayloadDelta(merged, runtime.fileApprovalDeltasById.get(approvalId) ?? null),
+          null
+        )
+      : null;
+  const rolloutDelta =
+    kind === "file"
+      ? await buildApprovalPayloadDeltaFromRollout({
+          runtime,
+          conversationId,
+          params: rawParams,
+        })
+      : null;
+  const mergedDelta =
+    kind === "file"
+      ? mergeApprovalPayloadDelta(mergeApprovalPayloadDelta(requestDelta, cachedDelta), rolloutDelta)
+      : null;
   const messageText = formatNativeApprovalMessage(kind, rawParams, config.defaultLocale);
 
   return {
-    token,
     kind,
     title,
     threadLabel,
@@ -3807,19 +3966,93 @@ function createNativeApproval({ config, runtime, conversationId, request, now = 
     reviewUrl,
     conversationId,
     requestId,
-    requestKey: nativeRequestKey(conversationId, requestId),
+    requestKey,
     ownerClientId: runtime.threadOwnerClientIds.get(conversationId) ?? null,
+    approvalIds,
     rawParams,
-    fileRefs,
-    diffText,
-    diffAvailable: Boolean(diffText),
-    diffSource: diffText ? "approval_request" : "",
-    diffAddedLines: diffCounts.addedLines,
-    diffRemovedLines: diffCounts.removedLines,
-    createdAtMs: now,
-    resolved: false,
-    resolving: false,
+    fileRefs: normalizeTimelineFileRefs(mergedDelta?.fileRefs ?? []),
+    diffText: normalizeTimelineDiffText(mergedDelta?.diffText ?? ""),
+    diffAvailable: Boolean(mergedDelta?.diffAvailable),
+    diffSource: normalizeTimelineDiffSource(mergedDelta?.diffSource ?? ""),
+    diffAddedLines: Math.max(0, Number(mergedDelta?.diffAddedLines) || 0),
+    diffRemovedLines: Math.max(0, Number(mergedDelta?.diffRemovedLines) || 0),
   };
+}
+
+async function refreshNativeApprovalFromRequest({ config, runtime, conversationId, request, approval }) {
+  if (!approval?.token) {
+    return false;
+  }
+  const payload = await buildNativeApprovalPayload({
+    config,
+    runtime,
+    conversationId,
+    request,
+    token: approval.token,
+  });
+  if (!payload) {
+    return false;
+  }
+
+  const before = JSON.stringify({
+    kind: approval.kind,
+    title: approval.title,
+    threadLabel: approval.threadLabel,
+    messageText: approval.messageText,
+    reviewUrl: approval.reviewUrl,
+    conversationId: approval.conversationId,
+    requestId: approval.requestId,
+    requestKey: approval.requestKey,
+    ownerClientId: approval.ownerClientId,
+    approvalIds: approval.approvalIds,
+    rawParams: approval.rawParams,
+    fileRefs: normalizeTimelineFileRefs(approval.fileRefs ?? []),
+    diffText: normalizeTimelineDiffText(approval.diffText ?? ""),
+    diffAvailable: Boolean(approval.diffAvailable),
+    diffSource: normalizeTimelineDiffSource(approval.diffSource ?? ""),
+    diffAddedLines: Math.max(0, Number(approval.diffAddedLines) || 0),
+    diffRemovedLines: Math.max(0, Number(approval.diffRemovedLines) || 0),
+  });
+
+  approval.kind = payload.kind;
+  approval.title = payload.title;
+  approval.threadLabel = payload.threadLabel;
+  approval.messageText = payload.messageText;
+  approval.reviewUrl = payload.reviewUrl;
+  approval.conversationId = payload.conversationId;
+  approval.requestId = payload.requestId;
+  approval.requestKey = payload.requestKey;
+  approval.ownerClientId = payload.ownerClientId;
+  approval.approvalIds = payload.approvalIds;
+  approval.rawParams = payload.rawParams;
+  approval.fileRefs = payload.fileRefs;
+  approval.diffText = payload.diffText;
+  approval.diffAvailable = payload.diffAvailable;
+  approval.diffSource = payload.diffSource;
+  approval.diffAddedLines = payload.diffAddedLines;
+  approval.diffRemovedLines = payload.diffRemovedLines;
+
+  const after = JSON.stringify({
+    kind: approval.kind,
+    title: approval.title,
+    threadLabel: approval.threadLabel,
+    messageText: approval.messageText,
+    reviewUrl: approval.reviewUrl,
+    conversationId: approval.conversationId,
+    requestId: approval.requestId,
+    requestKey: approval.requestKey,
+    ownerClientId: approval.ownerClientId,
+    approvalIds: approval.approvalIds,
+    rawParams: approval.rawParams,
+    fileRefs: normalizeTimelineFileRefs(approval.fileRefs ?? []),
+    diffText: normalizeTimelineDiffText(approval.diffText ?? ""),
+    diffAvailable: Boolean(approval.diffAvailable),
+    diffSource: normalizeTimelineDiffSource(approval.diffSource ?? ""),
+    diffAddedLines: Math.max(0, Number(approval.diffAddedLines) || 0),
+    diffRemovedLines: Math.max(0, Number(approval.diffRemovedLines) || 0),
+  });
+
+  return before !== after;
 }
 
 function createPlanQuestionRequest({ runtime, conversationId, request, sourceClientId, now = Date.now() }) {
@@ -5482,6 +5715,11 @@ class NativeIpcClient {
       return;
     }
 
+    if (message.method === "item/fileChange/outputDelta") {
+      this.handleFileChangeOutputDelta(message);
+      return;
+    }
+
     if (isUserInputRequestedBroadcastMethod(message.method)) {
       await this.handleUserInputRequested(message);
     }
@@ -5538,6 +5776,15 @@ class NativeIpcClient {
     }
 
     await this.onUserInputRequested(normalized);
+  }
+
+  handleFileChangeOutputDelta(message) {
+    const params = isPlainObject(message?.params) ? message.params : {};
+    if (!rememberFileApprovalDelta(this.runtime, params)) {
+      return;
+    }
+    const approvalIds = collectFileApprovalCorrelationIds(params);
+    console.log(`[ipc-file-change-delta] approvalIds=${approvalIds.join(",") || "unknown"}`);
   }
 
   write(message) {
@@ -5948,10 +6195,20 @@ function extractApprovalFileRefs(params) {
   const candidateKeys = new Set([
     "file",
     "files",
+    "fileChange",
+    "fileChanges",
+    "change",
+    "changes",
     "path",
     "paths",
     "filePath",
     "filePaths",
+    "filename",
+    "filenames",
+    "fileName",
+    "fileNames",
+    "file_name",
+    "file_names",
     "fileRef",
     "fileRefs",
     "updatedFile",
@@ -5962,6 +6219,16 @@ function extractApprovalFileRefs(params) {
     "targetFiles",
     "touchedFile",
     "touchedFiles",
+    "relativePath",
+    "relativePaths",
+    "oldPath",
+    "newPath",
+    "old_path",
+    "new_path",
+    "sourcePath",
+    "sourcePaths",
+    "destinationPath",
+    "destinationPaths",
   ]);
 
   function visit(value, parentKey = "", depth = 0) {
@@ -5989,7 +6256,23 @@ function extractApprovalFileRefs(params) {
     }
 
     if (candidateKeys.has(normalizedParentKey)) {
-      const directRef = cleanText(value.fileRef ?? value.filePath ?? value.path ?? value.filename ?? value.name ?? "");
+      const directRef = cleanText(
+        value.fileRef ??
+          value.filePath ??
+          value.path ??
+          value.filename ??
+          value.fileName ??
+          value.file_name ??
+          value.relativePath ??
+          value.oldPath ??
+          value.newPath ??
+          value.old_path ??
+          value.new_path ??
+          value.sourcePath ??
+          value.destinationPath ??
+          value.name ??
+          ""
+      );
       if (directRef) {
         refs.push(directRef);
       }
@@ -6007,6 +6290,144 @@ function extractApprovalFileRefs(params) {
   return normalizeTimelineFileRefs(refs);
 }
 
+function buildUnifiedDiffFromBeforeAfter({ fileRef = "", beforeText = "", afterText = "" }) {
+  const normalizedFileRef = cleanTimelineFileRef(fileRef);
+  if (!normalizedFileRef) {
+    return "";
+  }
+  const before = String(beforeText ?? "");
+  const after = String(afterText ?? "");
+  if (!before && !after) {
+    return "";
+  }
+  const beforeLines = before.replace(/\r\n/gu, "\n").split("\n");
+  const afterLines = after.replace(/\r\n/gu, "\n").split("\n");
+  const diffLines = [`diff --git ${diffPathForSide(normalizedFileRef, "a")} ${diffPathForSide(normalizedFileRef, "b")}`];
+
+  if (!before && after) {
+    diffLines.push("new file mode 100644");
+    diffLines.push("--- /dev/null");
+    diffLines.push(`+++ ${diffPathForSide(normalizedFileRef, "b")}`);
+    diffLines.push(`@@ -0,0 +1,${Math.max(afterLines.length, 1)} @@`);
+    diffLines.push(...afterLines.map((line) => `+${line}`));
+    return normalizeTimelineDiffText(diffLines.join("\n"));
+  }
+
+  diffLines.push(`--- ${diffPathForSide(normalizedFileRef, "a")}`);
+  diffLines.push(`+++ ${diffPathForSide(normalizedFileRef, "b")}`);
+  diffLines.push(`@@ -1,${Math.max(beforeLines.length, 1)} +1,${Math.max(afterLines.length, 1)} @@`);
+  diffLines.push(...beforeLines.map((line) => `-${line}`));
+  diffLines.push(...afterLines.map((line) => `+${line}`));
+  return normalizeTimelineDiffText(diffLines.join("\n"));
+}
+
+function extractStructuredApprovalDiffText(value, fallbackFileRefs = []) {
+  const normalizedFallbackRefs = normalizeTimelineFileRefs(fallbackFileRefs);
+  if (typeof value === "string") {
+    return normalizeTimelineDiffText(value);
+  }
+
+  if (Array.isArray(value)) {
+    const sections = value
+      .map((item) => extractStructuredApprovalDiffText(item, normalizedFallbackRefs))
+      .filter(Boolean);
+    return normalizeTimelineDiffText(sections.join("\n\n"));
+  }
+
+  if (!isPlainObject(value)) {
+    return "";
+  }
+
+  const explicitDiff =
+    extractStructuredApprovalDiffText(
+      value.diff ??
+        value.patch ??
+        value.patchText ??
+      value.diffText ??
+      value.unifiedDiff ??
+      value.unified_diff ??
+      value.unifiedPatch ??
+      value.unified_patch ??
+      value.unifiedPatchText ??
+      value.unified_patch_text ??
+      value.text ??
+      value.value ??
+      value.content ??
+      value.delta ??
+      value.output ??
+      value.fileChanges ??
+      value.fileChange ??
+      value.changes ??
+      value.change ??
+      null,
+      normalizedFallbackRefs
+    ) || "";
+  if (explicitDiff) {
+    return explicitDiff;
+  }
+
+  const fileRef =
+    cleanTimelineFileRef(
+      value.fileRef ??
+        value.filePath ??
+        value.path ??
+        value.filename ??
+        value.fileName ??
+        value.file_name ??
+        value.relativePath ??
+        value.name ??
+        value.targetFile ??
+        value.newPath ??
+        value.oldPath ??
+        value.new_path ??
+        value.old_path ??
+        value.sourcePath ??
+        value.destinationPath ??
+        normalizedFallbackRefs[0] ??
+        ""
+    ) || normalizedFallbackRefs[0] || "";
+  const beforeText =
+    value.before ??
+    value.beforeText ??
+    value.oldText ??
+    value.old_text ??
+    value.originalText ??
+    value.original_text ??
+    value.previousText ??
+    value.previous_text ??
+    value.contentBefore ??
+    value.beforeContent ??
+    value.oldContent ??
+    value.old_content ??
+    "";
+  const afterText =
+    value.after ??
+    value.afterText ??
+    value.newText ??
+    value.new_text ??
+    value.updatedText ??
+    value.updated_text ??
+    value.currentText ??
+    value.current_text ??
+    value.contentAfter ??
+    value.afterContent ??
+    value.newContent ??
+    value.new_content ??
+    "";
+  const beforeAfterDiff = buildUnifiedDiffFromBeforeAfter({ fileRef, beforeText, afterText });
+  if (beforeAfterDiff) {
+    return beforeAfterDiff;
+  }
+
+  for (const child of Object.values(value)) {
+    const nested = extractStructuredApprovalDiffText(child, fileRef ? [fileRef] : normalizedFallbackRefs);
+    if (nested) {
+      return nested;
+    }
+  }
+  return "";
+}
+
 function extractApprovalDiffText(params, fileRefs = []) {
   if (!isPlainObject(params)) {
     return "";
@@ -6018,8 +6439,13 @@ function extractApprovalDiffText(params, fileRefs = []) {
     "patch",
     "patchText",
     "unifiedDiff",
+    "unified_diff",
     "diffPreview",
     "diffString",
+    "fileChange",
+    "fileChanges",
+    "change",
+    "changes",
   ]);
 
   let best = "";
@@ -6067,6 +6493,14 @@ function extractApprovalDiffText(params, fileRefs = []) {
       return;
     }
 
+    const normalizedParentKey = cleanText(parentKey);
+    if (candidateKeys.has(normalizedParentKey)) {
+      considerText(extractStructuredApprovalDiffText(value, fileRefs));
+      if (best) {
+        return;
+      }
+    }
+
     for (const [key, child] of Object.entries(value)) {
       visit(child, key, depth + 1);
       if (best) {
@@ -6092,6 +6526,214 @@ function extractApprovalDiffText(params, fileRefs = []) {
     .join("\n");
 
   return filtered ? normalizeTimelineDiffText(filtered) : best;
+}
+
+function extractApprovalPayloadDelta(params, diffSource = "approval_request") {
+  const fileRefs = extractApprovalFileRefs(params);
+  const diffText = extractApprovalDiffText(params, fileRefs);
+  const diffCounts = diffLineCounts(diffText);
+  return {
+    fileRefs,
+    diffText,
+    diffAvailable: Boolean(diffText),
+    diffSource: diffText ? diffSource : "",
+    diffAddedLines: diffCounts.addedLines,
+    diffRemovedLines: diffCounts.removedLines,
+  };
+}
+
+function mergeApprovalDiffTexts(existingText = "", nextText = "", fileRefs = []) {
+  const existing = normalizeTimelineDiffText(existingText);
+  const next = normalizeTimelineDiffText(nextText);
+  if (!existing) {
+    return next;
+  }
+  if (!next || next === existing) {
+    return existing;
+  }
+  if (next.includes(existing)) {
+    return next;
+  }
+  if (existing.includes(next)) {
+    return existing;
+  }
+
+  const relevantRefs = normalizeTimelineFileRefs(fileRefs);
+  const existingSections = splitUnifiedDiffTextByFile(existing);
+  const nextSections = splitUnifiedDiffTextByFile(next);
+  if (existingSections.length === 0 || nextSections.length === 0) {
+    return normalizeTimelineDiffText([existing, next].join("\n\n"));
+  }
+
+  const mergedSections = [...existingSections];
+  for (const section of nextSections) {
+    const matchIndex = mergedSections.findIndex((candidate) => timelineFileRefsMatch(candidate.fileRef, section.fileRef));
+    if (matchIndex === -1) {
+      mergedSections.push(section);
+      continue;
+    }
+    if ((section.diffText || "").length > (mergedSections[matchIndex].diffText || "").length) {
+      mergedSections[matchIndex] = section;
+    }
+  }
+
+  const filteredSections =
+    relevantRefs.length > 0
+      ? mergedSections.filter((section) => relevantRefs.some((fileRef) => timelineFileRefsMatch(section.fileRef, fileRef)))
+      : mergedSections;
+  return normalizeTimelineDiffText(filteredSections.map((section) => section.diffText).filter(Boolean).join("\n\n"));
+}
+
+function mergeApprovalPayloadDelta(base, next) {
+  if (!base && !next) {
+    return null;
+  }
+  if (!base) {
+    return next ? { ...next, fileRefs: normalizeTimelineFileRefs(next.fileRefs ?? []) } : null;
+  }
+  if (!next) {
+    return base ? { ...base, fileRefs: normalizeTimelineFileRefs(base.fileRefs ?? []) } : null;
+  }
+
+  const fileRefs = normalizeTimelineFileRefs([...(base.fileRefs ?? []), ...(next.fileRefs ?? [])]);
+  const diffText = mergeApprovalDiffTexts(base.diffText ?? "", next.diffText ?? "", fileRefs);
+  const diffCounts = diffLineCounts(diffText);
+  return {
+    fileRefs,
+    diffText,
+    diffAvailable: Boolean(diffText) || base.diffAvailable === true || next.diffAvailable === true,
+    diffSource: normalizeTimelineDiffSource(next.diffSource || base.diffSource || ""),
+    diffAddedLines: diffCounts.addedLines,
+    diffRemovedLines: diffCounts.removedLines,
+  };
+}
+
+function collectFileApprovalCorrelationIds(params, fallbackRequestId = "") {
+  const ids = new Set();
+  const pushValue = (value) => {
+    const normalized = cleanText(value ?? "");
+    if (normalized) {
+      ids.add(normalized);
+    }
+  };
+
+  pushValue(fallbackRequestId);
+  if (isPlainObject(params)) {
+    pushValue(params.approvalId);
+    pushValue(params.requestId);
+    pushValue(params.id);
+  }
+  return [...ids.values()];
+}
+
+function approvalCorrelationIds(approval) {
+  const ids = new Set();
+  if (approval?.requestId != null) {
+    ids.add(cleanText(approval.requestId));
+  }
+  if (Array.isArray(approval?.approvalIds)) {
+    for (const approvalId of approval.approvalIds) {
+      const normalized = cleanText(approvalId);
+      if (normalized) {
+        ids.add(normalized);
+      }
+    }
+  }
+  const rawParams = isPlainObject(approval?.rawParams) ? approval.rawParams : {};
+  for (const candidate of [rawParams.approvalId, rawParams.requestId, rawParams.id]) {
+    const normalized = cleanText(candidate ?? "");
+    if (normalized) {
+      ids.add(normalized);
+    }
+  }
+  return [...ids.values()];
+}
+
+function applyApprovalPayloadDeltaToApproval(approval, delta) {
+  if (!approval || !delta) {
+    return false;
+  }
+  const merged = mergeApprovalPayloadDelta(
+    {
+      fileRefs: approval.fileRefs ?? [],
+      diffText: approval.diffText ?? "",
+      diffAvailable: approval.diffAvailable === true,
+      diffSource: approval.diffSource ?? "",
+      diffAddedLines: approval.diffAddedLines ?? 0,
+      diffRemovedLines: approval.diffRemovedLines ?? 0,
+    },
+    delta
+  );
+  if (!merged) {
+    return false;
+  }
+  const changed =
+    JSON.stringify([
+      normalizeTimelineFileRefs(approval.fileRefs ?? []),
+      normalizeTimelineDiffText(approval.diffText ?? ""),
+      Boolean(approval.diffAvailable),
+      normalizeTimelineDiffSource(approval.diffSource ?? ""),
+      Math.max(0, Number(approval.diffAddedLines) || 0),
+      Math.max(0, Number(approval.diffRemovedLines) || 0),
+    ]) !==
+    JSON.stringify([
+      normalizeTimelineFileRefs(merged.fileRefs ?? []),
+      normalizeTimelineDiffText(merged.diffText ?? ""),
+      Boolean(merged.diffAvailable),
+      normalizeTimelineDiffSource(merged.diffSource ?? ""),
+      Math.max(0, Number(merged.diffAddedLines) || 0),
+      Math.max(0, Number(merged.diffRemovedLines) || 0),
+    ]);
+  approval.fileRefs = normalizeTimelineFileRefs(merged.fileRefs ?? []);
+  approval.diffText = normalizeTimelineDiffText(merged.diffText ?? "");
+  approval.diffAvailable = Boolean(merged.diffAvailable);
+  approval.diffSource = normalizeTimelineDiffSource(merged.diffSource ?? "");
+  approval.diffAddedLines = Math.max(0, Number(merged.diffAddedLines) || 0);
+  approval.diffRemovedLines = Math.max(0, Number(merged.diffRemovedLines) || 0);
+  return changed;
+}
+
+function rememberFileApprovalDelta(runtime, params) {
+  const approvalIds = collectFileApprovalCorrelationIds(params);
+  if (approvalIds.length === 0) {
+    return false;
+  }
+
+  const delta = extractApprovalPayloadDelta(params, "approval_request");
+  if (!delta.diffAvailable && normalizeTimelineFileRefs(delta.fileRefs ?? []).length === 0) {
+    return false;
+  }
+
+  let changed = false;
+  for (const approvalId of approvalIds) {
+    const previous = runtime.fileApprovalDeltasById.get(approvalId) ?? null;
+    const next = mergeApprovalPayloadDelta(previous, delta);
+    if (!next) {
+      continue;
+    }
+    runtime.fileApprovalDeltasById.set(approvalId, next);
+    changed = true;
+  }
+
+  if (runtime.fileApprovalDeltasById.size > 256) {
+    const oldestKey = runtime.fileApprovalDeltasById.keys().next().value;
+    if (oldestKey) {
+      runtime.fileApprovalDeltasById.delete(oldestKey);
+    }
+  }
+
+  if (!changed) {
+    return false;
+  }
+
+  for (const approval of runtime.nativeApprovalsByToken.values()) {
+    const matches = approvalCorrelationIds(approval).some((approvalId) => approvalIds.includes(approvalId));
+    if (!matches) {
+      continue;
+    }
+    applyApprovalPayloadDeltaToApproval(approval, delta);
+  }
+  return true;
 }
 
 function buildNativeApprovalActions(reviewUrl, locale = config?.defaultLocale || DEFAULT_LOCALE) {
@@ -7729,6 +8371,11 @@ function buildHistoryDetail(item, locale, runtime = null) {
     createdAtMs: Number(item.createdAtMs) || 0,
     messageHtml: renderMessageHtml(item.messageText, `<p>${escapeHtml(t(locale, "detail.detailUnavailable"))}</p>`),
     fileRefs: normalizeTimelineFileRefs(item.fileRefs ?? []),
+    diffText: normalizeTimelineDiffText(item.diffText ?? ""),
+    diffAvailable: item.diffAvailable === true || Boolean(item.diffText),
+    diffSource: normalizeTimelineDiffSource(item.diffSource ?? ""),
+    diffAddedLines: Math.max(0, Number(item.diffAddedLines) || 0),
+    diffRemovedLines: Math.max(0, Number(item.diffRemovedLines) || 0),
     interruptNotice: interruptedDetailNotice(item.messageText, locale),
     readOnly: true,
     reply: replyEnabled
@@ -8357,8 +9004,15 @@ async function handleNativeApprovalDecision({ config, runtime, state, approval, 
     stableId: `approval:${approval.requestKey}:${Date.now()}`,
     token: approval.token,
     title: approval.title,
+    threadLabel: approval.threadLabel || "",
     messageText: `${approvalDecisionMessage(decision, config.defaultLocale)}\n\n${approval.messageText}`,
     summary: approvalDecisionMessage(decision, config.defaultLocale),
+    fileRefs: normalizeTimelineFileRefs(approval.fileRefs ?? []),
+    diffText: normalizeTimelineDiffText(approval.diffText ?? ""),
+    diffSource: normalizeTimelineDiffSource(approval.diffSource ?? ""),
+    diffAvailable: approval.diffAvailable === true || Boolean(approval.diffText),
+    diffAddedLines: Math.max(0, Number(approval.diffAddedLines) || 0),
+    diffRemovedLines: Math.max(0, Number(approval.diffRemovedLines) || 0),
     outcome: decision === "accept" ? "approved" : "rejected",
   });
   if (stateChanged) {
