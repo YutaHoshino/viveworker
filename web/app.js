@@ -3133,6 +3133,9 @@ function renderDetailPlainIntro(detail, options = {}) {
   if (!["approval", "diff_thread", "file_event"].includes(detail?.kind || "")) {
     return "";
   }
+  if (detail?.kind === "approval" && normalizeClientText(detail?.approvalKind || "") !== "file") {
+    return "";
+  }
   if (!detail?.messageHtml) {
     return "";
   }

@@ -6820,16 +6820,16 @@ function formatNativeApprovalMessage(kind, params, locale = config?.defaultLocal
 function formatCommandApprovalMessage(params, locale = config?.defaultLocale || DEFAULT_LOCALE) {
   const parts = [];
   const reason = truncate(cleanText(params.reason ?? params.justification ?? ""), 220);
-  const command = truncate(cleanText(params.command ?? params.cmd ?? ""), 220);
+  const command = truncate(cleanText(params.command ?? params.cmd ?? ""), 1200);
   if (reason) {
     parts.push(reason);
   } else {
     parts.push(t(locale, "server.message.commandApprovalNeeded"));
   }
   if (command) {
-    parts.push(t(locale, "server.message.commandPrefix", { command }));
+    parts.push(`${t(locale, "server.message.commandLabel")}\n\`\`\`sh\n${command}\n\`\`\``);
   }
-  return truncate(parts.join("\n") || t(locale, "server.message.commandApprovalNeeded"), 1024);
+  return parts.join("\n\n") || t(locale, "server.message.commandApprovalNeeded");
 }
 
 function formatFileApprovalMessage(params, locale = config?.defaultLocale || DEFAULT_LOCALE) {
@@ -8830,6 +8830,7 @@ function buildPendingApprovalDetail(runtime, approval, locale) {
   const previousContext = buildPreviousApprovalContext(runtime, approval);
   return {
     kind: "approval",
+    approvalKind: cleanText(approval.kind || ""),
     token: approval.token,
     title: formatLocalizedTitle(locale, "server.title.approval", approval.threadLabel),
     threadLabel: approval.threadLabel || "",

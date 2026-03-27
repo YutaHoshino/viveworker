@@ -1927,6 +1927,7 @@ code {
   padding: 0 0.2rem;
   color: var(--muted);
   line-height: 1.55;
+  overflow-wrap: anywhere;
 }
 
 .detail-page-copy--approval {
